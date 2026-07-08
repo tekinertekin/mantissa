@@ -1,0 +1,7 @@
+build/
+*.o
+*.so
+*.dylib
+*.dll
+__pycache__/
+*.pyc
