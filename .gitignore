@@ -9,3 +9,5 @@ build/
 !dist/*.dll
 __pycache__/
 *.pyc
+# personal dev notes / session resume command — never push
+DEV_HISTORY.md
