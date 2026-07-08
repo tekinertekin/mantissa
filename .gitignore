@@ -3,5 +3,9 @@ build/
 *.so
 *.dylib
 *.dll
+# dist/ holds the committed prebuilt library — keep it tracked
+!dist/*.so
+!dist/*.dylib
+!dist/*.dll
 __pycache__/
 *.pyc

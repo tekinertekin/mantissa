@@ -26,7 +26,7 @@ else
     LIBEXT := so
 endif
 
-.PHONY: test lib example clean
+.PHONY: test lib dist example clean
 
 test: $(SRC) tests/test_dtypes.c
 	@mkdir -p $(BUILD)
@@ -37,6 +37,13 @@ lib: $(SRC)
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -DTK_BUILD_DLL -fPIC -shared -o $(BUILD)/libmantissa.$(LIBEXT) $^ $(LDFLAGS)
 	@echo "built $(BUILD)/libmantissa.$(LIBEXT)  (dtype=$(DTYPE))"
+
+# Prebuilt, committed shared library so the Python binding works without a
+# toolchain. The same command emits libmantissa.dll on Windows and .so on Linux.
+dist: $(SRC)
+	@mkdir -p dist
+	$(CC) $(CFLAGS) -DTK_BUILD_DLL -fPIC -shared -o dist/libmantissa.$(LIBEXT) $^ $(LDFLAGS)
+	@echo "built dist/libmantissa.$(LIBEXT)  (dtype=$(DTYPE))"
 
 example: $(SRC) examples/perceptron_example.c
 	@mkdir -p $(BUILD)

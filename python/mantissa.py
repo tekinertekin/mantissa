@@ -18,12 +18,14 @@ IDENTITY, STEP, SIGN, RELU, SIGMOID, TANH, GELU = range(7)
 
 def _library_path() -> str:
     ext = {"darwin": "dylib", "win32": "dll"}.get(sys.platform, "so")
-    build = Path(__file__).resolve().parent.parent / "build" / f"libmantissa.{ext}"
-    if not build.exists():
-        raise FileNotFoundError(
-            f"{build} not found. Build it first:  make lib"
-        )
-    return str(build)
+    root = Path(__file__).resolve().parent.parent
+    # Prefer the committed prebuilt library; fall back to a local `make lib`.
+    for lib in (root / "dist" / f"libmantissa.{ext}", root / "build" / f"libmantissa.{ext}"):
+        if lib.exists():
+            return str(lib)
+    raise FileNotFoundError(
+        f"libmantissa.{ext} not found in dist/ or build/. Build it:  make dist"
+    )
 
 
 class Mantissa:

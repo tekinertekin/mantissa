@@ -30,6 +30,44 @@ Micikevicius et al., 2017).
 `tekin32` and `tekin8` are original designs; the reasoning (why these exact
 bit splits) is in [docs/DESIGN.md](docs/DESIGN.md).
 
+## What the trade-off looks like
+
+The same value stored in each format and read back (from the test suite,
+`make DTYPE=<n> test`). Precision falls with the mantissa budget; the reference
+value is column `float32`:
+
+| input   | float32 | tekin32 | fp16     | bfloat16 | tekin8 |
+|---------|--------:|--------:|---------:|---------:|-------:|
+| 3.14159 | 3.14159 | 3.14159 | 3.14062  | 3.14062  | 3.25   |
+| 100.0   | 100     | 100     | 100      | 100      | 104    |
+| 0.01    | 0.01    | 0.01    | 0.0100021| 0.0100098| 0.00977|
+
+tekin8's step near 100 is 8 (3 mantissa bits), so 100 becomes 104 — the format
+is doing exactly what its bit budget allows. tekin32 round-trips float32 exactly
+across the NN range.
+
+A perceptron built from the primitives (`make example`):
+
+```
+OR perceptron  (dtype=float32)
+  (0, 0) -> 0
+  (0, 1) -> 1
+  (1, 0) -> 1
+  (1, 1) -> 1
+```
+
+## Memory footprint
+
+Storage size is the whole point — it sets how much RAM/VRAM a model needs and,
+because a dense layer is memory-bandwidth bound, roughly its runtime. For a
+model with *N* parameters:
+
+| Format | bytes/param | 1B params | 7B params |
+|--------|:-----------:|:---------:|:---------:|
+| float32          | 4 | 4.0 GB | 28 GB |
+| fp16 / bfloat16  | 2 | 2.0 GB | 14 GB |
+| tekin8           | 1 | 1.0 GB | 7 GB  |
+
 ## Layout
 
 ```
@@ -46,9 +84,12 @@ docs/       DESIGN.md (numerics + optimization), USAGE.md (API + examples)
 ```sh
 make DTYPE=2 test     # build + run tests with bfloat16 storage
 make example          # C perceptron
-make lib              # shared library for Python
-python3 python/perceptron_example.py
+python3 python/perceptron_example.py   # uses the prebuilt dist/ library
 ```
+
+A prebuilt float32 library ships in [`dist/`](dist/) so the Python binding runs
+with no toolchain. Rebuild it for any platform (`.dll` on Windows, `.so` on
+Linux, `.dylib` on macOS) or dtype with `make dist` / `make DTYPE=<n> dist`.
 
 Full API and worked C/Python examples: [docs/USAGE.md](docs/USAGE.md).
 
@@ -59,3 +100,7 @@ This is the numeric core. It is deliberately general: a dense layer
 GRUs, LSTMs, and Transformers, so the same primitives will back those models as
 the project grows. Training / back-propagation is a later stage and is not here
 yet.
+
+## License
+
+MIT — see [LICENSE](LICENSE). © 2024 Tekin Ertekin.
