@@ -1,15 +1,16 @@
 # mantissa
 #
-# Storage type (see include/config.h):
-#   DTYPE=0 float32 | 1 fp16 | 2 bfloat16 | 3 tekin32 | 4 tekin8
+# Storage type (see include/config.h; default is bfloat16):
+#   DTYPE=0 float32 | 1 fp16 | 2 bfloat16 | 3 tekin32 | 4 tekin8 | 5 fp8_e5m2 | 6 fp4_e2m1
 #
-#   make DTYPE=2 test     build + run tests with bfloat16
-#   make lib              build the shared library for the Python binding
-#   make example          build + run the C perceptron example
+#   make test             build + run tests            (default dtype = bfloat16)
+#   make DTYPE=4 bench     build + run benchmark with tekin8
+#   make example / mlp     C perceptron / mixed-MLP demos
+#   make dist              shared library for the Python binding
 #   make clean
 
 CC      := cc
-DTYPE   ?= 0
+DTYPE   ?= 2
 # -O3 + fast FP contraction lets tk_dot fold multiply-add into FMA and vectorize.
 # Add `march=native` locally for full SIMD width; kept off by default for portable builds.
 CFLAGS  := -O3 -funroll-loops -ffp-contract=fast -Wall -Wextra -std=c11 \
@@ -26,7 +27,7 @@ else
     LIBEXT := so
 endif
 
-.PHONY: test lib dist example clean
+.PHONY: test lib dist example mlp bench clean
 
 test: $(SRC) tests/test_dtypes.c
 	@mkdir -p $(BUILD)
@@ -49,6 +50,16 @@ example: $(SRC) examples/perceptron_example.c
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $(BUILD)/perceptron_example $^ $(LDFLAGS)
 	@./$(BUILD)/perceptron_example
+
+mlp: $(SRC) examples/mlp_example.c
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -o $(BUILD)/mlp_example $^ $(LDFLAGS)
+	@./$(BUILD)/mlp_example
+
+bench: $(SRC) bench/benchmark.c
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -o $(BUILD)/benchmark $^ $(LDFLAGS)
+	@./$(BUILD)/benchmark
 
 clean:
 	rm -rf $(BUILD)

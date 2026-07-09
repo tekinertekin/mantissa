@@ -39,9 +39,18 @@ int main(void) {
     for (int i = 0; i < n; i++)
         check("t32", tk_t32_to_float(tk_float_to_t32(xs[i])), xs[i], 1e-6f, 1e-7f);
 
-    printf("tekin8 round-trip (3-bit mantissa, rel ~2^-4):\n");
+    printf("tekin8 (E4M3) round-trip (3-bit mantissa, rel ~2^-4):\n");
     for (int i = 0; i < n; i++)
         check("t8", tk_f8_to_float(tk_float_to_f8(xs[i])), xs[i], 0.07f, 1e-3f);
+
+    printf("fp8_e5m2 round-trip (2-bit mantissa, wider range):\n");
+    for (int i = 0; i < n; i++)
+        check("e5m2", tk_e5m2_to_float(tk_float_to_e5m2(xs[i])), xs[i], 0.15f, 1e-3f);
+
+    printf("fp4 (E2M1) round-trip on its exact grid {0,.5,1,1.5,2,3,4,6}:\n");
+    float g[] = { 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f };
+    for (int i = 0; i < (int)(sizeof(g) / sizeof(g[0])); i++)
+        check("fp4", tk_fp4_to_float(tk_float_to_fp4(g[i])), g[i], 0.0f, 0.0f);
 
     /* A 2-input AND perceptron built from the generic dense-layer primitive. */
     printf("\nAND perceptron via tk_linear_forward (step):\n");

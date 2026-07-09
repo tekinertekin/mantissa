@@ -71,5 +71,39 @@ tk_f8_t tk_float_to_f8(float f) {
     return (tk_f8_t)(sbit | ((uint32_t)ef << 3) | ((uint32_t)mant & 0x7u));
 }
 
+tk_e5m2_t tk_float_to_e5m2(float f) {
+    const uint32_t sbit = (signbit(f) ? 1u : 0u) << 7;
+    const float af = fabsf(f);
+    if (isnan(af))              return (tk_e5m2_t)(sbit | 0x7Eu);        /* nan */
+    if (isinf(af) || af >= 61440.0f) return (tk_e5m2_t)(sbit | 0x7Cu);  /* inf (max normal 57344) */
+    if (af == 0.0f)             return (tk_e5m2_t)sbit;
+
+    int e; float m = frexpf(af, &e); m *= 2.0f; e -= 1;
+    int ef = e + 15;
+    if (ef >= 1) {
+        long mant = lroundf((m - 1.0f) * 4.0f);
+        if (mant == 4) { mant = 0; ef++; if (ef >= 31) return (tk_e5m2_t)(sbit | 0x7Cu); }
+        return (tk_e5m2_t)(sbit | ((uint32_t)ef << 2) | ((uint32_t)mant & 3u));
+    }
+    long mant = lroundf(af * 65536.0f);                                 /* subnormal: round(af * 2^16) */
+    if (mant <= 0) return (tk_e5m2_t)sbit;
+    if (mant > 3)  return (tk_e5m2_t)(sbit | (1u << 2));
+    return (tk_e5m2_t)(sbit | ((uint32_t)mant & 3u));
+}
+
+tk_fp4_t tk_float_to_fp4(float f) {
+    /* Only 8 magnitudes exist; nearest-value search is exact and clearest. */
+    static const float lv[8] = { 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f };
+    const uint32_t sbit = (signbit(f) ? 1u : 0u) << 3;
+    const float af = fabsf(f);
+    if (isnan(af) || isinf(af)) return (tk_fp4_t)(sbit | 7u);           /* no inf/nan: clamp to 6 */
+    int best = 0; float bd = af;                                        /* |af - 0| */
+    for (int i = 1; i < 8; i++) {
+        float d = fabsf(af - lv[i]);
+        if (d < bd) { bd = d; best = i; }
+    }
+    return (tk_fp4_t)(sbit | (uint32_t)best);
+}
+
 const char *tk_dtype_name(void) { return TK_DTYPE_NAME; }
 int         tk_scalar_size(void) { return (int)sizeof(tk_scalar_t); }

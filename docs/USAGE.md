@@ -2,16 +2,21 @@
 
 ## Build
 
-Pick the storage format at build time with `DTYPE` (see `config.h`):
+Zero config gives you bfloat16 + bias. Override the storage format with `DTYPE`
+(see `config.h`):
 
 ```sh
-make DTYPE=0 test    # 0 float32  1 fp16  2 bfloat16  3 tekin32  4 tekin8
-make example         # C perceptron  (build/perceptron_example)
-make lib             # shared library (build/libmantissa.{so,dylib,dll})
+make test            # tests (default bfloat16)
+# DTYPE: 0 float32  1 fp16  2 bfloat16  3 tekin32  4 tekin8  5 fp8_e5m2  6 fp4_e2m1
+make DTYPE=4 test    # switch to tekin8
+make example         # C perceptron   (build/perceptron_example)
+make mlp             # mixed 3-layer MLP
+make DTYPE=0 bench   # GEMV + activation-dispatch benchmark
+make dist            # shared library for Python (dist/libmantissa.{so,dylib,dll})
 ```
 
-`TK_USE_BIAS=0` on the command line flips the default-bias policy the examples
-follow (the core API controls bias per-call regardless — pass `NULL`).
+`TK_USE_BIAS=0` flips the default-bias policy the examples follow (the core API
+controls bias per-call regardless — pass `NULL`).
 
 ## C API
 
@@ -26,12 +31,15 @@ float       f = TK_TO_FLOAT(w);        // storage -> float
 ```
 
 Explicit converters (all exported for the binding): `tk_float_to_fp16` /
-`tk_fp16_to_float`, and the `bf16` / `t32` / `f8` equivalents.
+`tk_fp16_to_float`, and the `bf16` / `t32` / `f8` / `e5m2` / `fp4` equivalents.
 
 ### Activations (`activations.h`)
 
 `tk_activation_t`: `TK_ACT_IDENTITY, STEP, SIGN, RELU, SIGMOID, TANH, GELU`.
-`tk_activate(float *y, int n, act)` applies one over a vector in place.
+`tk_activate(float *y, int n, act)` applies one over a vector in place (inline
+switch — vectorizes). `tk_act_resolve(act)` returns a `tk_act_fn` function
+pointer for pluggable dispatch; prefer `tk_activate` for the built-ins (faster,
+see the benchmark).
 
 ### Linear layer (`ops.h`)
 
@@ -67,18 +75,21 @@ Full file: [`examples/perceptron_example.c`](../examples/perceptron_example.c)
 
 ## Python API
 
-Build the library as float32 (`make lib`), then:
+`make dist` (any dtype — the binding is dtype-agnostic), then:
 
 ```python
 from mantissa import Mantissa, STEP
 
-tk = Mantissa()                     # loads ../build/libmantissa.<ext>
+tk = Mantissa()                     # loads ../dist/libmantissa.<ext>
+print(tk.dtype)                     # e.g. 'bfloat16'
 W    = [1.0, 1.0]                   # 1 x 2, row-major
 bias = [-0.5]
 y = tk.linear_forward(W, [1, 0], bias, out_dim=1, in_dim=2, act=STEP)
 print(int(y[0]))                    # 1
 ```
 
+Values are quantized through the library's storage dtype inside
+`tk_linear_forward_f32`, so the same Python runs against any build.
 Full file: [`python/perceptron_example.py`](../python/perceptron_example.py).
 
 ## Which functions to call

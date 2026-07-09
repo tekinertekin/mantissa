@@ -30,3 +30,30 @@ void tk_linear_forward(const tk_scalar_t *restrict W,
         y[o] = tk_act_scalar(z, act);
     }
 }
+
+/* Quantize a float through the active storage type (round-trip), so the f32
+ * API reproduces that type's precision on plain-float inputs. */
+static inline float tk_q(float v) { return TK_TO_FLOAT(TK_FROM_FLOAT(v)); }
+
+void tk_linear_forward_f32(const float *restrict W,
+                           const float *restrict x,
+                           const float *restrict bias,
+                           float *restrict y,
+                           int out_dim, int in_dim,
+                           tk_activation_t act) {
+    for (int o = 0; o < out_dim; o++) {
+        const float *restrict wr = W + (size_t)o * in_dim;
+        float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+        int i = 0;
+        for (; i + 4 <= in_dim; i += 4) {
+            s0 += tk_q(wr[i + 0]) * tk_q(x[i + 0]);
+            s1 += tk_q(wr[i + 1]) * tk_q(x[i + 1]);
+            s2 += tk_q(wr[i + 2]) * tk_q(x[i + 2]);
+            s3 += tk_q(wr[i + 3]) * tk_q(x[i + 3]);
+        }
+        float z = (s0 + s1) + (s2 + s3);
+        for (; i < in_dim; i++) z += tk_q(wr[i]) * tk_q(x[i]);
+        if (bias) z += tk_q(bias[o]);
+        y[o] = tk_act_scalar(z, act);
+    }
+}

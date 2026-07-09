@@ -32,4 +32,16 @@ TK_API void tk_linear_forward(const tk_scalar_t *restrict W,
                               int out_dim, int in_dim,
                               tk_activation_t act);
 
+/* Same forward pass, but all buffers are plain float32. Each value is quantized
+ * through the configured storage type before the multiply, so the caller sees
+ * that type's numerical behavior while passing ordinary floats. This is the
+ * entry point the Python binding uses, so the library works from Python
+ * whatever dtype it was compiled for. */
+TK_API void tk_linear_forward_f32(const float *restrict W,
+                                  const float *restrict x,
+                                  const float *restrict bias,
+                                  float *restrict y,
+                                  int out_dim, int in_dim,
+                                  tk_activation_t act);
+
 #endif /* MANTISSA_OPS_H */

@@ -13,6 +13,8 @@ Only the bit budget differs.
 | bfloat16| 1 | 8 | 7  | 127 | 3.4e38 | 1.2e-38 | ~2.4 |
 | tekin32 | 1 | 7 | 24 | 63  | 1.8e19 | 2.2e-19 | ~7.5 |
 | tekin8  | 1 | 4 | 3  | 7   | 480    | 1.6e-2  | ~1.1 |
+| e5m2    | 1 | 5 | 2  | 15  | 57344  | 6.1e-5  | ~0.9 |
+| fp4     | 1 | 2 | 1  | 1   | 6      | 1.0     | ~0.3 |
 
 References for the standard formats:
 - **fp16 / mixed precision** — Micikevicius et al., *Mixed Precision Training*,
@@ -20,9 +22,14 @@ References for the standard formats:
 - **bfloat16** — Kalamkar et al., *A Study of BFLOAT16 for Deep Learning
   Training*, 2019 (arXiv:1905.12322). Same 8-bit exponent as float32, so it is
   literally the top 16 bits of a float32 — conversion is a shift.
-- **fp8 E4M3** — Micikevicius et al., *FP8 Formats for Deep Learning*, 2022
-  (arXiv:2209.05433), OCP FP8. Our tekin8 follows E4M3 but does not reserve the
-  `S.1111.111` NaN slot, so its max finite is 480 rather than OCP's 448.
+- **fp8 E4M3 / E5M2** — Micikevicius et al., *FP8 Formats for Deep Learning*,
+  2022 (arXiv:2209.05433), OCP FP8. E4M3 (tekin8) favors precision; E5M2 favors
+  range and is used for gradients. tekin8 does not reserve the `S.1111.111` NaN
+  slot, so its max finite is 480 rather than OCP's 448.
+- **fp4 E2M1** — the element type of MXFP4/NVFP4 (OCP Microscaling v1.0, 2023;
+  NVIDIA Blackwell). Eight magnitudes `{0,.5,1,1.5,2,3,4,6}`, no inf/nan; only
+  usable inside a block-scaling scheme (roadmap), included here as the scalar
+  primitive.
 
 ### Why bfloat16 beats fp16 for training
 
@@ -79,10 +86,17 @@ would lose low-order bits catastrophically for large layers.
 ### Memory bandwidth is the budget
 
 A dense layer's forward pass (GEMV) reads the whole weight matrix once and does
-~2 FLOPs per weight — it is **memory-bandwidth bound**, not compute bound. So
-halving the storage size (float32 → 16-bit) roughly *halves the runtime*, and
-tekin8 roughly quarters it. This is why the storage format, not the arithmetic,
-is the lever, and why the whole library is organized around it.
+~2 FLOPs per weight — when the matrix exceeds cache it is **memory-bandwidth
+bound**, so halving the storage size approaches halving the runtime. `make
+bench` confirms the direction: bfloat16 (half the bytes, a one-shift read) edges
+out float32.
+
+But the benchmark also tells the honest counter-story: **tekin8 is slower**, not
+4× faster, once the matrix is cache-resident — its E4M3→float conversion (a
+subnormal branch, not SIMD-friendly) now dominates the arithmetic. The lesson is
+real: narrow storage only converts to speed when the read is cheap (a shift) or
+hardware-accelerated (F16C, AVX512-BF16, Blackwell FP8 tensor cores). This is
+why the conversion hot path matters as much as the byte count.
 
 ### Conversion: hot path vs cold path
 
@@ -105,6 +119,17 @@ out-of-order engine keep multiple FMAs in flight. Combined with
 aliasing → free to vectorize), and `-O3 -funroll-loops`, the compiler emits
 vectorized FMA. `-march=native` unlocks the full SIMD width locally.
 
+### Activation dispatch: switch beats a function pointer
+
+Intuition says an indirect `function pointer` avoids the cost of a `switch`.
+The benchmark says otherwise: applying an activation element-wise, the inline
+`switch` runs ~3× faster than a resolved pointer for `relu`. Reason — the
+`switch` body inlines and the loop **vectorizes**; an indirect call per element
+is opaque to the vectorizer and pays call overhead each iteration. So
+`tk_activate` uses the `switch`, and `tk_act_resolve()` (the pointer table) is
+kept only for genuinely pluggable dispatch (e.g. a caller-supplied activation).
+A dispatch mechanism is only "faster" if you measure it in the loop it runs in.
+
 ## 3. Reuse across architectures
 
 `tk_linear_forward` — `activation(W·x + bias)` with an optional (NULL-able)
@@ -116,6 +141,27 @@ bias — is deliberately the only "layer". It is the shared primitive of:
 - **Transformer**: Q/K/V and feed-forward are linear projections; attention
   output projections are typically bias-free (hence the NULL bias path), and
   GELU (Hendrycks & Gimpel, 2016, arXiv:1606.08415) is provided.
+- **CNN**: a convolution is a batch of dot products of a filter over input
+  patches. `tk_dot` is that inner product already; a conv layer adds an
+  `im2col`/patch iterator (or a direct sliding window) on top and reuses the
+  same narrow-store/float-accumulate numerics — no new arithmetic. Planned.
+
+Heterogeneous models are supported today: bias is a per-call NULL-able pointer
+and the activation is a per-call argument, so each layer chooses independently
+(see `examples/mlp_example.c`).
 
 Building this one primitive well now means those models reuse it later instead
 of reimplementing the numerics.
+
+## 4. Numeric landscape (context for the format choices)
+
+- **Microscaling (MX)** — OCP MX v1.0 (2023): a block of 32 elements shares one
+  E8M0 scale, restoring the dynamic range that 4/6-bit elements lack. Element
+  types MXFP8 (E4M3/E5M2), MXFP6, MXFP4 (E2M1). mantissa implements the element
+  formats; a shared per-block scale is the next step.
+- **NVFP4** — NVIDIA Blackwell (2024): 16-element blocks, an FP8 E4M3 block
+  scale plus a per-tensor FP32 scalar; LLMs pretrained at 4 bits
+  (arXiv:2509.25149).
+- **Posit / takum** (Gustafson) — tapered-precision alternatives to IEEE
+  floats; more precision near ±1 where zero-centered weights concentrate.
+- **IEEE P3109** — emerging standard for ML arithmetic formats (2025).
