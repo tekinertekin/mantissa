@@ -18,6 +18,52 @@ A tight C core does the compute; a thin Python layer drives it.
 
 ---
 
+## How it works
+
+`mantissa` is a shared library with a plain **C ABI**, so any language that can
+call C — Python (via ctypes), C/C++, Rust, Go — drives the same engine. The
+caller passes ordinary **float32** arrays in and gets float32 back; inside,
+weights are kept in a narrow type to save memory.
+
+```mermaid
+flowchart TB
+    subgraph callers["Caller — your program"]
+        PY["Python (ctypes)"]
+        CPP["C / C++"]
+        OTH["any language with a C FFI"]
+    end
+    callers ==>|"float32 in: weights, inputs, targets"| ABI
+
+    subgraph lib["libmantissa  (.so / .dylib / .dll)"]
+        ABI["C ABI entry points"]
+        ABI --> Q["Build — quantize / load weights<br/>float32 to narrow storage"]
+        ABI --> FWD["Forward pass — tk_linear_forward<br/>y = act(W·x + b)"]
+        ABI --> BWD["Train — backward + update<br/>tk_linear_backward then tk_sgd_step"]
+        Q --> CORE
+        FWD --> CORE
+        BWD --> CORE
+        subgraph CORE["compute core"]
+            DOT["dot product · float32 accumulate"]
+            ACT["activations"]
+            DT["dtypes · narrow to/from float32"]
+        end
+    end
+    CORE ==>|"float32 out: predictions / gradients"| callers
+```
+
+A call is one of three kinds:
+
+- **Build** — quantize weights from float32 into the compact storage type (once).
+- **Forward pass** (`tk_linear_forward`) — compute `y = activation(W·x + b)`.
+  Called *forward* because data flows forward through the network, input →
+  output (also *feed-forward*). There is no "fast" in it — the opposite
+  direction is the backward pass.
+- **Backward pass / training** (`tk_linear_backward` → `tk_sgd_step`) —
+  gradients flow backward, output → input, and the weights are updated.
+
+Whichever it is, the compute core does the same underneath: read the narrow
+weights, **accumulate in float32**, apply an activation, return float32.
+
 ## Performance at a glance
 
 A 2048×2048 dense layer (4.2M parameters) on an Apple M-series laptop, default
