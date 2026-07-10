@@ -1,75 +1,81 @@
 # mantissa
 
+[![ci](https://github.com/tekinertekin/mantissa/actions/workflows/ci.yml/badge.svg)](https://github.com/tekinertekin/mantissa/actions/workflows/ci.yml)
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Language](https://img.shields.io/badge/C-C11-00599C.svg)
 ![Python](https://img.shields.io/badge/python-ctypes-3776AB.svg)
 ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen.svg)
-![Tests](https://img.shields.io/badge/tests-7%20dtypes%20%2B%20gradcheck-brightgreen.svg)
 
-**A low-precision numerics core for neural networks — C engine, Python skin.**
+**A fast, memory-lean neural-network core in C, with a Python binding.**
 
-`mantissa` stores weights and activations in configurable narrow floating-point
-formats and runs dense-layer forward passes on them. It exists to make one
-trade-off explicit and measurable: **how few bits per parameter can you spend
-before accuracy breaks — and what does that buy in memory and speed?** That
-question decides whether a model fits in VRAM and how fast it runs.
+`mantissa` runs neural-network layers — forward *and* backward — spending as
+little time and memory per parameter as it can. That is the goal: an engine
+small enough to fit big models in RAM/VRAM and fast enough to run them at scale.
+A tight C core does the compute; a thin Python layer drives it.
 
 > Started by Tekin Ertekin (2024); later refactored with Claude Code — see
 > [AUTHORS.md](AUTHORS.md).
 
 ---
 
-## Why this exists
+## Performance at a glance
 
-A parameter stored in 1 byte instead of 4 is a **4× cut** in the RAM/VRAM a
-model needs. And because a dense layer's forward pass is bound by memory
-bandwidth, less data moved is also less time. The entire library is organized
-around the storage format because that is the real lever at scale.
+A 2048×2048 dense layer (4.2M parameters) on an Apple M-series laptop, default
+bfloat16 (`make bench` / `make benchbp`):
 
-The recipe throughout is **narrow storage, float32 accumulation** — the
-standard mixed-precision approach (Micikevicius et al., 2017): store small,
-sum wide, so error stays bounded across the millions of terms in a layer.
+| | value |
+|---|---|
+| forward pass | **0.98 ms** (8.6 GFLOP/s) |
+| backward pass | **0.98 ms** (12.8 GFLOP/s) |
+| weight memory | **8 MB** — half of float32 |
+| `relu` over 4M values | **0.41 ms** |
 
-## Numeric formats
+Memory is the headline at scale — it decides whether a model loads at all:
 
-| `DTYPE` | Name       | Layout (S·E·M) | Bits | Source |
-|--------:|------------|:--------------:|:----:|--------|
-| 0 | `float32`  | 1·8·23 | 32 | IEEE-754 binary32 (reference) |
-| 1 | `fp16`     | 1·5·10 | 16 | IEEE-754 half (Micikevicius 2017) |
-| 2 | `bfloat16` | 1·8·7  | 16 | Google bfloat16 (Kalamkar 2019) — **default** |
-| 3 | `tekin32`  | 1·7·24 | 32 | **custom** — range traded for precision |
-| 4 | `tekin8`   | 1·4·3  | 8  | FP8 E4M3 (Micikevicius 2022) |
-| 5 | `fp8_e5m2` | 1·5·2  | 8  | FP8 E5M2, range variant (OCP / IEEE P3109) |
-| 6 | `fp4_e2m1` | 1·2·1  | 4  | FP4 E2M1, the MXFP4/NVFP4 element (OCP MX 2023) |
+| model | float32 | mantissa (bf16) | mantissa (1-byte) |
+|-------|:-------:|:---------------:|:-----------------:|
+| 1B params | 4.0 GB | 2.0 GB | 1.0 GB |
+| 7B params | 28 GB  | 14 GB  | **7 GB** |
 
-Every value is stored in the selected type but computed in float32. Conversions
-split into a branchless **hot path** (narrow→float, inlined into the dot loop)
-and a clear **cold path** (float→narrow, run once at weight load).
+## How it stays small and fast
 
-### tekin32 — why a *second* 32-bit float?
+1. **Narrow weight storage** — weights are the bulk of a model, so storing each
+   in 2 bytes (or 1) instead of 4 is where the RAM/VRAM savings come from, and
+   since a dense layer is memory-bandwidth bound, moving fewer bytes is also
+   faster. The precision is a build-time dial (below).
+2. **float32 accumulation** — compute always sums in float32 so accuracy holds
+   across a layer's millions of terms (mixed precision; Micikevicius 2017).
+3. **Tuned kernels** — a vectorizing dot product (four independent accumulators,
+   FMA, `restrict`), branchless activations (sign-bit / `fmax` / `copysign`,
+   chosen by benchmark), and stochastic rounding so training survives narrow
+   weights. Details and measurements in [docs/DESIGN.md](docs/DESIGN.md).
 
-`float32` is `1·8·23`. `tekin32` is `1·7·24` — same 32 bits, one exponent bit
-moved into the mantissa. The reasoning:
+### The precision dial
 
-- float32's 8-bit exponent spans **±3.4e38**. Neural-network weights,
-  activations, and even loss-scaled gradients live far inside **±1e18** — that
-  range is mostly unused.
-- tekin32 spends 7 exponent bits (still **±1.8e19**, ample) and gives the freed
-  bit to the mantissa: a **25-bit significand vs float32's 24**.
+Storage precision is one build-time knob (`DTYPE`); the default needs no config.
+It is *how* the core trades accuracy for memory — a means to the speed/RAM goal,
+not the goal itself.
 
-So `tekin32`:
-- **round-trips float32 losslessly** across the whole NN operating range, and
-- carries **one extra bit of precision** for values produced inside tekin32
-  arithmetic or quantized down from float64 (a high-fidelity accumulator).
+| `DTYPE` | Name | Bytes | When |
+|--------:|------|:-----:|------|
+| 0 | `float32`  | 4 | reference / exact |
+| 2 | `bfloat16` | 2 | **default** — half the RAM, training-safe |
+| 1 | `fp16`     | 2 | half RAM, more precision, less range |
+| 3 | `tekin32`  | 4 | custom high-fidelity accumulator |
+| 4 | `tekin8`   | 1 | FP8 E4M3 — 4× smaller |
+| 5 | `fp8_e5m2` | 1 | FP8, wider range |
+| 6 | `fp4_e2m1` | ½ | FP4 — the extreme |
 
-It is the bfloat16 philosophy *inverted*: bf16 assumes range is scarce and
-sacrifices precision; tekin32 assumes range is abundant and buys precision back.
-Full derivation in [docs/DESIGN.md](docs/DESIGN.md).
+Bit layouts, the `tekin` formats' design rationale, the hot/cold conversion
+split, and the current-research context (MX / NVFP4 / posit / IEEE P3109) all
+live in [docs/DESIGN.md](docs/DESIGN.md). Every value is stored in the selected
+type but computed in float32.
 
-## Precision, seen
+### Accuracy cost, seen
 
 The same value stored in each format and read back (`make DTYPE=<n> test`).
-Precision tracks the mantissa budget; `float32` is the reference column:
+This is the accuracy you trade away for the memory you save — `float32` is the
+reference column:
 
 | input   | float32 | tekin32 | fp16      | bfloat16  | e5m2 | tekin8 |
 |---------|--------:|--------:|----------:|----------:|-----:|-------:|
@@ -80,11 +86,11 @@ Precision tracks the mantissa budget; `float32` is the reference column:
 `fp4_e2m1` is coarser still: its 8 magnitudes are `{0, ±0.5, ±1, ±1.5, ±2, ±3,
 ±4, ±6}` — everything rounds onto that grid.
 
-## Benchmark
+## Full benchmarks
 
-`make DTYPE=<n> bench` — a 2048×2048 dense layer (4.2M params), plus the
-activation-dispatch micro-test. Numbers below are from an Apple M-series laptop
-(clang `-O3`); they are indicative, not absolute.
+The numbers behind *Performance at a glance*, per dtype. `make DTYPE=<n> bench` —
+a 2048×2048 dense layer (4.2M params), plus the activation-dispatch micro-test.
+Apple M-series laptop, clang `-O3`; indicative, not absolute.
 
 | dtype    | weight memory | GEMV ms/pass | GEMV GFLOP/s |
 |----------|:-------------:|:------------:|:------------:|
@@ -108,10 +114,13 @@ portable implementation.
 | tekin8   | 3.04 |  4.14 |  298 |
 
 **Activation dispatch** (4M elements): a per-element `switch` beats a resolved
-function pointer ~3× for `relu` and ~1.5× for `sigmoid`. The inline `switch`
-vectorizes; an indirect call per element does not. So `tk_activate` keeps the
-`switch`, and the function-pointer API (`tk_act_resolve`) is reserved for
-genuinely pluggable dispatch. *Measure, don't assume.*
+function pointer ~7× for `relu` and ~1.5× for `sigmoid`. The inline `switch`
+vectorizes (`relu` compiles to a single `fmax` per lane); an indirect call per
+element does not. So `tk_activate` keeps the `switch`, and the function-pointer
+API (`tk_act_resolve`) is reserved for genuinely pluggable dispatch. The
+`step`/`sign`/`relu` kernels themselves are branchless (sign-bit read, `fmax`,
+`copysign`), each picked by benchmark over the obvious comparison. *Measure,
+don't assume.*
 
 ## Mixed architectures
 
@@ -191,6 +200,27 @@ the safe general-purpose default. Override only when you want to:
 ```sh
 make DTYPE=4 test     # switch storage to tekin8
 ```
+
+## Download
+
+Prebuilt shared libraries are attached to every [release](https://github.com/tekinertekin/mantissa/releases) —
+built by CI for Linux, macOS, and Windows. Grab the one for your OS and load it
+straight from Python, no compiler or `make` needed:
+
+| OS | file |
+|----|------|
+| Linux   | `libmantissa-linux-x86_64.so` |
+| macOS   | `libmantissa-macos-arm64.dylib` |
+| Windows | `libmantissa-windows-x86_64.dll` |
+
+```python
+import ctypes
+lib = ctypes.CDLL("./libmantissa-linux-x86_64.so")   # the file you downloaded
+print(lib.tk_dtype_name.restype == None or "loaded")
+```
+
+Or use the ctypes wrapper in [`python/mantissa.py`](python/mantissa.py) (point
+it at the downloaded file). To build from source instead, see below.
 
 ## Quick start
 

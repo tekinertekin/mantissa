@@ -2,9 +2,9 @@
 #include <math.h>
 
 float tk_act_identity(float z) { return z; }
-float tk_act_step(float z)     { return z >= 0.0f ? 1.0f : 0.0f; }
-float tk_act_sign(float z)     { return z >= 0.0f ? 1.0f : -1.0f; }
-float tk_act_relu(float z)     { return z > 0.0f ? z : 0.0f; }
+float tk_act_step(float z)     { return 1.0f - (float)(tk_act__bits(z) >> 31); }
+float tk_act_sign(float z)     { return copysignf(1.0f, z); }
+float tk_act_relu(float z)     { return fmaxf(z, 0.0f); }
 float tk_act_sigmoid(float z)  { return 1.0f / (1.0f + expf(-z)); }
 float tk_act_tanh(float z)     { return tanhf(z); }
 float tk_act_gelu(float z) {
