@@ -93,10 +93,6 @@ static void gemv_range(const tk_scalar_t *restrict W, const tk_scalar_t *restric
     }
 }
 
-/* Parallelize only above this much work (out_dim * in_dim); small layers run
- * serially so the pool overhead never hurts the millions-of-small-calls case. */
-#define TK_MT_MIN_WORK (1 << 18)
-
 typedef struct {
     const tk_scalar_t *W, *x, *bias;
     float *y;
@@ -104,7 +100,8 @@ typedef struct {
     tk_activation_t act;
 } tk_gemv_ctx;
 
-static void gemv_worker(void *p, int o0, int o1) {
+static void gemv_worker(void *p, int o0, int o1, int worker) {
+    (void)worker;
     const tk_gemv_ctx *c = (const tk_gemv_ctx *)p;
     gemv_range(c->W, c->x, c->bias, c->y, o0, o1, c->in_dim, c->act);
 }

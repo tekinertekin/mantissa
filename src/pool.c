@@ -6,7 +6,7 @@
 
 #ifndef TK_HAVE_PTHREADS
 /* No pthreads (e.g. bare Windows build): run serially. */
-void tk_parallel_for(int n, tk_row_fn fn, void *ctx) { fn(ctx, 0, n); }
+void tk_parallel_for(int n, tk_row_fn fn, void *ctx) { fn(ctx, 0, n, 0); }
 int  tk_num_threads(void) { return 1; }
 #else
 
@@ -47,7 +47,7 @@ static void *worker(void *arg) {
         pthread_mutex_unlock(&g_lock);
 
         int b, e; chunk(id, total, n, &b, &e);
-        if (e > b) fn(ctx, b, e);
+        if (e > b) fn(ctx, b, e, id);
 
         pthread_mutex_lock(&g_lock);
         if (--g_pending == 0) pthread_cond_signal(&g_done);
@@ -73,7 +73,7 @@ int tk_num_threads(void) { pool_init(); return g_workers + 1; }
 
 void tk_parallel_for(int n, tk_row_fn fn, void *ctx) {
     pool_init();
-    if (g_workers == 0) { fn(ctx, 0, n); return; }   /* single core / disabled */
+    if (g_workers == 0) { fn(ctx, 0, n, 0); return; } /* single core / disabled */
 
     pthread_mutex_lock(&g_dispatch);                 /* one GEMV through the pool at a time */
     pthread_mutex_lock(&g_lock);
@@ -83,7 +83,7 @@ void tk_parallel_for(int n, tk_row_fn fn, void *ctx) {
     pthread_mutex_unlock(&g_lock);
 
     int b, e; chunk(g_workers, g_workers + 1, n, &b, &e);  /* main takes the last chunk */
-    if (e > b) fn(ctx, b, e);
+    if (e > b) fn(ctx, b, e, g_workers);
 
     pthread_mutex_lock(&g_lock);
     while (g_pending > 0) pthread_cond_wait(&g_done, &g_lock);

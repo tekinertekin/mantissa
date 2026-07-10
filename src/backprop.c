@@ -1,6 +1,41 @@
 #include "backprop.h"
 #include "config.h"
+#include "pool.h"
 #include <math.h>
+#include <stdlib.h>
+
+/* Backward for output rows [o0, o1): writes each row's dW/db (disjoint, so
+ * thread-safe) and, if dxp != NULL, accumulates the input-gradient contribution
+ * into dxp. dW row and dx share one pass over the row (wr/dWr sequential). */
+static void bwd_range(const tk_scalar_t *restrict W, const tk_scalar_t *restrict x,
+                      const float *restrict z, const float *restrict dy,
+                      float *restrict dW, float *restrict db, float *restrict dxp,
+                      int o0, int o1, int in_dim, tk_activation_t act) {
+    for (int o = o0; o < o1; o++) {
+        const float dz = dy[o] * tk_act_grad_scalar(z[o], act);
+        if (db) db[o] = dz;
+        const tk_scalar_t *restrict wr  = W  + (size_t)o * in_dim;
+        float             *restrict dWr = dW + (size_t)o * in_dim;
+        for (int i = 0; i < in_dim; i++) {
+            dWr[i] = dz * TK_TO_FLOAT(x[i]);
+            if (dxp) dxp[i] += TK_TO_FLOAT(wr[i]) * dz;
+        }
+    }
+}
+
+typedef struct {
+    const tk_scalar_t *W, *x;
+    const float *z, *dy;
+    float *dW, *db, *dx_partials;   /* per-thread dx accumulators (T x in_dim), or NULL */
+    int in_dim;
+    tk_activation_t act;
+} tk_bwd_ctx;
+
+static void bwd_worker(void *p, int o0, int o1, int worker) {
+    const tk_bwd_ctx *c = (const tk_bwd_ctx *)p;
+    float *dxp = c->dx_partials ? c->dx_partials + (size_t)worker * c->in_dim : NULL;
+    bwd_range(c->W, c->x, c->z, c->dy, c->dW, c->db, dxp, o0, o1, c->in_dim, c->act);
+}
 
 void tk_linear_backward(const tk_scalar_t *restrict W,
                         const tk_scalar_t *restrict x,
@@ -11,22 +46,30 @@ void tk_linear_backward(const tk_scalar_t *restrict W,
                         float *restrict dx,
                         int out_dim, int in_dim,
                         tk_activation_t act) {
-    if (dx) for (int i = 0; i < in_dim; i++) dx[i] = 0.0f;
+    const int T = ((long)out_dim * in_dim >= TK_MT_MIN_WORK) ? tk_num_threads() : 1;
 
-    for (int o = 0; o < out_dim; o++) {
-        /* Collapse the activation derivative into the output gradient once. */
-        const float dz = dy[o] * tk_act_grad_scalar(z[o], act);
-        if (db) db[o] = dz;
-
-        const tk_scalar_t *restrict wr  = W  + (size_t)o * in_dim;
-        float             *restrict dWr = dW + (size_t)o * in_dim;
-        /* dW row and dx accumulation share one pass over the row: wr/dWr are
-         * sequential (cache-friendly); dx stays hot across the o loop. */
-        for (int i = 0; i < in_dim; i++) {
-            dWr[i] = dz * TK_TO_FLOAT(x[i]);
-            if (dx) dx[i] += TK_TO_FLOAT(wr[i]) * dz;
-        }
+    if (T > 1 && !dx) {                       /* no input gradient: pure row-parallel */
+        tk_bwd_ctx c = { W, x, z, dy, dW, db, NULL, in_dim, act };
+        tk_parallel_for(out_dim, bwd_worker, &c);
+        return;
     }
+    if (T > 1) {                              /* dx is a reduction over rows */
+        float *partials = calloc((size_t)T * in_dim, sizeof(float));
+        if (partials) {                       /* each worker accumulates privately... */
+            tk_bwd_ctx c = { W, x, z, dy, dW, db, partials, in_dim, act };
+            tk_parallel_for(out_dim, bwd_worker, &c);
+            for (int i = 0; i < in_dim; i++) {  /* ...then sum the partials into dx */
+                float s = 0.0f;
+                for (int t = 0; t < T; t++) s += partials[(size_t)t * in_dim + i];
+                dx[i] = s;
+            }
+            free(partials);
+            return;
+        }                                     /* allocation failed -> serial */
+    }
+
+    if (dx) for (int i = 0; i < in_dim; i++) dx[i] = 0.0f;
+    bwd_range(W, x, z, dy, dW, db, dx, 0, out_dim, in_dim, act);
 }
 
 tk_optim tk_optim_default(float lr) {

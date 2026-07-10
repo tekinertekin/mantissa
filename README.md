@@ -86,13 +86,14 @@ bfloat16 (`make bench` / `make benchbp`):
 |---|---|
 | forward pass (10 threads) | **0.10 ms** (~83 GFLOP/s) |
 | forward pass (1 thread) | **0.35 ms** (~29 GFLOP/s) |
-| backward pass | **0.98 ms** (12.8 GFLOP/s) |
+| backward pass (10 threads) | **0.33 ms** (~39 GFLOP/s) |
+| backward pass (1 thread) | **1.01 ms** (~12 GFLOP/s) |
 | weight memory | **8 MB** — half of float32 |
 | `relu` over 4M values | **0.41 ms** |
 
-Forward uses explicit NEON kernels (bfloat16 leads — half the bytes, same FMAs)
-and a persistent thread pool that splits output rows across cores for large
-layers. Numbers are for the default bfloat16 on a 10-core Apple laptop.
+Forward *and* backward use explicit NEON kernels (bfloat16 leads — half the
+bytes, same FMAs) and a persistent thread pool that splits rows across cores for
+large layers. Numbers are for the default bfloat16 on a 10-core Apple laptop.
 
 Memory is the headline at scale — it decides whether a model loads at all:
 
@@ -169,12 +170,13 @@ bfloat16 on arm64 (portable fallback elsewhere). **bfloat16 leads on both axes**
 it moves half the bytes of float32 for the same FMAs. `tekin8` stays conversion-
 bound (E4M3→float unpack, no SIMD; native FP8 hardware removes that).
 
-On top, a **thread pool** splits the output rows across cores for large layers
-(the numbers above are single-thread):
+On top, a **thread pool** splits the output rows across cores for large layers,
+both forward and backward (the per-kernel numbers above are single-thread):
 
-| bfloat16 GEMV | 1 thread | 10 threads |
+| bfloat16 (2048×2048) | 1 thread | 10 threads |
 |---|:--:|:--:|
-| GFLOP/s | ~29 | **~83** (2.9×) |
+| forward GFLOP/s  | ~29 | **~83** (2.9×) |
+| backward GFLOP/s | ~12 | **~39** (3.1×) |
 
 Scaling is sub-linear because GEMV does only ~2 FLOPs per byte, so it saturates
 memory bandwidth before compute — float32 (twice the bytes) barely gains, which

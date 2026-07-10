@@ -147,10 +147,21 @@ is **bitwise identical to the serial path** (each dot product is still computed
 start-to-finish by one thread — no cross-thread reduction reordering). Small
 layers run serially below a work threshold so the pool never adds overhead to
 the common small-call case; `MANTISSA_THREADS` overrides the worker count, and
-platforms without pthreads compile a serial stub. Measured ~2.9× on bfloat16
-across 10 cores — sub-linear because GEMV's low arithmetic intensity (~2 FLOPs
-per byte) makes it memory-bandwidth bound before it is compute bound, the classic
-reason narrow storage matters.
+platforms without pthreads compile a serial stub.
+
+The **backward pass** parallelizes the same way, with one wrinkle: `dW` and `db`
+are per-row (disjoint, bitwise-identical to serial), but `dx = Σ_o Wᵀ·dz` is a
+*reduction* over rows — every row contributes to every `dx[i]`. Splitting rows
+would race on `dx`. So when `dx` is requested, each worker accumulates into a
+private `dx` buffer and the partials are summed afterwards; `dW`/`db` stay
+bitwise-identical and `dx` differs only by float reduction order. When `dx` is
+`NULL` (e.g. the first layer, which needs no input gradient) the reduction
+disappears and the whole backward is bitwise-identical.
+
+Measured on bfloat16 across 10 cores: forward ~2.9×, backward ~3.1×. Sub-linear
+because GEMV's low arithmetic intensity (~2 FLOPs per byte) makes it
+memory-bandwidth bound before it is compute bound — the classic reason narrow
+storage matters.
 
 ### Activation dispatch: switch beats a function pointer
 

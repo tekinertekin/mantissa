@@ -6,6 +6,29 @@ dense layer (4.2M params) unless noted, and are indicative, not absolute.
 
 ---
 
+## v0.1.6 — 2026-07-10  (tag `v0.1.6`)
+
+Multithread the **backward** pass too (v0.1.5 did the forward).
+
+**Optimized**
+- `tk_linear_backward` splits output rows across the thread pool. `dW`/`db` are
+  per-row so they stay bitwise-identical to serial; `dx` is a reduction over
+  rows, so when it is requested each worker accumulates into a private buffer
+  and the partials are summed afterwards (dx then differs only by float
+  reduction order). When `dx == NULL` (e.g. the first layer) the whole pass is
+  bitwise-identical.
+
+**Benchmarks** (bfloat16 backward GEMV, 2048×2048, 10-core Apple laptop)
+| threads | ms/pass | GFLOP/s |
+|---|:--:|:--:|
+| 1  | 1.01 | 12.45 |
+| 10 | 0.33 | **38.67** (3.1×) |
+
+**Correctness:** verified `dW`/`db` bitwise-identical serial vs 10 threads, and
+`dx` matching to reduction-order tolerance; all tests + gradient check pass.
+
+---
+
 ## v0.1.5 — 2026-07-10  (tag `v0.1.5`)
 
 Multithreaded GEMV — split the dense-layer output rows across CPU cores.
