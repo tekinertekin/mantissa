@@ -6,6 +6,29 @@ dense layer (4.2M params) unless noted, and are indicative, not absolute.
 
 ---
 
+## v0.1.4 — 2026-07-10  (tag `v0.1.4`)
+
+NEON kernel for **bfloat16** (the default dtype) — the follow-up promised in
+v0.1.3.
+
+**Optimized**
+- Explicit NEON GEMV for bfloat16 on arm64: 4 values loaded with `vld1_u16` and
+  widened in-register via `vshll_n_u16(v, 16)` (that shift *is* the bf16→float32
+  conversion), then FMA'd. Portable fallback unchanged elsewhere.
+
+**Benchmarks** (forward GEMV, 2048×2048; indicative, laptop-noisy)
+| dtype | baseline | v0.1.3 | v0.1.4 |
+|---|:--:|:--:|:--:|
+| bfloat16 | 8.57 | 10.70 | **~21** GFLOP/s |
+| float32  | 7.97 | 14.29 | ~15 |
+| tekin8   | 2.55 | 2.76  | ~3.2 |
+
+bfloat16 is now the fastest dtype *and* the smallest: it moves half the bytes of
+float32 for the same FMA work. All 7 forward dtypes + gradient check pass; the
+bf16 NEON path is validated by the bf16 tests and the XOR trainer on arm64.
+
+---
+
 ## v0.1.3 — 2026-07-10  (tag `v0.1.3`)
 
 Matmul (GEMV) throughput — the actual bottleneck in a real network.

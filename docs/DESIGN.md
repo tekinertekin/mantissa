@@ -125,12 +125,17 @@ loaded and converted once and feeds four independent FMA chains, so the FP units
 stay busy and the shared input is reused instead of reloaded per row — a
 single-row loop can do neither. This is ~1.3× across all dtypes.
 
-**Explicit NEON.** The float32 build additionally uses a hand-written NEON
-kernel on arm64 (`vfmaq_f32` into four `float32x4_t` accumulators, `vaddvq_f32`
-to reduce), guarded by `#if TK_DTYPE == FLOAT32 && defined(__aarch64__)` with the
-portable path as the fallback everywhere else. It roughly doubles float32
-throughput (7.97 → 14.3 GFLOP/s). A bf16-widening NEON kernel (`vshll`) is the
-next step; an AVX path is the x86 equivalent.
+**Explicit NEON.** On arm64, `tk__dot4` uses hand-written NEON kernels
+(`vfmaq_f32` into four `float32x4_t` accumulators, `vaddvq_f32` to reduce), with
+the portable blocked loop as the fallback on every other target/dtype:
+- **float32** loads with `vld1q_f32` — ~1.9× (7.97 → ~15 GFLOP/s).
+- **bfloat16** loads 4 values with `vld1_u16` and widens them in-register with
+  `vshll_n_u16(v, 16)` (bf16 *is* the top 16 bits of a float32, so the shift is
+  the conversion), then reinterprets to `float32x4_t` — ~2.5× (8.57 → ~21).
+  bfloat16 ends up fastest overall: half the bytes of float32 for the same FMAs.
+
+An AVX path is the x86 equivalent (planned); `tekin8`'s E4M3 unpack does not map
+to a single widening instruction, so it stays on the portable path for now.
 
 ### Activation dispatch: switch beats a function pointer
 

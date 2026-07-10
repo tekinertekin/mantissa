@@ -84,12 +84,13 @@ bfloat16 (`make bench` / `make benchbp`):
 
 | | value |
 |---|---|
-| forward pass | **0.78 ms** (10.7 GFLOP/s) |
+| forward pass | **0.39 ms** (~21 GFLOP/s) |
 | backward pass | **0.98 ms** (12.8 GFLOP/s) |
 | weight memory | **8 MB** — half of float32 |
 | `relu` over 4M values | **0.41 ms** |
 
-(float32 forward hits **14.3 GFLOP/s** via an explicit NEON kernel; see below.)
+(Both float32 and bfloat16 forward use explicit NEON kernels on arm64; bfloat16
+leads — half the bytes moved, same FMA work.)
 
 Memory is the headline at scale — it decides whether a model loads at all:
 
@@ -153,20 +154,20 @@ The numbers behind *Performance at a glance*, per dtype. `make DTYPE=<n> bench` 
 a 2048×2048 dense layer (4.2M params), plus the activation-dispatch micro-test.
 Apple M-series laptop, clang `-O3`; indicative, not absolute.
 
-| dtype    | weight memory | GEMV ms/pass | GEMV GFLOP/s | vs v0.1.2 |
-|----------|:-------------:|:------------:|:------------:|:---------:|
-| float32  | 16.0 MB | 0.59 | 14.29 | **1.8×** (NEON) |
-| bfloat16 |  8.0 MB | 0.78 | 10.70 | 1.25× (blocking) |
-| tekin8   |  4.0 MB | 3.04 |  2.76 | 1.08× |
+| dtype    | weight memory | GEMV ms/pass | GEMV GFLOP/s | vs baseline |
+|----------|:-------------:|:------------:|:------------:|:-----------:|
+| bfloat16 |  8.0 MB | 0.39 | ~21 | **2.5×** (NEON) |
+| float32  | 16.0 MB | 0.55 | ~15 | 1.9× (NEON) |
+| tekin8   |  4.0 MB | 2.6  | ~3.2 | 1.25× (blocking) |
 
 The forward pass is register-blocked (4 output rows share each `x` load and run
-4 independent FMA chains); the float32 path adds an explicit NEON FMA kernel on
-arm64. Reading, honestly: float32 now leads on throughput because it gets the
-NEON kernel, while `bfloat16` leads on *memory* (half the bytes) and would match
-it with a NEON bf16-widening kernel (a planned follow-up). `tekin8` stays
-conversion-bound — its E4M3→float unpack (a subnormal branch, no SIMD)
-dominates; native FP8 hardware (Blackwell tensor cores) removes that. `-mcpu=native`
-pushes float32 higher still (~17 GFLOP/s here).
+4 independent FMA chains), with explicit **NEON** FMA kernels for float32 and
+bfloat16 on arm64 (portable fallback elsewhere). Reading, honestly: **bfloat16
+now leads on both axes** — it moves half the bytes of float32 for the same FMA
+work, so once both are NEON-accelerated the memory advantage wins. `tekin8` stays
+conversion-bound: its E4M3→float unpack (a subnormal branch, no SIMD) dominates;
+native FP8 hardware (Blackwell tensor cores) removes that. Numbers are laptop-
+noisy; `-mcpu=native` pushes higher still.
 
 **Backward pass** (`make DTYPE=<n> benchbp`, same 2048×2048 layer):
 

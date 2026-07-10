@@ -1,8 +1,17 @@
 #include "ops.h"
 
-#if TK_DTYPE == TK_DTYPE_FLOAT32 && defined(__aarch64__)
+#if defined(__aarch64__)
 #include <arm_neon.h>
+#if TK_DTYPE == TK_DTYPE_FLOAT32
 #define TK_HAVE_NEON_F32 1
+#elif TK_DTYPE == TK_DTYPE_BFLOAT16
+#define TK_HAVE_NEON_BF16 1
+/* Load 4 bfloat16 as float32: widen u16->u32 and shift the bits into the high
+ * half — bf16 is exactly the top 16 bits of a float32, so this is the conversion. */
+static inline float32x4_t tk__bf16x4(const tk_bf16_t *p) {
+    return vreinterpretq_f32_u32(vshll_n_u16(vld1_u16(p), 16));
+}
+#endif
 #endif
 
 float tk_dot(const tk_scalar_t *restrict a, const tk_scalar_t *restrict b, int n) {
@@ -35,14 +44,22 @@ static inline void tk__dot4(const tk_scalar_t *restrict W, int in,
                        *restrict w2 = W + 2 * in, *restrict w3 = W + 3 * in;
     float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
     int i = 0;
-#ifdef TK_HAVE_NEON_F32
+#if defined(TK_HAVE_NEON_F32) || defined(TK_HAVE_NEON_BF16)
     float32x4_t a0 = vdupq_n_f32(0), a1 = a0, a2 = a0, a3 = a0;
     for (; i + 4 <= in; i += 4) {
+  #ifdef TK_HAVE_NEON_F32
         float32x4_t xv = vld1q_f32(x + i);
         a0 = vfmaq_f32(a0, vld1q_f32(w0 + i), xv);
         a1 = vfmaq_f32(a1, vld1q_f32(w1 + i), xv);
         a2 = vfmaq_f32(a2, vld1q_f32(w2 + i), xv);
         a3 = vfmaq_f32(a3, vld1q_f32(w3 + i), xv);
+  #else /* bf16: load + widen each vector */
+        float32x4_t xv = tk__bf16x4(x + i);
+        a0 = vfmaq_f32(a0, tk__bf16x4(w0 + i), xv);
+        a1 = vfmaq_f32(a1, tk__bf16x4(w1 + i), xv);
+        a2 = vfmaq_f32(a2, tk__bf16x4(w2 + i), xv);
+        a3 = vfmaq_f32(a3, tk__bf16x4(w3 + i), xv);
+  #endif
     }
     s0 = vaddvq_f32(a0); s1 = vaddvq_f32(a1); s2 = vaddvq_f32(a2); s3 = vaddvq_f32(a3);
 #endif
