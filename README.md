@@ -99,6 +99,14 @@ cache. On hardware with native FP8 conversion (F16C, AVX512-BF16, Blackwell
 tensor cores) that cost disappears; here it is a candid picture of a scalar,
 portable implementation.
 
+**Backward pass** (`make DTYPE=<n> benchbp`, same 2048×2048 layer):
+
+| dtype    | backward ms/pass | backward GFLOP/s | SGD update (M weights/s) |
+|----------|:----------------:|:----------------:|:------------------------:|
+| float32  | 1.03 | 12.21 | 9379 |
+| bfloat16 | 0.98 | 12.83 |  994 |
+| tekin8   | 3.04 |  4.14 |  298 |
+
 **Activation dispatch** (4M elements): a per-element `switch` beats a resolved
 function pointer ~3× for `relu` and ~1.5× for `sigmoid`. The inline `switch`
 vectorizes; an indirect call per element does not. So `tk_activate` keeps the
@@ -150,6 +158,17 @@ smaller than the storage type's precision rounds to zero and training stalls; SR
 rounds up/down with probability proportional to distance, so tiny updates
 accumulate in expectation (Gupta et al., 2015; the technique behind FP8 training
 on Hopper/Blackwell). It needs no fp32 master copy of the weights.
+
+Measured — same XOR run, 4000 epochs, round-to-nearest vs SR (`make DTYPE=<n> benchbp`):
+
+| dtype    | round-to-nearest | stochastic rounding |
+|----------|:----------------:|:-------------------:|
+| float32  | 0.00008 | 0.00008 *(SR is a no-op)* |
+| bfloat16 | 0.01090 | 0.00009 |
+| tekin8   | **0.24862 — stalled** | **0.00008 — converged** |
+
+In the 1-byte type, plain rounding never learns XOR; stochastic rounding does.
+That is the whole reason the technique exists.
 
 ### Training config (all OFF by default)
 

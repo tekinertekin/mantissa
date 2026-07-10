@@ -188,6 +188,11 @@ final `TK_FROM_FLOAT` is then exact. This is what lets `make train` learn XOR in
 bfloat16 without an fp32 master weight copy; on float32/tekin32 it is a no-op.
 It is the same mechanism used for FP8 weight updates on Hopper/Blackwell.
 
+`make benchbp` quantifies it on the XOR run (4000 epochs, final loss): in the
+1-byte tekin8, round-to-nearest stalls at 0.249 (never learns) while stochastic
+rounding reaches 0.00008; in bfloat16, 0.011 vs 0.00009; in float32 the two are
+identical, as expected.
+
 **L1/L2** fold into the gradient at the optimizer step (`g += l2·w`,
 `g += l1·sign(w)`); **dropout** is inverted (survivors scaled by `1/(1-rate)`),
 with the mask reused on the backward pass. All are config-gated, off by default.

@@ -27,7 +27,7 @@ else
     LIBEXT := so
 endif
 
-.PHONY: test testbp lib dist example mlp train bench clean
+.PHONY: test testbp lib dist example mlp train bench benchbp clean
 
 test: $(SRC) tests/test_dtypes.c
 	@mkdir -p $(BUILD)
@@ -72,6 +72,11 @@ bench: $(SRC) bench/benchmark.c
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $(BUILD)/benchmark $^ $(LDFLAGS)
 	@./$(BUILD)/benchmark
+
+benchbp: $(SRC) bench/bench_backprop.c
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -o $(BUILD)/bench_backprop $^ $(LDFLAGS)
+	@./$(BUILD)/bench_backprop
 
 clean:
 	rm -rf $(BUILD)
