@@ -84,10 +84,12 @@ bfloat16 (`make bench` / `make benchbp`):
 
 | | value |
 |---|---|
-| forward pass | **0.98 ms** (8.6 GFLOP/s) |
+| forward pass | **0.78 ms** (10.7 GFLOP/s) |
 | backward pass | **0.98 ms** (12.8 GFLOP/s) |
 | weight memory | **8 MB** — half of float32 |
 | `relu` over 4M values | **0.41 ms** |
+
+(float32 forward hits **14.3 GFLOP/s** via an explicit NEON kernel; see below.)
 
 Memory is the headline at scale — it decides whether a model loads at all:
 
@@ -151,18 +153,20 @@ The numbers behind *Performance at a glance*, per dtype. `make DTYPE=<n> bench` 
 a 2048×2048 dense layer (4.2M params), plus the activation-dispatch micro-test.
 Apple M-series laptop, clang `-O3`; indicative, not absolute.
 
-| dtype    | weight memory | GEMV ms/pass | GEMV GFLOP/s |
-|----------|:-------------:|:------------:|:------------:|
-| float32  | 16.0 MB | 1.05 | 7.97 |
-| bfloat16 |  8.0 MB | 0.98 | 8.57 |
-| tekin8   |  4.0 MB | 3.29 | 2.55 |
+| dtype    | weight memory | GEMV ms/pass | GEMV GFLOP/s | vs v0.1.2 |
+|----------|:-------------:|:------------:|:------------:|:---------:|
+| float32  | 16.0 MB | 0.59 | 14.29 | **1.8×** (NEON) |
+| bfloat16 |  8.0 MB | 0.78 | 10.70 | 1.25× (blocking) |
+| tekin8   |  4.0 MB | 3.04 |  2.76 | 1.08× |
 
-Reading, honestly: `bfloat16` beats `float32` (half the bytes, bf16→float is a
-single shift). `tekin8` is *slower* despite ¼ the memory — its E4M3→float
-conversion (a subnormal branch, no SIMD) dominates once the matrix fits in
-cache. On hardware with native FP8 conversion (F16C, AVX512-BF16, Blackwell
-tensor cores) that cost disappears; here it is a candid picture of a scalar,
-portable implementation.
+The forward pass is register-blocked (4 output rows share each `x` load and run
+4 independent FMA chains); the float32 path adds an explicit NEON FMA kernel on
+arm64. Reading, honestly: float32 now leads on throughput because it gets the
+NEON kernel, while `bfloat16` leads on *memory* (half the bytes) and would match
+it with a NEON bf16-widening kernel (a planned follow-up). `tekin8` stays
+conversion-bound — its E4M3→float unpack (a subnormal branch, no SIMD)
+dominates; native FP8 hardware (Blackwell tensor cores) removes that. `-mcpu=native`
+pushes float32 higher still (~17 GFLOP/s here).
 
 **Backward pass** (`make DTYPE=<n> benchbp`, same 2048×2048 layer):
 

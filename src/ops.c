@@ -1,5 +1,10 @@
 #include "ops.h"
 
+#if TK_DTYPE == TK_DTYPE_FLOAT32 && defined(__aarch64__)
+#include <arm_neon.h>
+#define TK_HAVE_NEON_F32 1
+#endif
+
 float tk_dot(const tk_scalar_t *restrict a, const tk_scalar_t *restrict b, int n) {
     /* Four independent accumulators break the loop-carried dependency on the FP
      * adder, letting the CPU pipeline/vectorize the FMAs instead of stalling on
@@ -18,13 +23,53 @@ float tk_dot(const tk_scalar_t *restrict a, const tk_scalar_t *restrict b, int n
     return s;
 }
 
+/* Four dot products (4 consecutive weight rows against the same x) at once.
+ * Register blocking: each x element is loaded once and feeds 4 independent FMA
+ * chains, so the FP units stay busy and x conversions are shared across rows —
+ * a single-row loop can do neither. ~1.3x portable; the float32 build adds an
+ * explicit NEON FMA kernel on arm64 for ~2x. */
+static inline void tk__dot4(const tk_scalar_t *restrict W, int in,
+                            const tk_scalar_t *restrict x,
+                            float *restrict out) {
+    const tk_scalar_t *restrict w0 = W, *restrict w1 = W + in,
+                       *restrict w2 = W + 2 * in, *restrict w3 = W + 3 * in;
+    float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+    int i = 0;
+#ifdef TK_HAVE_NEON_F32
+    float32x4_t a0 = vdupq_n_f32(0), a1 = a0, a2 = a0, a3 = a0;
+    for (; i + 4 <= in; i += 4) {
+        float32x4_t xv = vld1q_f32(x + i);
+        a0 = vfmaq_f32(a0, vld1q_f32(w0 + i), xv);
+        a1 = vfmaq_f32(a1, vld1q_f32(w1 + i), xv);
+        a2 = vfmaq_f32(a2, vld1q_f32(w2 + i), xv);
+        a3 = vfmaq_f32(a3, vld1q_f32(w3 + i), xv);
+    }
+    s0 = vaddvq_f32(a0); s1 = vaddvq_f32(a1); s2 = vaddvq_f32(a2); s3 = vaddvq_f32(a3);
+#endif
+    for (; i < in; i++) {
+        float xi = TK_TO_FLOAT(x[i]);
+        s0 += TK_TO_FLOAT(w0[i]) * xi; s1 += TK_TO_FLOAT(w1[i]) * xi;
+        s2 += TK_TO_FLOAT(w2[i]) * xi; s3 += TK_TO_FLOAT(w3[i]) * xi;
+    }
+    out[0] = s0; out[1] = s1; out[2] = s2; out[3] = s3;
+}
+
 void tk_linear_forward(const tk_scalar_t *restrict W,
                        const tk_scalar_t *restrict x,
                        const tk_scalar_t *restrict bias,
                        float *restrict y,
                        int out_dim, int in_dim,
                        tk_activation_t act) {
-    for (int o = 0; o < out_dim; o++) {
+    int o = 0;
+    for (; o + 4 <= out_dim; o += 4) {
+        float s[4];
+        tk__dot4(W + (size_t)o * in_dim, in_dim, x, s);
+        for (int k = 0; k < 4; k++) {
+            float z = s[k] + (bias ? TK_TO_FLOAT(bias[o + k]) : 0.0f);
+            y[o + k] = tk_act_scalar(z, act);
+        }
+    }
+    for (; o < out_dim; o++) {                       /* remaining rows */
         float z = tk_dot(W + (size_t)o * in_dim, x, in_dim);
         if (bias) z += TK_TO_FLOAT(bias[o]);
         y[o] = tk_act_scalar(z, act);

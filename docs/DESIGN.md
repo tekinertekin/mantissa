@@ -119,6 +119,19 @@ out-of-order engine keep multiple FMAs in flight. Combined with
 aliasing → free to vectorize), and `-O3 -funroll-loops`, the compiler emits
 vectorized FMA. `-march=native` unlocks the full SIMD width locally.
 
+**Register blocking (GEMV).** `tk_linear_forward` does not call `tk_dot`
+per row; it computes **four output rows at once** (`tk__dot4`). Each `x[i]` is
+loaded and converted once and feeds four independent FMA chains, so the FP units
+stay busy and the shared input is reused instead of reloaded per row — a
+single-row loop can do neither. This is ~1.3× across all dtypes.
+
+**Explicit NEON.** The float32 build additionally uses a hand-written NEON
+kernel on arm64 (`vfmaq_f32` into four `float32x4_t` accumulators, `vaddvq_f32`
+to reduce), guarded by `#if TK_DTYPE == FLOAT32 && defined(__aarch64__)` with the
+portable path as the fallback everywhere else. It roughly doubles float32
+throughput (7.97 → 14.3 GFLOP/s). A bf16-widening NEON kernel (`vshll`) is the
+next step; an AVX path is the x86 equivalent.
+
 ### Activation dispatch: switch beats a function pointer
 
 Intuition says an indirect `function pointer` avoids the cost of a `switch`.

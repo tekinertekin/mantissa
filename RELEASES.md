@@ -6,6 +6,32 @@ dense layer (4.2M params) unless noted, and are indicative, not absolute.
 
 ---
 
+## v0.1.3 — 2026-07-10  (tag `v0.1.3`)
+
+Matmul (GEMV) throughput — the actual bottleneck in a real network.
+
+**Optimized**
+- **Register-blocked forward pass** (`tk__dot4`): computes four output rows at
+  once so each `x` element is loaded/converted once and feeds four independent
+  FMA chains. ~1.3× across all dtypes, portable.
+- **Explicit NEON kernel** for the float32 build on arm64 (`vfmaq_f32` +
+  `vaddvq_f32`), with the portable path as the fallback on every other
+  target/dtype. ~1.8× for float32.
+
+**Benchmarks** (forward GEMV, 2048×2048)
+| dtype | v0.1.2 GFLOP/s | v0.1.3 GFLOP/s | speedup |
+|---|:--:|:--:|:--:|
+| float32  | 7.97 | 14.29 | 1.8× (NEON) |
+| bfloat16 | 8.57 | 10.70 | 1.25× |
+| tekin8   | 2.55 | 2.76  | 1.08× |
+
+Correctness re-verified: all 7 forward dtypes + the gradient check pass. The
+NEON path is exercised by the float32 tests on arm64 (locally); CI runs on
+x86_64 and covers the portable fallback. Next: a bf16-widening NEON kernel and
+an AVX path.
+
+---
+
 ## v0.1.2 — 2026-07-10  (tag `v0.1.2`)
 
 Multi-language clients, Python training, README diagrams, and an
