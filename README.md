@@ -84,13 +84,15 @@ bfloat16 (`make bench` / `make benchbp`):
 
 | | value |
 |---|---|
-| forward pass | **0.39 ms** (~21 GFLOP/s) |
+| forward pass (10 threads) | **0.10 ms** (~83 GFLOP/s) |
+| forward pass (1 thread) | **0.35 ms** (~29 GFLOP/s) |
 | backward pass | **0.98 ms** (12.8 GFLOP/s) |
 | weight memory | **8 MB** — half of float32 |
 | `relu` over 4M values | **0.41 ms** |
 
-(Both float32 and bfloat16 forward use explicit NEON kernels on arm64; bfloat16
-leads — half the bytes moved, same FMA work.)
+Forward uses explicit NEON kernels (bfloat16 leads — half the bytes, same FMAs)
+and a persistent thread pool that splits output rows across cores for large
+layers. Numbers are for the default bfloat16 on a 10-core Apple laptop.
 
 Memory is the headline at scale — it decides whether a model loads at all:
 
@@ -107,10 +109,11 @@ Memory is the headline at scale — it decides whether a model loads at all:
    faster. The precision is a build-time dial (below).
 2. **float32 accumulation** — compute always sums in float32 so accuracy holds
    across a layer's millions of terms (mixed precision; Micikevicius 2017).
-3. **Tuned kernels** — a vectorizing dot product (four independent accumulators,
-   FMA, `restrict`), branchless activations (sign-bit / `fmax` / `copysign`,
-   chosen by benchmark), and stochastic rounding so training survives narrow
-   weights. Details and measurements in [docs/DESIGN.md](docs/DESIGN.md).
+3. **Tuned kernels** — register-blocked GEMV with explicit NEON FMA kernels
+   (arm64) and a persistent thread pool across cores, branchless activations
+   (sign-bit / `fmax` / `copysign`, chosen by benchmark), and stochastic rounding
+   so training survives narrow weights. Details and measurements in
+   [docs/DESIGN.md](docs/DESIGN.md).
 
 ### The precision dial
 
@@ -162,12 +165,22 @@ Apple M-series laptop, clang `-O3`; indicative, not absolute.
 
 The forward pass is register-blocked (4 output rows share each `x` load and run
 4 independent FMA chains), with explicit **NEON** FMA kernels for float32 and
-bfloat16 on arm64 (portable fallback elsewhere). Reading, honestly: **bfloat16
-now leads on both axes** — it moves half the bytes of float32 for the same FMA
-work, so once both are NEON-accelerated the memory advantage wins. `tekin8` stays
-conversion-bound: its E4M3→float unpack (a subnormal branch, no SIMD) dominates;
-native FP8 hardware (Blackwell tensor cores) removes that. Numbers are laptop-
-noisy; `-mcpu=native` pushes higher still.
+bfloat16 on arm64 (portable fallback elsewhere). **bfloat16 leads on both axes**:
+it moves half the bytes of float32 for the same FMAs. `tekin8` stays conversion-
+bound (E4M3→float unpack, no SIMD; native FP8 hardware removes that).
+
+On top, a **thread pool** splits the output rows across cores for large layers
+(the numbers above are single-thread):
+
+| bfloat16 GEMV | 1 thread | 10 threads |
+|---|:--:|:--:|
+| GFLOP/s | ~29 | **~83** (2.9×) |
+
+Scaling is sub-linear because GEMV does only ~2 FLOPs per byte, so it saturates
+memory bandwidth before compute — float32 (twice the bytes) barely gains, which
+is exactly why the narrow default matters. Small layers run serially (below a
+work threshold) so the pool never hurts the millions-of-small-calls case; set
+`MANTISSA_THREADS` to tune. Numbers are laptop-noisy.
 
 **Backward pass** (`make DTYPE=<n> benchbp`, same 2048×2048 layer):
 
@@ -347,7 +360,7 @@ same gradient and optimizer pieces.
 ## Project layout
 
 ```
-include/   config, dtypes + conversions, activations, ops, loss, backprop
+include/   config, dtypes + conversions, activations, ops, loss, backprop, pool
 src/       implementations
 tests/     forward round-trip checks (7 formats) + backprop gradient check
 examples/  perceptron, mixed-MLP, XOR training

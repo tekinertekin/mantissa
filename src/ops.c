@@ -1,4 +1,5 @@
 #include "ops.h"
+#include "pool.h"
 
 #if defined(__aarch64__)
 #include <arm_neon.h>
@@ -71,14 +72,13 @@ static inline void tk__dot4(const tk_scalar_t *restrict W, int in,
     out[0] = s0; out[1] = s1; out[2] = s2; out[3] = s3;
 }
 
-void tk_linear_forward(const tk_scalar_t *restrict W,
-                       const tk_scalar_t *restrict x,
-                       const tk_scalar_t *restrict bias,
-                       float *restrict y,
-                       int out_dim, int in_dim,
-                       tk_activation_t act) {
-    int o = 0;
-    for (; o + 4 <= out_dim; o += 4) {
+/* Compute output rows [o0, o1) — the unit of work a thread owns (rows are
+ * disjoint, so no locking). Uses the 4-row register-blocked kernel internally. */
+static void gemv_range(const tk_scalar_t *restrict W, const tk_scalar_t *restrict x,
+                       const tk_scalar_t *restrict bias, float *restrict y,
+                       int o0, int o1, int in_dim, tk_activation_t act) {
+    int o = o0;
+    for (; o + 4 <= o1; o += 4) {
         float s[4];
         tk__dot4(W + (size_t)o * in_dim, in_dim, x, s);
         for (int k = 0; k < 4; k++) {
@@ -86,10 +86,40 @@ void tk_linear_forward(const tk_scalar_t *restrict W,
             y[o + k] = tk_act_scalar(z, act);
         }
     }
-    for (; o < out_dim; o++) {                       /* remaining rows */
+    for (; o < o1; o++) {
         float z = tk_dot(W + (size_t)o * in_dim, x, in_dim);
         if (bias) z += TK_TO_FLOAT(bias[o]);
         y[o] = tk_act_scalar(z, act);
+    }
+}
+
+/* Parallelize only above this much work (out_dim * in_dim); small layers run
+ * serially so the pool overhead never hurts the millions-of-small-calls case. */
+#define TK_MT_MIN_WORK (1 << 18)
+
+typedef struct {
+    const tk_scalar_t *W, *x, *bias;
+    float *y;
+    int in_dim;
+    tk_activation_t act;
+} tk_gemv_ctx;
+
+static void gemv_worker(void *p, int o0, int o1) {
+    const tk_gemv_ctx *c = (const tk_gemv_ctx *)p;
+    gemv_range(c->W, c->x, c->bias, c->y, o0, o1, c->in_dim, c->act);
+}
+
+void tk_linear_forward(const tk_scalar_t *restrict W,
+                       const tk_scalar_t *restrict x,
+                       const tk_scalar_t *restrict bias,
+                       float *restrict y,
+                       int out_dim, int in_dim,
+                       tk_activation_t act) {
+    if ((long)out_dim * in_dim >= TK_MT_MIN_WORK && tk_num_threads() > 1) {
+        tk_gemv_ctx c = { W, x, bias, y, in_dim, act };
+        tk_parallel_for(out_dim, gemv_worker, &c);   /* split rows across the pool */
+    } else {
+        gemv_range(W, x, bias, y, 0, out_dim, in_dim, act);
     }
 }
 

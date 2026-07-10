@@ -6,6 +6,31 @@ dense layer (4.2M params) unless noted, and are indicative, not absolute.
 
 ---
 
+## v0.1.5 — 2026-07-10  (tag `v0.1.5`)
+
+Multithreaded GEMV — split the dense-layer output rows across CPU cores.
+
+**Added**
+- Persistent fork-join **thread pool** (`src/pool.c`): workers created once
+  (lazily), woken per call by a condvar barrier — no per-call `pthread_create`.
+  `tk_linear_forward` splits output rows across it above a work threshold; small
+  layers stay serial so the pool never hurts the millions-of-small-calls path.
+  `MANTISSA_THREADS` tunes the count; non-pthreads targets get a serial stub.
+
+**Benchmarks** (bfloat16 forward GEMV, 2048×2048, 10-core Apple laptop)
+| threads | GFLOP/s |
+|---|:--:|
+| 1  | ~29 |
+| 10 | **~83** (2.9×) |
+
+Sub-linear by design: GEMV does ~2 FLOPs/byte, so it hits the memory-bandwidth
+wall before the compute wall (float32, twice the bytes, gains only ~1.2×).
+**Correctness:** the multithreaded result is bitwise identical to serial (each
+row is computed entirely by one thread — no reduction reordering); verified by
+matching checksums and the full test suite.
+
+---
+
 ## v0.1.4 — 2026-07-10  (tag `v0.1.4`)
 
 NEON kernel for **bfloat16** (the default dtype) — the follow-up promised in

@@ -14,10 +14,10 @@ DTYPE   ?= 2
 # -O3 + fast FP contraction lets tk_dot fold multiply-add into FMA and vectorize.
 # Add `march=native` locally for full SIMD width; kept off by default for portable builds.
 CFLAGS  := -O3 -funroll-loops -ffp-contract=fast -Wall -Wextra -std=c11 \
-           -Iinclude -DTK_DTYPE=$(DTYPE) -fvisibility=hidden
-LDFLAGS := -lm
+           -Iinclude -DTK_DTYPE=$(DTYPE) -fvisibility=hidden -pthread
+LDFLAGS := -lm -pthread
 
-SRC     := src/dtypes.c src/activations.c src/ops.c src/loss.c src/backprop.c
+SRC     := src/dtypes.c src/activations.c src/ops.c src/loss.c src/backprop.c src/pool.c
 BUILD   := build
 
 UNAME_S := $(shell uname -s)

@@ -137,6 +137,21 @@ the portable blocked loop as the fallback on every other target/dtype:
 An AVX path is the x86 equivalent (planned); `tekin8`'s E4M3 unpack does not map
 to a single widening instruction, so it stays on the portable path for now.
 
+**Multithreading.** A dense layer's output rows are independent, so
+`tk_linear_forward` splits them across a **persistent thread pool** (`pool.c`):
+a fixed set of workers created once (lazily) and woken per call via a
+condition-variable barrier — never `pthread_create` per call, which would be
+fatal for a function invoked millions of times. Each thread owns a contiguous
+row range and writes its own slice of `y`, so there is no locking and the result
+is **bitwise identical to the serial path** (each dot product is still computed
+start-to-finish by one thread — no cross-thread reduction reordering). Small
+layers run serially below a work threshold so the pool never adds overhead to
+the common small-call case; `MANTISSA_THREADS` overrides the worker count, and
+platforms without pthreads compile a serial stub. Measured ~2.9× on bfloat16
+across 10 cores — sub-linear because GEMV's low arithmetic intensity (~2 FLOPs
+per byte) makes it memory-bandwidth bound before it is compute bound, the classic
+reason narrow storage matters.
+
 ### Activation dispatch: switch beats a function pointer
 
 Intuition says an indirect `function pointer` avoids the cost of a `switch`.
