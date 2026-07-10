@@ -4,7 +4,7 @@
 ![Language](https://img.shields.io/badge/C-C11-00599C.svg)
 ![Python](https://img.shields.io/badge/python-ctypes-3776AB.svg)
 ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen.svg)
-![Tests](https://img.shields.io/badge/tests-7%20dtypes%20passing-brightgreen.svg)
+![Tests](https://img.shields.io/badge/tests-7%20dtypes%20%2B%20gradcheck-brightgreen.svg)
 
 **A low-precision numerics core for neural networks — C engine, Python skin.**
 
@@ -120,6 +120,50 @@ That is a full 3-layer MLP with three different bias/activation setups —
 exactly the heterogeneity a Transformer needs (bias-free attention projections,
 bias-using feed-forward). Run it: `make mlp`.
 
+## Training (back-propagation)
+
+The reverse pass mirrors the forward core: `tk_linear_backward` computes the
+weight, bias, and input gradients for a dense layer; `tk_sgd_step` updates
+narrow-stored weights; `tk_loss` (MSE / BCE) seeds the gradient. No autograd
+graph — the caller drives the layers, keeping everything explicit and
+inspectable.
+
+Correctness is proven by a **gradient check** (`make testbp`): analytic
+gradients vs central finite differences, matching to <1e-3 for tanh, sigmoid,
+relu, and gelu.
+
+`make train` learns **XOR** — the problem a single perceptron *cannot* solve —
+end to end, in the default **bfloat16**:
+
+```
+Training XOR  (dtype=bfloat16, stochastic_rounding=1)
+  epoch    0  loss 0.31523
+  epoch 1000  loss 0.00035
+  epoch 4000  loss 0.00007
+predictions:
+  (0,0) -> 0.004   (0,1) -> 0.990   (1,0) -> 0.991   (1,1) -> 0.009
+```
+
+That it converges in bf16 is the point of **stochastic rounding** (config
+`TK_USE_STOCHASTIC_ROUNDING`): under plain round-to-nearest, a weight update
+smaller than the storage type's precision rounds to zero and training stalls; SR
+rounds up/down with probability proportional to distance, so tiny updates
+accumulate in expectation (Gupta et al., 2015; the technique behind FP8 training
+on Hopper/Blackwell). It needs no fp32 master copy of the weights.
+
+### Training config (all OFF by default)
+
+| Flag | Effect |
+|------|--------|
+| `TK_USE_DROPOUT` / `TK_DROPOUT_RATE` | inverted dropout on activations |
+| `TK_USE_L1` / `TK_L1_LAMBDA`         | L1 weight penalty in the update |
+| `TK_USE_L2` / `TK_L2_LAMBDA`         | L2 weight penalty in the update |
+| `TK_USE_STOCHASTIC_ROUNDING`         | SR on the weight write-back |
+
+Each sets a default; the runtime `tk_optim` / dropout calls override per layer.
+Back-propagation is scoped to the dense layer for now (the shared primitive);
+conv/recurrent backward reuse the same pieces later.
+
 ## Zero-config
 
 Never touch `config.h` and you get Google's **bfloat16** with **bias enabled** —
@@ -160,16 +204,17 @@ The low-precision frontier moves fast; `mantissa` tracks it deliberately:
 microscaling (a shared per-block scale) is the next planned step. **Convolution
 is already within reach**: a conv layer is a batch of dot products of a filter
 against input patches, and `tk_dot` is exactly that primitive — a CNN needs an
-`im2col`/patch iterator on top, no new numerics. Training / back-propagation is
-a later stage and is intentionally not here yet.
+`im2col`/patch iterator on top, no new numerics. Back-propagation for the dense
+layer is implemented (gradient-checked); conv/recurrent backward will reuse the
+same gradient and optimizer pieces.
 
 ## Project layout
 
 ```
-include/   config, dtypes + conversions, activations, linear-algebra ops
+include/   config, dtypes + conversions, activations, ops, loss, backprop
 src/       implementations
-tests/     round-trip + forward-pass checks for all 7 formats
-examples/  C perceptron + mixed-MLP demos
+tests/     forward round-trip checks (7 formats) + backprop gradient check
+examples/  perceptron, mixed-MLP, XOR training
 bench/     GEMV + activation-dispatch benchmark
 python/    ctypes binding + Python perceptron
 docs/      DESIGN.md (numerics, optimization), USAGE.md (API + examples)

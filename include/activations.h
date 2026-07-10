@@ -50,4 +50,25 @@ static inline float tk_act_scalar(float z, tk_activation_t a) {
 /* Apply an activation over a contiguous vector in place (resolves once). */
 TK_API void tk_activate(float *y, int n, tk_activation_t a);
 
+/* Derivative d(act)/dz at pre-activation z, for back-propagation.
+ * step/sign are non-differentiable (gradient 0) and only make sense in a
+ * forward-only perceptron. */
+static inline float tk_act_grad_scalar(float z, tk_activation_t a) {
+    switch (a) {
+        case TK_ACT_RELU:    return z > 0.0f ? 1.0f : 0.0f;
+        case TK_ACT_SIGMOID: { float s = 1.0f / (1.0f + __builtin_expf(-z));
+                               return s * (1.0f - s); }
+        case TK_ACT_TANH:    { float t = __builtin_tanhf(z); return 1.0f - t * t; }
+        case TK_ACT_GELU: {
+            const float c = 0.7978845608028654f, a3 = 0.044715f;
+            float u  = c * (z + a3 * z * z * z);
+            float th = __builtin_tanhf(u);
+            float du = c * (1.0f + 3.0f * a3 * z * z);
+            return 0.5f * (1.0f + th) + 0.5f * z * (1.0f - th * th) * du;
+        }
+        case TK_ACT_IDENTITY: return 1.0f;
+        default:              return 0.0f;   /* step, sign */
+    }
+}
+
 #endif /* MANTISSA_ACTIVATIONS_H */

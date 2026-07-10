@@ -102,36 +102,43 @@ TK_API tk_fp4_t  tk_float_to_fp4(float f);
     #define TK_TO_FLOAT(x)   ((float)(x))
     #define TK_FROM_FLOAT(f) ((float)(f))
     #define TK_DTYPE_NAME    "float32"
+    #define TK_MANT_BITS     23
 #elif TK_DTYPE == TK_DTYPE_FP16
     typedef tk_fp16_t tk_scalar_t;
     #define TK_TO_FLOAT(x)   tk_fp16_to_float(x)
     #define TK_FROM_FLOAT(f) tk_float_to_fp16(f)
     #define TK_DTYPE_NAME    "fp16"
+    #define TK_MANT_BITS     10
 #elif TK_DTYPE == TK_DTYPE_BFLOAT16
     typedef tk_bf16_t tk_scalar_t;
     #define TK_TO_FLOAT(x)   tk_bf16_to_float(x)
     #define TK_FROM_FLOAT(f) tk_float_to_bf16(f)
     #define TK_DTYPE_NAME    "bfloat16"
+    #define TK_MANT_BITS     7
 #elif TK_DTYPE == TK_DTYPE_TEKIN32
     typedef tk_t32_t tk_scalar_t;
     #define TK_TO_FLOAT(x)   tk_t32_to_float(x)
     #define TK_FROM_FLOAT(f) tk_float_to_t32(f)
     #define TK_DTYPE_NAME    "tekin32"
+    #define TK_MANT_BITS     24
 #elif TK_DTYPE == TK_DTYPE_TEKIN8
     typedef tk_f8_t tk_scalar_t;
     #define TK_TO_FLOAT(x)   tk_f8_to_float(x)
     #define TK_FROM_FLOAT(f) tk_float_to_f8(f)
     #define TK_DTYPE_NAME    "tekin8"
+    #define TK_MANT_BITS     3
 #elif TK_DTYPE == TK_DTYPE_FP8_E5M2
     typedef tk_e5m2_t tk_scalar_t;
     #define TK_TO_FLOAT(x)   tk_e5m2_to_float(x)
     #define TK_FROM_FLOAT(f) tk_float_to_e5m2(f)
     #define TK_DTYPE_NAME    "fp8_e5m2"
+    #define TK_MANT_BITS     2
 #elif TK_DTYPE == TK_DTYPE_FP4_E2M1
     typedef tk_fp4_t tk_scalar_t;
     #define TK_TO_FLOAT(x)   tk_fp4_to_float(x)
     #define TK_FROM_FLOAT(f) tk_float_to_fp4(f)
     #define TK_DTYPE_NAME    "fp4_e2m1"
+    #define TK_MANT_BITS     1
 #else
     #error "Unknown TK_DTYPE in config.h"
 #endif

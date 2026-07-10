@@ -17,7 +17,7 @@ CFLAGS  := -O3 -funroll-loops -ffp-contract=fast -Wall -Wextra -std=c11 \
            -Iinclude -DTK_DTYPE=$(DTYPE) -fvisibility=hidden
 LDFLAGS := -lm
 
-SRC     := src/dtypes.c src/activations.c src/ops.c
+SRC     := src/dtypes.c src/activations.c src/ops.c src/loss.c src/backprop.c
 BUILD   := build
 
 UNAME_S := $(shell uname -s)
@@ -27,7 +27,7 @@ else
     LIBEXT := so
 endif
 
-.PHONY: test lib dist example mlp bench clean
+.PHONY: test testbp lib dist example mlp train bench clean
 
 test: $(SRC) tests/test_dtypes.c
 	@mkdir -p $(BUILD)
@@ -55,6 +55,18 @@ mlp: $(SRC) examples/mlp_example.c
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $(BUILD)/mlp_example $^ $(LDFLAGS)
 	@./$(BUILD)/mlp_example
+
+train: $(SRC) examples/train_xor.c
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -o $(BUILD)/train_xor $^ $(LDFLAGS)
+	@./$(BUILD)/train_xor
+
+# Gradient check always runs at float32 (finite differences need precision).
+testbp: $(SRC) tests/test_backprop.c
+	@mkdir -p $(BUILD)
+	$(CC) -O3 -funroll-loops -ffp-contract=fast -Wall -Wextra -std=c11 \
+	      -Iinclude -DTK_DTYPE=0 -o $(BUILD)/test_backprop $^ $(LDFLAGS)
+	@./$(BUILD)/test_backprop
 
 bench: $(SRC) bench/benchmark.c
 	@mkdir -p $(BUILD)

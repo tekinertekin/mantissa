@@ -29,4 +29,42 @@
 #define TK_USE_BIAS 1
 #endif
 
+/* --- Training options (all OFF by default) --------------------------------
+ * These set the defaults filled into tk_optim_default() / tk_dropout_*; they
+ * are still overridable per call at runtime. */
+
+/* Dropout: randomly zero activations during training (Srivastava et al., 2014).
+ * TK_DROPOUT_RATE is the fraction dropped when enabled. */
+#ifndef TK_USE_DROPOUT
+#define TK_USE_DROPOUT 0
+#endif
+#ifndef TK_DROPOUT_RATE
+#define TK_DROPOUT_RATE 0.5f
+#endif
+
+/* L1 / L2 weight regularization, added to the gradient in the optimizer step. */
+#ifndef TK_USE_L1
+#define TK_USE_L1 0
+#endif
+#ifndef TK_L1_LAMBDA
+#define TK_L1_LAMBDA 1e-5f
+#endif
+#ifndef TK_USE_L2
+#define TK_USE_L2 0
+#endif
+#ifndef TK_L2_LAMBDA
+#define TK_L2_LAMBDA 1e-4f
+#endif
+
+/* Stochastic rounding on the weight update. Under round-to-nearest a small
+ * lr*grad step below the storage type's precision rounds to zero and training
+ * stalls; SR rounds up/down with probability proportional to distance, so tiny
+ * updates accumulate in expectation. This is what lets narrow types train
+ * without an fp32 master copy (Gupta et al., 2015, arXiv:1502.02551; used in
+ * FP8 training on Hopper/Blackwell). No effect on float32/tekin32 (updates are
+ * already exact there). */
+#ifndef TK_USE_STOCHASTIC_ROUNDING
+#define TK_USE_STOCHASTIC_ROUNDING 0
+#endif
+
 #endif /* MANTISSA_CONFIG_H */

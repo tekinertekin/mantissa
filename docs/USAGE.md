@@ -92,6 +92,31 @@ Values are quantized through the library's storage dtype inside
 `tk_linear_forward_f32`, so the same Python runs against any build.
 Full file: [`python/perceptron_example.py`](../python/perceptron_example.py).
 
+## Training (back-propagation)
+
+```c
+#include "loss.h"
+#include "backprop.h"
+
+float loss = tk_loss(y, target, dy, n, TK_LOSS_MSE);   // seeds dL/dy
+
+// dense-layer backward: fills dW, db (or NULL), dx (or NULL)
+tk_linear_backward(W, x, z /*pre-activation*/, dy, dW, db, dx,
+                   out_dim, in_dim, act);
+
+tk_optim opt = tk_optim_default(0.5f);   // lr; l1/l2/SR from config
+tk_sgd_step(W, dW, out_dim * in_dim, &opt, &rng);   // W -= lr*(dW + reg)
+```
+
+- `z` is the pre-activation — get it with `tk_linear_forward(..., TK_ACT_IDENTITY)`
+  then `tk_activate` for the output.
+- Dropout: `tk_dropout_forward(y, mask, n, rate, &rng)` /
+  `tk_dropout_backward(dy, mask, n, rate)`.
+- `tk_rng rng = tk_rng_seed(seed)` drives dropout masks and stochastic rounding.
+
+Worked end-to-end trainer: [`examples/train_xor.c`](../examples/train_xor.c)
+(`make train`). Gradient check: `make testbp`.
+
 ## Which functions to call
 
 | You want to… | Call |
@@ -101,4 +126,8 @@ Full file: [`python/perceptron_example.py`](../python/perceptron_example.py).
 | One neuron / a dense layer forward | `tk_linear_forward` |
 | Just a dot product | `tk_dot` |
 | Apply an activation over a vector | `tk_activate` |
+| Loss + seed gradient | `tk_loss` |
+| Dense layer backward | `tk_linear_backward` |
+| Update weights (SGD, L1/L2, SR) | `tk_sgd_step` / `tk_optim_default` |
+| Dropout forward / backward | `tk_dropout_forward` / `tk_dropout_backward` |
 | Know the active dtype from Python | `Mantissa().dtype` |

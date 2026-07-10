@@ -165,3 +165,35 @@ of reimplementing the numerics.
 - **Posit / takum** (Gustafson) — tapered-precision alternatives to IEEE
   floats; more precision near ±1 where zero-centered weights concentrate.
 - **IEEE P3109** — emerging standard for ML arithmetic formats (2025).
+
+## 5. Back-propagation
+
+The backward pass keeps the forward core's philosophy: no autograd graph, an
+explicit primitive the caller drives.
+
+`tk_linear_backward` collapses the activation derivative into the output
+gradient once (`dz = dy · act'(z)`), then computes `dW`, `db`, and `dx` in a
+single pass over each weight row — `W`/`dW` accessed sequentially (cache
+friendly) while `dx` stays hot across the output loop. Accumulation is float32,
+matching the forward pass.
+
+**Stochastic rounding** is the key low-precision-training idea (Gupta et al.,
+2015, arXiv:1502.02551). Storing weights narrow, a plain round-to-nearest write
+of `w - lr·g` discards any update below the type's ULP, so with a small learning
+rate training silently stalls. SR rounds to the neighbouring grid point with
+probability equal to the fractional distance, so an update of ⅓ ULP moves the
+weight ⅓ of the time — correct in expectation. `tk_sr_from_float` derives the
+ULP from the value's binade and `TK_MANT_BITS`, rounds onto the grid, and the
+final `TK_FROM_FLOAT` is then exact. This is what lets `make train` learn XOR in
+bfloat16 without an fp32 master weight copy; on float32/tekin32 it is a no-op.
+It is the same mechanism used for FP8 weight updates on Hopper/Blackwell.
+
+**L1/L2** fold into the gradient at the optimizer step (`g += l2·w`,
+`g += l1·sign(w)`); **dropout** is inverted (survivors scaled by `1/(1-rate)`),
+with the mask reused on the backward pass. All are config-gated, off by default.
+
+**Correctness** is not asserted, it is checked: `make testbp` compares analytic
+gradients against central finite differences (`(L(w+h)−L(w−h))/2h`) at float32,
+requiring <1e-2 relative error over all weight and input gradients for tanh,
+sigmoid, relu, and gelu. Finite-difference gradient checking is the standard way
+to prove a hand-written backward pass matches its forward pass.
