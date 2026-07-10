@@ -3,10 +3,25 @@
 
 #include <stdint.h>
 #include <string.h>
+#include "config.h"
 #include "tk_export.h"
 
 /* Reinterpret a float's bits (no aliasing violation, no-op at -O2). */
 static inline uint32_t tk_act__bits(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
+
+/* exp/tanh backends: exact (libm) by default, or a branchless rational
+ * approximation that vectorizes when TK_FAST_MATH is set (see config.h). */
+#if TK_FAST_MATH
+static inline float tk__tanh(float x) {
+    x = __builtin_fminf(3.0f, __builtin_fmaxf(-3.0f, x));   /* clamp, branchless */
+    float x2 = x * x;
+    return x * (27.0f + x2) / (27.0f + 9.0f * x2);          /* Pade [3/2] */
+}
+static inline float tk__sigmoid(float x) { return 0.5f * (tk__tanh(0.5f * x) + 1.0f); }
+#else
+static inline float tk__tanh(float x)    { return __builtin_tanhf(x); }
+static inline float tk__sigmoid(float x) { return 1.0f / (1.0f + __builtin_expf(-x)); }
+#endif
 
 /* Shared by every layer type this library will feed: perceptron (step/sign),
  * MLP/RNN (relu/tanh/sigmoid), LSTM/GRU gates (sigmoid/tanh), Transformer (gelu). */
@@ -48,9 +63,9 @@ static inline float tk_act_scalar(float z, tk_activation_t a) {
          * vectorize; branchless. */
         case TK_ACT_SIGN:    return __builtin_copysignf(1.0f, z);
         case TK_ACT_RELU:    return __builtin_fmaxf(z, 0.0f);
-        case TK_ACT_SIGMOID: return 1.0f / (1.0f + __builtin_expf(-z));
-        case TK_ACT_TANH:    return __builtin_tanhf(z);
-        case TK_ACT_GELU:    return 0.5f * z * (1.0f + __builtin_tanhf(
+        case TK_ACT_SIGMOID: return tk__sigmoid(z);
+        case TK_ACT_TANH:    return tk__tanh(z);
+        case TK_ACT_GELU:    return 0.5f * z * (1.0f + tk__tanh(
                                     0.7978845608028654f * (z + 0.044715f * z * z * z)));
         default:             return z;
     }
@@ -65,14 +80,14 @@ TK_API void tk_activate(float *y, int n, tk_activation_t a);
 static inline float tk_act_grad_scalar(float z, tk_activation_t a) {
     switch (a) {
         case TK_ACT_RELU:    return z > 0.0f ? 1.0f : 0.0f;
-        case TK_ACT_SIGMOID: { float s = 1.0f / (1.0f + __builtin_expf(-z));
-                               return s * (1.0f - s); }
-        case TK_ACT_TANH:    { float t = __builtin_tanhf(z); return 1.0f - t * t; }
+        case TK_ACT_SIGMOID: { float s = tk__sigmoid(z); return s * (1.0f - s); }
+        case TK_ACT_TANH:    { float t = tk__tanh(z); return 1.0f - t * t; }
         case TK_ACT_GELU: {
             const float c = 0.7978845608028654f, a3 = 0.044715f;
-            float u  = c * (z + a3 * z * z * z);
-            float th = __builtin_tanhf(u);
-            float du = c * (1.0f + 3.0f * a3 * z * z);
+            float z2 = z * z;                               /* cache z^2 (FMA-friendly) */
+            float u  = c * z * (1.0f + a3 * z2);
+            float th = tk__tanh(u);
+            float du = c * (1.0f + (3.0f * a3) * z2);
             return 0.5f * (1.0f + th) + 0.5f * z * (1.0f - th * th) * du;
         }
         case TK_ACT_IDENTITY: return 1.0f;

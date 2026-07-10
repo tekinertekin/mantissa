@@ -16,6 +16,8 @@ A tight C core does the compute; a thin Python layer drives it.
 > Started by Tekin Ertekin (2024); later refactored with Claude Code — see
 > [AUTHORS.md](AUTHORS.md).
 
+Version history and per-release benchmark scores: **[RELEASES.md](RELEASES.md)**.
+
 ---
 
 ## How it works

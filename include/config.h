@@ -67,4 +67,14 @@
 #define TK_USE_STOCHASTIC_ROUNDING 0
 #endif
 
+/* Fast approximate exp/tanh in the activations (sigmoid/tanh/gelu). The exact
+ * versions call libm, which does not vectorize -- a rational approximation is
+ * ~15x faster over a vector but costs ~2% absolute error. OFF by default
+ * (exact, gradient-checkable). Turn on for inference throughput where a small
+ * activation error is acceptable. Activations are O(n) vs the layer's O(n^2)
+ * matmul, so this only matters for activation-bound workloads. */
+#ifndef TK_FAST_MATH
+#define TK_FAST_MATH 0
+#endif
+
 #endif /* MANTISSA_CONFIG_H */

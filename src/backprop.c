@@ -38,40 +38,48 @@ tk_optim tk_optim_default(float lr) {
     return o;
 }
 
-/* Stochastic rounding to the active storage grid. ulp is derived from the
- * value's binade and the type's mantissa width (TK_MANT_BITS); rounding onto
- * the grid makes the final TK_FROM_FLOAT exact. */
+/* Stochastic rounding to the active storage grid. The ULP at v is built by bit
+ * arithmetic on the exponent (biased_exp - TK_MANT_BITS) instead of
+ * frexpf/ldexpf, dropping two libm calls per weight; rounding onto the grid
+ * keeps the final TK_FROM_FLOAT exact. */
 static inline tk_scalar_t tk_sr_from_float(float v, tk_rng *rng) {
-    if (v == 0.0f || !isfinite(v)) return TK_FROM_FLOAT(v);
-    int e; frexpf(fabsf(v), &e);                       /* |v| in [2^(e-1), 2^e) */
-    float ulp    = ldexpf(1.0f, (e - 1) - TK_MANT_BITS);
-    float scaled = v / ulp;
-    float fl     = floorf(scaled);
-    float chosen = (tk_rng_f01(rng) < (scaled - fl)) ? fl + 1.0f : fl;
+    const uint32_t bits = tk__f2u(v);
+    const uint32_t bexp = (bits >> 23) & 0xFFu;
+    if (v == 0.0f || bexp == 0xFFu || bexp <= (uint32_t)TK_MANT_BITS)
+        return TK_FROM_FLOAT(v);                        /* 0 / inf / nan / tiny */
+    const float ulp    = tk__u2f((bexp - (uint32_t)TK_MANT_BITS) << 23);
+    const float scaled = v / ulp;
+    const float fl     = floorf(scaled);
+    const float chosen = (tk_rng_f01(rng) < (scaled - fl)) ? fl + 1.0f : fl;
     return TK_FROM_FLOAT(chosen * ulp);
 }
 
 void tk_sgd_step(tk_scalar_t *restrict W, const float *restrict dW,
                  int n, const tk_optim *opt, tk_rng *rng) {
     const float lr = opt->lr, l1 = opt->l1, l2 = opt->l2;
+    const int sr = opt->stochastic && rng;
+    tk_rng r = sr ? *rng : (tk_rng){0};                 /* keep RNG state in a register */
     for (int i = 0; i < n; i++) {
         float w = TK_TO_FLOAT(W[i]);
         float g = dW[i];
         if (l2 != 0.0f) g += l2 * w;
         if (l1 != 0.0f) g += l1 * (w > 0.0f ? 1.0f : (w < 0.0f ? -1.0f : 0.0f));
         w -= lr * g;
-        W[i] = (opt->stochastic && rng) ? tk_sr_from_float(w, rng) : TK_FROM_FLOAT(w);
+        W[i] = sr ? tk_sr_from_float(w, &r) : TK_FROM_FLOAT(w);
     }
+    if (sr) *rng = r;
 }
 
 void tk_dropout_forward(float *restrict y, uint8_t *restrict mask,
                         int n, float rate, tk_rng *rng) {
     const float scale = 1.0f / (1.0f - rate);
+    tk_rng r = *rng;                                    /* hoist state out of the loop */
     for (int i = 0; i < n; i++) {
-        uint8_t keep = tk_rng_f01(rng) >= rate;
+        uint8_t keep = tk_rng_f01(&r) >= rate;
         mask[i] = keep;
         y[i]    = keep ? y[i] * scale : 0.0f;
     }
+    *rng = r;
 }
 
 void tk_dropout_backward(float *restrict dy, const uint8_t *restrict mask,
