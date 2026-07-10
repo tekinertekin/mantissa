@@ -43,6 +43,14 @@ class Mantissa:
             ctypes.c_int,                     # activation
         ]
 
+        # one float32 SGD training step (forward + backward + update); returns loss
+        self._lib.tk_train_step_f32.restype = ctypes.c_float
+        self._lib.tk_train_step_f32.argtypes = [
+            f32p, f32p, f32p, f32p,           # W, bias, x, target
+            ctypes.c_int, ctypes.c_int,       # out_dim, in_dim
+            ctypes.c_int, ctypes.c_float,     # activation, lr
+        ]
+
     @property
     def dtype(self) -> str:
         """Storage type the loaded library was compiled for (e.g. 'bfloat16')."""
@@ -58,3 +66,17 @@ class Mantissa:
         bc = (ctypes.c_float * out_dim)(*bias) if bias is not None else None
         self._lib.tk_linear_forward_f32(Wc, xc, bc, yc, out_dim, in_dim, act)
         return list(yc)
+
+    def train_step(self, W, x, target, out_dim: int, in_dim: int,
+                   act: int, lr: float, bias=None) -> float:
+        """One SGD step on a dense layer. Mutates W (and bias) in place, returns
+        the MSE loss before the update. W is row-major out_dim x in_dim."""
+        Wc = (ctypes.c_float * (out_dim * in_dim))(*W)
+        xc = (ctypes.c_float * in_dim)(*x)
+        tc = (ctypes.c_float * out_dim)(*target)
+        bc = (ctypes.c_float * out_dim)(*bias) if bias is not None else None
+        loss = self._lib.tk_train_step_f32(Wc, bc, xc, tc, out_dim, in_dim, act, lr)
+        W[:] = list(Wc)                       # reflect in-place update back to caller
+        if bias is not None:
+            bias[:] = list(bc)
+        return float(loss)

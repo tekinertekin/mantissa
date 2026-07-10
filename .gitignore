@@ -6,5 +6,13 @@ dist/
 *.dll
 __pycache__/
 *.pyc
+# language client build artifacts
+node_modules/
+package-lock.json
+target/
+bin/
+obj/
+*.class
+jna.jar
 # personal dev notes / session resume command — never push
 DEV_HISTORY.md

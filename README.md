@@ -297,7 +297,10 @@ print(lib.tk_dtype_name.restype == None or "loaded")
 ```
 
 Or use the ctypes wrapper in [`python/mantissa.py`](python/mantissa.py) (point
-it at the downloaded file). To build from source instead, see below.
+it at the downloaded file). Runnable **forward + back-prop** examples for
+Python, C++, C#, Java, JavaScript, and Rust live in
+[`clients/`](clients) — all calling the same C ABI. To build from source
+instead, see below.
 
 ## Quick start
 
@@ -342,7 +345,8 @@ src/       implementations
 tests/     forward round-trip checks (7 formats) + backprop gradient check
 examples/  perceptron, mixed-MLP, XOR training
 bench/     GEMV + activation-dispatch benchmark
-python/    ctypes binding + Python perceptron
+python/    ctypes binding + Python perceptron & training examples
+clients/   forward + back-prop demos in C++, C#, Java, JavaScript, Rust
 docs/      DESIGN.md (numerics, optimization), USAGE.md (API + examples)
 ```
 

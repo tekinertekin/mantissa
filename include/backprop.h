@@ -66,4 +66,15 @@ TK_API void tk_dropout_forward(float *restrict y, uint8_t *restrict mask,
 TK_API void tk_dropout_backward(float *restrict dy, const uint8_t *restrict mask,
                                 int n, float rate);
 
+/* --- convenience: one float32 training step for a single dense layer -------
+ * Forward + MSE loss + backward + in-place SGD update, all in plain float32.
+ * A single call marshals only float arrays and scalars, so any language with a
+ * C FFI (Python, C#, Java, Node, Rust, ...) can train with it directly. Returns
+ * the pre-update MSE loss; `bias` may be NULL. For the full narrow-storage /
+ * stochastic-rounding path use tk_linear_backward + tk_sgd_step. */
+TK_API float tk_train_step_f32(float *W, float *bias,
+                               const float *x, const float *target,
+                               int out_dim, int in_dim,
+                               tk_activation_t act, float lr);
+
 #endif /* MANTISSA_BACKPROP_H */

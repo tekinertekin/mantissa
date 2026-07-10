@@ -79,3 +79,23 @@ void tk_dropout_backward(float *restrict dy, const uint8_t *restrict mask,
     const float scale = 1.0f / (1.0f - rate);
     for (int i = 0; i < n; i++) dy[i] = mask[i] ? dy[i] * scale : 0.0f;
 }
+
+float tk_train_step_f32(float *W, float *bias,
+                        const float *x, const float *target,
+                        int out_dim, int in_dim,
+                        tk_activation_t act, float lr) {
+    const float inv = 1.0f / (float)out_dim;
+    float loss = 0.0f;
+    for (int o = 0; o < out_dim; o++) {
+        float *restrict wr = W + (size_t)o * in_dim;
+        float z = bias ? bias[o] : 0.0f;
+        for (int i = 0; i < in_dim; i++) z += wr[i] * x[i];   /* forward */
+        float y = tk_act_scalar(z, act);
+        float d = y - target[o];
+        loss += d * d;
+        float dz = 2.0f * d * inv * tk_act_grad_scalar(z, act); /* dL/dz */
+        for (int i = 0; i < in_dim; i++) wr[i] -= lr * dz * x[i]; /* SGD update */
+        if (bias) bias[o] -= lr * dz;
+    }
+    return loss * inv;
+}

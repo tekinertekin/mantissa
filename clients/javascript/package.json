@@ -1,0 +1,9 @@
+{
+  "name": "mantissa-demo",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Node.js FFI demo for the mantissa shared library",
+  "dependencies": {
+    "koffi": "^2.9.0"
+  }
+}

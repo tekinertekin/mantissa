@@ -88,9 +88,19 @@ y = tk.linear_forward(W, [1, 0], bias, out_dim=1, in_dim=2, act=STEP)
 print(int(y[0]))                    # 1
 ```
 
-Values are quantized through the library's storage dtype inside
-`tk_linear_forward_f32`, so the same Python runs against any build.
-Full file: [`python/perceptron_example.py`](../python/perceptron_example.py).
+Training from Python is one call per step (`tk.train_step`, wrapping
+`tk_train_step_f32` — forward + gradient + SGD update on float32 arrays):
+
+```python
+W, bias = [0.0, 0.0, 0.0], [0.0]
+for _ in range(200):
+    loss = tk.train_step(W, [1, 2, 3], [14.0], out_dim=1, in_dim=3,
+                         act=IDENTITY, lr=0.01, bias=bias)   # W, bias updated in place
+```
+
+Full files: [`python/perceptron_example.py`](../python/perceptron_example.py),
+[`python/train_example.py`](../python/train_example.py). The same two functions
+back the other-language demos in [`clients/`](../clients).
 
 ## Training (back-propagation)
 
@@ -129,5 +139,6 @@ Worked end-to-end trainer: [`examples/train_xor.c`](../examples/train_xor.c)
 | Loss + seed gradient | `tk_loss` |
 | Dense layer backward | `tk_linear_backward` |
 | Update weights (SGD, L1/L2, SR) | `tk_sgd_step` / `tk_optim_default` |
+| One float32 training step (FFI-friendly) | `tk_train_step_f32` |
 | Dropout forward / backward | `tk_dropout_forward` / `tk_dropout_backward` |
 | Know the active dtype from Python | `Mantissa().dtype` |
