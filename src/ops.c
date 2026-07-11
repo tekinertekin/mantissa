@@ -14,6 +14,69 @@ static inline float32x4_t tk__bf16x4(const tk_bf16_t *p) {
     return vreinterpretq_f32_u32(vshll_n_u16(vld1_u16(p), 16));
 }
 #endif
+
+#elif defined(__x86_64__) && (TK_DTYPE == TK_DTYPE_FLOAT32 || TK_DTYPE == TK_DTYPE_BFLOAT16)
+#include <immintrin.h>
+#define TK_HAVE_AVX2 1
+
+/* Runtime CPU dispatch: the AVX2 kernel is compiled unconditionally (via the
+ * per-function target attribute) but only *called* when the running CPU has
+ * AVX2+FMA, so one portable binary is fast on modern x86 and correct on old
+ * chips (and under emulators without AVX). NEON on arm64 needs none of this —
+ * it is baseline. */
+static int tk__cpu_has_avx2(void) {
+    static int cached = -1;
+    if (cached < 0) cached = (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma"));
+    return cached;
+}
+
+__attribute__((target("avx2,fma")))
+static float tk__hsum256(__m256 v) {
+    __m128 lo = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+    lo = _mm_hadd_ps(lo, lo);
+    lo = _mm_hadd_ps(lo, lo);
+    return _mm_cvtss_f32(lo);
+}
+
+#if TK_DTYPE == TK_DTYPE_BFLOAT16
+/* Load 8 bfloat16 as float32: zero-extend u16->u32 and shift into the high half. */
+__attribute__((target("avx2,fma")))
+static __m256 tk__bf16x8(const tk_bf16_t *p) {
+    __m256i w = _mm256_slli_epi32(_mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i *)p)), 16);
+    return _mm256_castsi256_ps(w);
+}
+#endif
+
+/* Four dot products, 8-wide AVX2 FMA accumulators (one per weight row). */
+__attribute__((target("avx2,fma")))
+static void tk__dot4_avx2(const tk_scalar_t *W, int in, const tk_scalar_t *x, float *out) {
+    const tk_scalar_t *w0 = W, *w1 = W + in, *w2 = W + 2 * in, *w3 = W + 3 * in;
+    __m256 a0 = _mm256_setzero_ps(), a1 = a0, a2 = a0, a3 = a0;
+    int i = 0;
+    for (; i + 8 <= in; i += 8) {
+#if TK_DTYPE == TK_DTYPE_FLOAT32
+        __m256 xv = _mm256_loadu_ps(x + i);
+        a0 = _mm256_fmadd_ps(_mm256_loadu_ps(w0 + i), xv, a0);
+        a1 = _mm256_fmadd_ps(_mm256_loadu_ps(w1 + i), xv, a1);
+        a2 = _mm256_fmadd_ps(_mm256_loadu_ps(w2 + i), xv, a2);
+        a3 = _mm256_fmadd_ps(_mm256_loadu_ps(w3 + i), xv, a3);
+#else
+        __m256 xv = tk__bf16x8(x + i);
+        a0 = _mm256_fmadd_ps(tk__bf16x8(w0 + i), xv, a0);
+        a1 = _mm256_fmadd_ps(tk__bf16x8(w1 + i), xv, a1);
+        a2 = _mm256_fmadd_ps(tk__bf16x8(w2 + i), xv, a2);
+        a3 = _mm256_fmadd_ps(tk__bf16x8(w3 + i), xv, a3);
+#endif
+    }
+    float s0 = tk__hsum256(a0), s1 = tk__hsum256(a1);
+    float s2 = tk__hsum256(a2), s3 = tk__hsum256(a3);
+    for (; i < in; i++) {
+        float xi = TK_TO_FLOAT(x[i]);
+        s0 += TK_TO_FLOAT(w0[i]) * xi; s1 += TK_TO_FLOAT(w1[i]) * xi;
+        s2 += TK_TO_FLOAT(w2[i]) * xi; s3 += TK_TO_FLOAT(w3[i]) * xi;
+    }
+    out[0] = s0; out[1] = s1; out[2] = s2; out[3] = s3;
+}
 #endif
 
 float tk_dot(const tk_scalar_t *restrict a, const tk_scalar_t *restrict b, int n) {
@@ -64,6 +127,8 @@ static inline void tk__dot4(const tk_scalar_t *restrict W, int in,
   #endif
     }
     s0 = vaddvq_f32(a0); s1 = vaddvq_f32(a1); s2 = vaddvq_f32(a2); s3 = vaddvq_f32(a3);
+#elif defined(TK_HAVE_AVX2)
+    if (tk__cpu_has_avx2()) { tk__dot4_avx2(W, in, x, out); return; }  /* else portable below */
 #endif
     for (; i < in; i++) {
         float xi = TK_TO_FLOAT(x[i]);
