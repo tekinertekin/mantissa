@@ -180,6 +180,36 @@ is opaque to the vectorizer and pays call overhead each iteration. So
 kept only for genuinely pluggable dispatch (e.g. a caller-supplied activation).
 A dispatch mechanism is only "faster" if you measure it in the loop it runs in.
 
+### Optimizations measured and rejected
+
+Several textbook optimizations were tried and dropped because the measurement
+disagreed with the theory. Recorded here so they are not re-attempted.
+
+- **Software prefetch** (`__builtin_prefetch`) in the GEMV loop — **0.55× (≈2×
+  slower)**. GEMV streams weights sequentially, the case hardware prefetchers
+  handle perfectly; manual prefetch only adds instructions and competes with the
+  hardware unit.
+- **Cache-line padding of the per-thread `dx` partials** to defeat false
+  sharing — a ~1.6× win in an *isolated* contention microbenchmark, but **~10%
+  slower in the real backward** across three variants (aligned+memset, and
+  calloc with an aligned base). In the real kernel the boundary false-sharing is
+  masked by the per-element weight read + FMA, while the padding adds allocation
+  overhead. Kept the plain contiguous buffer.
+- **IFUNC dispatch** for the SIMD kernel — rejected on portability: `ifunc` is an
+  ELF feature and does not exist on macOS/Mach-O (a development and release
+  target). The `__builtin_cpu_supports` check it would replace is a cached,
+  perfectly-predicted invariant branch (~0 cost), so there was nothing to win.
+- **Stack (VLA) scratch instead of `malloc`** in the f32 binding path —
+  measured **~60% slower** (large fixed stack frame + a runtime-typed pointer
+  hurt codegen), and that path is quantization-bound, not allocator-bound.
+- **Manual branchless `dropout`/L1-sign and loop unswitching** — no change:
+  `-O3` already emits `csel`/`cmov` for the data-dependent selects and hoists the
+  loop-invariant branches.
+
+Two suggestions were already in place: `dW`/`dx` are computed in one pass over
+the weights (no double read), and small layers skip the thread pool via a work
+threshold.
+
 ## 3. Reuse across architectures
 
 `tk_linear_forward` — `activation(W·x + bias)` with an optional (NULL-able)
