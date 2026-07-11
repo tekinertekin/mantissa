@@ -1,5 +1,6 @@
 #include "ops.h"
 #include "pool.h"
+#include <stdlib.h>
 
 #if defined(__aarch64__)
 #include <arm_neon.h>
@@ -130,19 +131,33 @@ void tk_linear_forward_f32(const float *restrict W,
                            float *restrict y,
                            int out_dim, int in_dim,
                            tk_activation_t act) {
+    /* Quantize x once up front rather than once per output row: x is read
+     * out_dim times, so this removes the x-side round-trip from the hot loop
+     * (roughly halving the quantization work). W is quantized inline because it
+     * is passed as float here; the narrow-storage path (tk_linear_forward) has
+     * no such cost. Falls back to inline quantization if the scratch can't be
+     * allocated. */
+    float *xq = (float *)malloc((size_t)in_dim * sizeof(float));
+    if (xq) for (int i = 0; i < in_dim; i++) xq[i] = tk_q(x[i]);
+
     for (int o = 0; o < out_dim; o++) {
         const float *restrict wr = W + (size_t)o * in_dim;
         float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
         int i = 0;
-        for (; i + 4 <= in_dim; i += 4) {
-            s0 += tk_q(wr[i + 0]) * tk_q(x[i + 0]);
-            s1 += tk_q(wr[i + 1]) * tk_q(x[i + 1]);
-            s2 += tk_q(wr[i + 2]) * tk_q(x[i + 2]);
-            s3 += tk_q(wr[i + 3]) * tk_q(x[i + 3]);
+        if (xq) {
+            for (; i + 4 <= in_dim; i += 4) {
+                s0 += tk_q(wr[i + 0]) * xq[i + 0];
+                s1 += tk_q(wr[i + 1]) * xq[i + 1];
+                s2 += tk_q(wr[i + 2]) * xq[i + 2];
+                s3 += tk_q(wr[i + 3]) * xq[i + 3];
+            }
+            for (; i < in_dim; i++) s0 += tk_q(wr[i]) * xq[i];
+        } else {
+            for (; i < in_dim; i++) s0 += tk_q(wr[i]) * tk_q(x[i]);
         }
         float z = (s0 + s1) + (s2 + s3);
-        for (; i < in_dim; i++) z += tk_q(wr[i]) * tk_q(x[i]);
         if (bias) z += tk_q(bias[o]);
         y[o] = tk_act_scalar(z, act);
     }
+    free(xq);
 }

@@ -6,6 +6,36 @@ dense layer (4.2M params) unless noted, and are indicative, not absolute.
 
 ---
 
+## v0.1.7 — 2026-07-10  (tag `v0.1.7`)
+
+Code-review pass over the hot paths. Each suggestion was benchmarked before
+being accepted; only the change that actually helped was kept.
+
+**Optimized**
+- `tk_linear_forward_f32` (the float32-facing binding entry point) now quantizes
+  the input vector `x` **once** into a scratch buffer instead of re-quantizing it
+  on every output row, removing the x-side round-trip from the inner loop
+  (~half the per-element conversions in that path). Output is unchanged; the
+  narrow-storage hot path `tk_linear_forward` never had this cost.
+
+**Reviewed and *not* changed** (kept for the record, since "measure, don't
+assume" cuts both ways):
+- *Explicit NEON for the backward pass* — benchmarked and **rejected**: it
+  matched the auto-vectorized `dW` path and was ~40% *slower* for the `dx`
+  reduction, so the compiler's code was already better.
+- *Thread pool overhead on tiny layers* — already handled: `TK_MT_MIN_WORK`
+  keeps small layers fully serial (they never touch the pool). A spin-wait was
+  declined: it would burn cores when idle, wrong for a general-purpose library.
+- *"Cache thrash" / vectorization stall in the backward `dx += …`* — the inner
+  loop is element-wise (not a reduction over `i`), and `dx` fits L1 for realistic
+  `in_dim`, so the premise did not hold.
+- *Branchless dropout mask / L1 sign* — `-O3` already lowers these data-dependent
+  selects to branchless `csel`/`cmov`, so a manual rewrite changes nothing.
+
+All 7 dtypes, the gradient check, and the examples pass, warning-free.
+
+---
+
 ## v0.1.6 — 2026-07-10  (tag `v0.1.6`)
 
 Multithread the **backward** pass too (v0.1.5 did the forward).
