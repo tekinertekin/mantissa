@@ -110,8 +110,9 @@ Memory is the headline at scale — it decides whether a model loads at all:
    faster. The precision is a build-time dial (below).
 2. **float32 accumulation** — compute always sums in float32 so accuracy holds
    across a layer's millions of terms (mixed precision; Micikevicius 2017).
-3. **Tuned kernels** — register-blocked GEMV with explicit NEON FMA kernels
-   (arm64) and a persistent thread pool across cores, branchless activations
+3. **Tuned kernels** — register-blocked GEMV with explicit SIMD FMA kernels
+   (NEON on arm64, AVX2 on x86-64) and a persistent thread pool across cores,
+   branchless activations
    (sign-bit / `fmax` / `copysign`, chosen by benchmark), and stochastic rounding
    so training survives narrow weights. Details and measurements in
    [docs/DESIGN.md](docs/DESIGN.md).
@@ -165,8 +166,10 @@ Apple M-series laptop, clang `-O3`; indicative, not absolute.
 | tekin8   |  4.0 MB | 2.6  | ~3.2 | 1.25× (blocking) |
 
 The forward pass is register-blocked (4 output rows share each `x` load and run
-4 independent FMA chains), with explicit **NEON** FMA kernels for float32 and
-bfloat16 on arm64 (portable fallback elsewhere). **bfloat16 leads on both axes**:
+4 independent FMA chains), with explicit SIMD FMA kernels for float32 and
+bfloat16 — **NEON** on arm64, **AVX2** on x86-64 (runtime-dispatched via
+`__builtin_cpu_supports`, scalar fallback on older CPUs). **bfloat16 leads on
+both axes**:
 it moves half the bytes of float32 for the same FMAs. `tekin8` stays conversion-
 bound (E4M3→float unpack, no SIMD; native FP8 hardware removes that).
 

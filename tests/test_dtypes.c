@@ -66,6 +66,27 @@ int main(void) {
         check(lbl, y, want[i], 0.0f, 0.0f);
     }
 
+    /* Exercise the register-blocked SIMD kernel (out>=4, in>=8 hits tk__dot4's
+     * 4-row NEON/AVX2 path) against a scalar reference. This is what validates
+     * the vectorized kernels — e.g. the AVX2 path when CI runs on x86. */
+    printf("\nlinear layer vs scalar reference (SIMD kernel check):\n");
+    {
+        enum { O = 8, I = 20 };
+        tk_scalar_t Wl[O * I], xl[I], bl[O];
+        for (int k = 0; k < O * I; k++) Wl[k] = TK_FROM_FLOAT(((k % 9) - 4) * 0.1f);
+        for (int k = 0; k < I; k++)     xl[k] = TK_FROM_FLOAT(((k % 5) - 2) * 0.2f);
+        for (int k = 0; k < O; k++)     bl[k] = TK_FROM_FLOAT(0.05f);
+        float y[O];
+        tk_linear_forward(Wl, xl, bl, y, O, I, TK_ACT_RELU);
+        for (int o = 0; o < O; o++) {
+            float z = TK_TO_FLOAT(bl[o]);
+            for (int i = 0; i < I; i++) z += TK_TO_FLOAT(Wl[o * I + i]) * TK_TO_FLOAT(xl[i]);
+            float ref = z > 0.0f ? z : 0.0f;               /* relu */
+            char lbl[16]; snprintf(lbl, sizeof lbl, "row%d", o);
+            check(lbl, y[o], ref, 1e-4f, 1e-4f);           /* differ only by reduction order */
+        }
+    }
+
     printf("\n%s\n", failures ? "FAILED" : "ALL PASSED");
     return failures ? 1 : 0;
 }

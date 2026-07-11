@@ -134,8 +134,14 @@ the portable blocked loop as the fallback on every other target/dtype:
   the conversion), then reinterprets to `float32x4_t` — ~2.5× (8.57 → ~21).
   bfloat16 ends up fastest overall: half the bytes of float32 for the same FMAs.
 
-An AVX path is the x86 equivalent (planned); `tekin8`'s E4M3 unpack does not map
-to a single widening instruction, so it stays on the portable path for now.
+On **x86-64** the same kernels exist as **AVX2 + FMA** (`_mm256_fmadd_ps` into
+four `__m256` accumulators; bfloat16 widened with `_mm256_cvtepu16_epi32` +
+`_mm256_slli_epi32`). They are compiled unconditionally via a per-function
+`__attribute__((target("avx2,fma")))` and dispatched at runtime with
+`__builtin_cpu_supports`, so a single portable binary uses AVX2 where the CPU
+has it and falls back to the scalar loop on older chips — no build flags, no
+separate binaries. `tekin8`'s E4M3 unpack does not map to a single widening
+instruction, so it stays on the portable path on both architectures.
 
 **Multithreading.** A dense layer's output rows are independent, so
 `tk_linear_forward` splits them across a **persistent thread pool** (`pool.c`):

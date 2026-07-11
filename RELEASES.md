@@ -6,6 +6,33 @@ dense layer (4.2M params) unless noted, and are indicative, not absolute.
 
 ---
 
+## v0.1.8 — 2026-07-10  (tag `v0.1.8`)
+
+AVX2 GEMV kernels for x86-64 — the counterpart to the arm64 NEON path, so the
+same acceleration applies on Linux/Windows servers.
+
+**Added**
+- AVX2 + FMA kernels for `tk__dot4` (float32 and bfloat16), 8-wide
+  `_mm256_fmadd_ps` accumulators; bfloat16 widened in-register with
+  `_mm256_cvtepu16_epi32` + `_mm256_slli_epi32`.
+- **Runtime dispatch**: the kernel is compiled unconditionally via
+  `__attribute__((target("avx2,fma")))` and called only when
+  `__builtin_cpu_supports` reports AVX2+FMA, so one portable binary is fast on
+  modern x86 and correct on older CPUs — no build flags, no fat binaries. Prior
+  x86 releases ran the scalar fallback; they now auto-accelerate on capable CPUs.
+- A "linear layer vs scalar reference" test that exercises the register-blocked
+  SIMD kernel (out≥4, in≥8), so CI — which runs on x86 AVX2 hardware — validates
+  the AVX2 path on every push.
+
+**Verified**
+- arm64 (NEON) unchanged: all 7 dtypes + gradient check pass.
+- x86-64: AVX2 codegen compiles for float32 and bfloat16; the full suite passes
+  under an x86 emulator on the scalar-fallback path, and CI exercises the live
+  AVX2 path. `tekin8` stays on the portable path on both ISAs (its E4M3 unpack
+  has no single widening instruction).
+
+---
+
 ## v0.1.7 — 2026-07-10  (tag `v0.1.7`)
 
 Code-review pass over the hot paths. Each suggestion was benchmarked before
