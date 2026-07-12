@@ -70,6 +70,24 @@ int main(void) {
     double flops=3.0*params*REPS;                              /* dW + dx (mul+add) */
     printf("[backward] %.3f ms/pass, %.2f GFLOP/s\n", dt/REPS*1e3, flops/dt/1e9);
 
+    /* float32 training step (forward+backward+update), the binding's path. */
+    {
+        float *Wf=malloc((size_t)params*sizeof(float)), *bf=malloc(OUT*sizeof(float));
+        float *xf=malloc(IN*sizeof(float)), *tf=malloc(OUT*sizeof(float));
+        if (Wf && bf && xf && tf) {
+            for(long i=0;i<params;i++) Wf[i]=((float)(i%17)-8.0f)*0.05f;
+            for(int i=0;i<OUT;i++){ bf[i]=0.01f; tf[i]=0.02f; }
+            for(int i=0;i<IN;i++) xf[i]=((float)(i%13)-6.0f)*0.1f;
+            tk_train_step_f32(Wf,bf,xf,tf,OUT,IN,TK_ACT_RELU,0.001f);  /* warm up */
+            double s0=now_s();
+            for(int r=0;r<REPS;r++){ g_sink+=tk_train_step_f32(Wf,bf,xf,tf,OUT,IN,TK_ACT_RELU,0.001f); }
+            double sdt=now_s()-s0;
+            double sflops=4.0*params*REPS;   /* forward mul+add, backward mul+update */
+            printf("[train_step_f32] %.3f ms/pass, %.2f GFLOP/s\n", sdt/REPS*1e3, sflops/sdt/1e9);
+        }
+        free(Wf);free(bf);free(xf);free(tf);
+    }
+
     tk_optim opt=tk_optim_default(0.01f);
     t0=now_s();
     for(int r=0;r<REPS;r++){ tk_sgd_step(W,dW,(int)params,&opt,&rng); g_sink+=TK_TO_FLOAT(W[r%params]); }

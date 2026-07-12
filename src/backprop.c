@@ -140,8 +140,18 @@ float tk_train_step_f32(float *W, float *bias,
     float loss = 0.0f;
     for (int o = 0; o < out_dim; o++) {
         float *restrict wr = W + (size_t)o * in_dim;
-        float z = bias ? bias[o] : 0.0f;
-        for (int i = 0; i < in_dim; i++) z += wr[i] * x[i];   /* forward */
+        /* Four independent accumulators break the loop-carried FP-add dependency
+         * so the forward dot pipelines/vectorizes (same recipe as tk_dot). */
+        float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+        int i = 0;
+        for (; i + 4 <= in_dim; i += 4) {
+            s0 += wr[i + 0] * x[i + 0];
+            s1 += wr[i + 1] * x[i + 1];
+            s2 += wr[i + 2] * x[i + 2];
+            s3 += wr[i + 3] * x[i + 3];
+        }
+        float z = (bias ? bias[o] : 0.0f) + ((s0 + s1) + (s2 + s3));
+        for (; i < in_dim; i++) z += wr[i] * x[i];   /* forward tail */
         float y = tk_act_scalar(z, act);
         float d = y - target[o];
         loss += d * d;
