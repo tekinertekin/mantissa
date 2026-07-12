@@ -28,15 +28,15 @@ int main(void) {
     fill(W3, 2 * 5, 0.15f);  fill(b3, 2, 0.05f);
 
     tk_scalar_t xq[4];
-    for (int i = 0; i < 4; i++) xq[i] = TK_FROM_FLOAT(x[i]);
+    tk_quantize(x, xq, 4);
 
     printf("MLP forward  (dtype=%s)\n", tk_dtype_name());
 
     tk_scalar_t h1q[6], h2q[5];
     tk_linear_forward(W1, xq,  b1,   h1, 6, 4, TK_ACT_TANH);      /* bias + tanh    */
-    for (int i = 0; i < 6; i++) h1q[i] = TK_FROM_FLOAT(h1[i]);
+    tk_quantize(h1, h1q, 6);
     tk_linear_forward(W2, h1q, NULL, h2, 5, 6, TK_ACT_RELU);      /* no bias + relu */
-    for (int i = 0; i < 5; i++) h2q[i] = TK_FROM_FLOAT(h2[i]);
+    tk_quantize(h2, h2q, 5);
     tk_linear_forward(W3, h2q, b3,   y,  2, 5, TK_ACT_SIGMOID);   /* bias + sigmoid */
 
     printf("  output: [% .4f, % .4f]\n", y[0], y[1]);

@@ -39,6 +39,10 @@ int main(int argc, char **argv) {
     auto dtype_name = (dtype_name_fn)sym(h, "tk_dtype_name");
     auto forward    = (forward_fn)   sym(h, "tk_linear_forward_f32");
     auto train      = (train_fn)     sym(h, "tk_train_step_f32");
+    if (!dtype_name || !forward || !train) {
+        fprintf(stderr, "%s does not export the mantissa API\n", path);
+        return 1;
+    }
 
     printf("backend dtype: %s\n", dtype_name());
 

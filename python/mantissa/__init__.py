@@ -26,7 +26,7 @@ IDENTITY, STEP, SIGN, RELU, SIGMOID, TANH, GELU = range(7)
 _f32p = ctypes.POINTER(ctypes.c_float)
 
 
-def _as_c_float(seq, n: int):
+def _as_c_float(seq, n: int, name: str = "buffer"):
     """Expose `seq` (length n) to C as float32 without a per-element Python copy
     when possible. Returns (arg, writeback): `arg` is what to pass to the C call;
     if `writeback` is not None, call it after the C call to reflect in-place
@@ -34,7 +34,12 @@ def _as_c_float(seq, n: int):
 
     Zero-copy (mutation is seen by the caller automatically, writeback=None) for
     a C-contiguous float32 numpy.ndarray or an array('f'); a plain list/tuple is
-    boxed into a ctypes buffer and, if the C call mutates it, copied back."""
+    boxed into a ctypes buffer and, if the C call mutates it, copied back.
+    A float64 / non-contiguous numpy array silently falls back to the copy path
+    -- pass C-contiguous float32 for zero-copy."""
+    size = seq.size if _np is not None and isinstance(seq, _np.ndarray) else len(seq)
+    if size != n:
+        raise ValueError(f"{name}: expected {n} float32 values, got {size}")
     if _np is not None and isinstance(seq, _np.ndarray) \
             and seq.dtype == _np.float32 and seq.flags["C_CONTIGUOUS"]:
         return seq.ctypes.data_as(_f32p), None
@@ -64,14 +69,13 @@ def _library_path() -> str:
 class Mantissa:
     def __init__(self, path: str | None = None):
         self._lib = ctypes.CDLL(path or _library_path())
-        f32p = ctypes.POINTER(ctypes.c_float)
 
         self._lib.tk_dtype_name.restype = ctypes.c_char_p
         self._lib.tk_scalar_size.restype = ctypes.c_int
 
         self._lib.tk_linear_forward_f32.restype = None
         self._lib.tk_linear_forward_f32.argtypes = [
-            f32p, f32p, f32p, f32p,           # W, x, bias, y
+            _f32p, _f32p, _f32p, _f32p,           # W, x, bias, y
             ctypes.c_int, ctypes.c_int,       # out_dim, in_dim
             ctypes.c_int,                     # activation
         ]
@@ -79,7 +83,7 @@ class Mantissa:
         # one float32 SGD training step (forward + backward + update); returns loss
         self._lib.tk_train_step_f32.restype = ctypes.c_float
         self._lib.tk_train_step_f32.argtypes = [
-            f32p, f32p, f32p, f32p,           # W, bias, x, target
+            _f32p, _f32p, _f32p, _f32p,           # W, bias, x, target
             ctypes.c_int, ctypes.c_int,       # out_dim, in_dim
             ctypes.c_int, ctypes.c_float,     # activation, lr
         ]
@@ -87,7 +91,7 @@ class Mantissa:
         # a whole epoch of sequential SGD in one call; returns the mean loss
         self._lib.tk_train_epoch_f32.restype = ctypes.c_float
         self._lib.tk_train_epoch_f32.argtypes = [
-            f32p, f32p, f32p, f32p,           # W, bias, X, targets
+            _f32p, _f32p, _f32p, _f32p,           # W, bias, X, targets
             ctypes.c_int, ctypes.c_int, ctypes.c_int,  # n_samples, out_dim, in_dim
             ctypes.c_int, ctypes.c_float,     # activation, lr
         ]
@@ -106,12 +110,13 @@ class Mantissa:
         element copy (see _as_c_float). For repeated calls, pass `out=` (a
         float32 numpy array or array('f') of out_dim) — the result is written
         into it directly and `out` is returned: no per-call output allocation,
-        no per-element boxing of the result."""
-        Wc, _ = _as_c_float(W, out_dim * in_dim)      # read-only inputs: no writeback
-        xc, _ = _as_c_float(x, in_dim)
-        bc = _as_c_float(bias, out_dim)[0] if bias is not None else None
+        no per-element boxing of the result. Without `out`, returns a fresh list
+        of out_dim floats."""
+        Wc, _ = _as_c_float(W, out_dim * in_dim, "W")  # read-only inputs: no writeback
+        xc, _ = _as_c_float(x, in_dim, "x")
+        bc = _as_c_float(bias, out_dim, "bias")[0] if bias is not None else None
         if out is not None:
-            yc, y_wb = _as_c_float(out, out_dim)
+            yc, y_wb = _as_c_float(out, out_dim, "out")
             self._lib.tk_linear_forward_f32(Wc, xc, bc, yc, out_dim, in_dim, act)
             if y_wb:                          # `out` was a plain list: copy back
                 y_wb()
@@ -128,10 +133,10 @@ class Mantissa:
         Pass W/bias as float32 numpy arrays or array('f') for a zero-copy update
         (mutated directly, no list round-trip); a plain list is copied in and
         copied back."""
-        Wc, W_wb = _as_c_float(W, out_dim * in_dim)   # mutated -> may need writeback
-        xc, _ = _as_c_float(x, in_dim)
-        tc, _ = _as_c_float(target, out_dim)
-        bc, b_wb = _as_c_float(bias, out_dim) if bias is not None else (None, None)
+        Wc, W_wb = _as_c_float(W, out_dim * in_dim, "W")   # mutated -> may need writeback
+        xc, _ = _as_c_float(x, in_dim, "x")
+        tc, _ = _as_c_float(target, out_dim, "target")
+        bc, b_wb = _as_c_float(bias, out_dim, "bias") if bias is not None else (None, None)
         loss = self._lib.tk_train_step_f32(Wc, bc, xc, tc, out_dim, in_dim, act, lr)
         if W_wb:                              # reflect update back for the copy path
             W_wb()
@@ -146,10 +151,10 @@ class Mantissa:
         Weight updates are numerically identical to calling train_step once per
         sample; the win is one FFI crossing per epoch instead of one per sample.
         Mutates W (and bias) in place; returns the mean pre-update loss."""
-        Wc, W_wb = _as_c_float(W, out_dim * in_dim)
-        Xc, _ = _as_c_float(X, n_samples * in_dim)
-        tc, _ = _as_c_float(targets, n_samples * out_dim)
-        bc, b_wb = _as_c_float(bias, out_dim) if bias is not None else (None, None)
+        Wc, W_wb = _as_c_float(W, out_dim * in_dim, "W")
+        Xc, _ = _as_c_float(X, n_samples * in_dim, "X")
+        tc, _ = _as_c_float(targets, n_samples * out_dim, "targets")
+        bc, b_wb = _as_c_float(bias, out_dim, "bias") if bias is not None else (None, None)
         loss = self._lib.tk_train_epoch_f32(Wc, bc, Xc, tc,
                                             n_samples, out_dim, in_dim, act, lr)
         if W_wb:

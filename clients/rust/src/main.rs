@@ -24,7 +24,8 @@ fn main() {
         .unwrap_or_else(|| default_lib().to_string());
 
     unsafe {
-        let lib = Library::new(&path).expect("failed to load library");
+        let lib = Library::new(&path)
+            .unwrap_or_else(|e| panic!("cannot load {path}: {e}"));
         let dtype_name: Symbol<DtypeName> = lib.get(b"tk_dtype_name").unwrap();
         let forward: Symbol<Forward> = lib.get(b"tk_linear_forward_f32").unwrap();
         let train: Symbol<Train> = lib.get(b"tk_train_step_f32").unwrap();

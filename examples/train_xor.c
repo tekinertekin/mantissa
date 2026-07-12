@@ -42,13 +42,13 @@ int main(void) {
         float epoch_loss = 0.0f;
         for (int s = 0; s < 4; s++) {
             tk_scalar_t xq[IN], hq[H];
-            for (int i = 0; i < IN; i++) xq[i] = TK_FROM_FLOAT(X[s][i]);
+            tk_quantize(X[s], xq, IN);
 
             /* forward (IDENTITY gives the pre-activation z; then activate) */
             tk_linear_forward(W1, xq, b1, z1, H, IN, TK_ACT_IDENTITY);
             for (int i = 0; i < H; i++) { h[i] = z1[i]; }
             tk_activate(h, H, TK_ACT_TANH);
-            for (int i = 0; i < H; i++) hq[i] = TK_FROM_FLOAT(h[i]);
+            tk_quantize(h, hq, H);
             tk_linear_forward(W2, hq, b2, z2, OUT, H, TK_ACT_IDENTITY);
             for (int i = 0; i < OUT; i++) { y[i] = z2[i]; }
             tk_activate(y, OUT, TK_ACT_SIGMOID);
@@ -71,9 +71,9 @@ int main(void) {
     printf("predictions:\n");
     for (int s = 0; s < 4; s++) {
         tk_scalar_t xq[IN], hq[H];
-        for (int i = 0; i < IN; i++) xq[i] = TK_FROM_FLOAT(X[s][i]);
+        tk_quantize(X[s], xq, IN);
         tk_linear_forward(W1, xq, b1, h, H, IN, TK_ACT_TANH);
-        for (int i = 0; i < H; i++) hq[i] = TK_FROM_FLOAT(h[i]);
+        tk_quantize(h, hq, H);
         tk_linear_forward(W2, hq, b2, y, OUT, H, TK_ACT_SIGMOID);
         printf("  (%.0f,%.0f) -> %.3f  (target %.0f)\n", X[s][0], X[s][1], y[0], T[s]);
     }

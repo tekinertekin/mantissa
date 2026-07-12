@@ -87,7 +87,7 @@ zero-copy path). Or, from a checkout, `pip install .` (compiles the C core) or
 just `make dist` (any dtype — the binding is dtype-agnostic). Then:
 
 ```python
-from mantissa import Mantissa, STEP
+from mantissa import Mantissa, IDENTITY, STEP
 
 tk = Mantissa()                     # loads ../dist/libmantissa.<ext>
 print(tk.dtype)                     # e.g. 'bfloat16'
