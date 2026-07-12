@@ -52,6 +52,12 @@ void  tk_linear_forward(const tk_scalar_t *W,     // out_dim x in_dim, row-major
                         float *y,                 // out_dim (float32 out)
                         int out_dim, int in_dim,
                         tk_activation_t act);
+
+// Narrow n floats into the storage type. For repeated inference from float
+// buffers: quantize W once with this, then call tk_linear_forward — instead of
+// paying tk_linear_forward_f32's per-call re-quantization of every weight
+// (~9x serial / ~26x threaded on a 2048x2048 bf16 layer).
+void  tk_quantize(const float *src, tk_scalar_t *dst, int n);
 ```
 
 ### Example: a perceptron in C
@@ -96,6 +102,23 @@ W, bias = [0.0, 0.0, 0.0], [0.0]
 for _ in range(200):
     loss = tk.train_step(W, [1, 2, 3], [14.0], out_dim=1, in_dim=3,
                          act=IDENTITY, lr=0.01, bias=bias)   # W, bias updated in place
+```
+
+Plain lists work everywhere, but they are boxed element-by-element on every
+call. For real training loops pass **float32 numpy arrays or `array('f')`**
+instead — the binding then hands the buffer to C zero-copy and mutates it in
+place (~200x faster per step at 512x512; numpy is optional, nothing breaks
+without it):
+
+```python
+import numpy as np
+W    = np.zeros(3,  dtype=np.float32)
+bias = np.zeros(1,  dtype=np.float32)
+x    = np.array([1, 2, 3], dtype=np.float32)
+t    = np.array([14.0],    dtype=np.float32)
+for _ in range(200):
+    loss = tk.train_step(W, x, t, out_dim=1, in_dim=3,
+                         act=IDENTITY, lr=0.01, bias=bias)  # zero-copy, in place
 ```
 
 Full files: [`python/perceptron_example.py`](../python/perceptron_example.py),

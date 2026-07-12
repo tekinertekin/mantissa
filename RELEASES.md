@@ -6,6 +6,70 @@ dense layer (4.2M params) unless noted, and are indicative, not absolute.
 
 ---
 
+## v0.1.9 — 2026-07-12  (tag `v0.1.9`)
+
+The float32 API — the entry point every non-C binding calls — was serial and
+scalar while all the fast machinery (register blocking, NEON/AVX2, the thread
+pool) was reachable only from the narrow C API. This release closes that gap,
+plus a multi-agent review pass over correctness, tests, and docs.
+
+**Optimized**
+- `tk_train_step_f32` forward dot: 4 independent accumulators (the `tk_dot`
+  recipe) instead of one loop-carried FP add. **7.4 → ~14.6 GFLOP/s (~2×)** on
+  the full training step.
+- `tk_linear_forward_f32` now threads its output rows above `TK_MT_MIN_WORK`.
+  bf16 **3.1 → 10.7 GFLOP/s**, float32 **9.2 → 33.6 GFLOP/s** at 10 threads;
+  serial path unchanged, threaded output bit-identical to serial (rows are
+  independent). Implementation note: the serial loop had to stay in its own
+  pool-free function — the shared-helper refactor measured ~40% slower serial
+  (pointer escape defeats no-alias analysis; see DESIGN.md).
+- **Python binding zero-copy path**: pass float32 `numpy` arrays or `array('f')`
+  to `linear_forward` / `train_step` and the buffer goes straight to C, mutated
+  in place — no per-element boxing, no list round-trip. **~225× faster per
+  `train_step`** at 512×512 vs the list path (which still works; numpy optional).
+
+**Added**
+- `tk_quantize(const float *src, tk_scalar_t *dst, int n)` — narrow weights
+  once, then run repeated inference through the fast `tk_linear_forward`:
+  **9.5× serial / ~20–26× threaded** over per-call `tk_linear_forward_f32`
+  re-quantization (bf16 2048×2048), and the caller holds a 2-byte/param narrow
+  copy instead of round-tripping 4-byte floats every call.
+- Benchmark cases for the previously unmeasured f32 path: `[GEMV f32]`,
+  `[GEMV f32 prepared]`, `[train_step_f32]`.
+- Test coverage from the QA review: BCE loss (value/gradcheck/extremes),
+  dropout (rate 0/1, mask-backward consistency, seeded determinism), L1+L2 SGD
+  vs closed form, empty-batch guards, **stochastic-rounding unbiasedness**
+  (mean of 40k SR write-backs matches the true value in all 7 formats — the
+  Gupta et al. 2015 property, now pinned), non-finite conversions (NaN/Inf
+  preserved by bf16/fp16/tekin32/e5m2; tekin8/fp4 clamp to ±480/±6 by design),
+  `tk_linear_forward_f32` vs reference, and a 600×600 above-threshold layer
+  exercising the pool + SIMD kernels.
+
+**Fixed**
+- `tk_loss` / `tk_train_step_f32` returned **NaN for an empty batch** (`n<=0`:
+  `0 * inf`); now a clean `0.0f`.
+- The multithread work threshold used `(long)out_dim*in_dim`, which can
+  overflow on LLP64 (Windows); widened to `size_t`.
+
+**Docs**
+- fp16 was mis-attributed to Micikevicius et al. 2017 (that paper is the
+  *training recipe*, not the format — fp16 is IEEE 754-2008 binary16); NVFP4
+  paper year disambiguated (2025 paper, 2024 hardware).
+- DESIGN.md's claim that threaded forward results are "bitwise identical to
+  serial" was empirically false (chunk boundaries shift the 4-row/leftover
+  kernel split): restated as bitwise-reproducible for a fixed
+  `MANTISSA_THREADS`, ~ULP-stable across settings.
+- README: gradcheck tolerance corrected (<1e-2, not <1e-3), the mixed-arch
+  snippet's requantization requirement noted, the library smoke-test snippet
+  actually calls `tk_dtype_name()` now, stale tekin8 SGD figure refreshed,
+  fp4 "½ byte" footnoted as logical width (storage is 1 B/value today).
+
+**Verified**
+- All 7 dtypes + gradient check pass; threaded f32 output byte-compared equal
+  to serial; Python list vs numpy paths produce identical loss and weights.
+
+---
+
 ## v0.1.8 — 2026-07-10  (tag `v0.1.8`)
 
 AVX2 GEMV kernels for x86-64 — the counterpart to the arm64 NEON path, so the

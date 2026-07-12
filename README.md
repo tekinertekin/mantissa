@@ -329,7 +329,9 @@ print(lib.tk_dtype_name().decode())                  # -> e.g. "bfloat16"
 ```
 
 Or use the ctypes wrapper in [`python/mantissa.py`](python/mantissa.py) (point
-it at the downloaded file). Runnable **forward + back-prop** examples for
+it at the downloaded file) — pass float32 `numpy` arrays (or `array('f')`) for
+a zero-copy, in-place training path, ~200× faster per step than plain lists
+(numpy optional). Runnable **forward + back-prop** examples for
 Python, C++, C#, Java, JavaScript, and Rust live in
 [`clients/`](clients) — all calling the same C ABI. To build from source
 instead, see below.

@@ -217,6 +217,15 @@ disagreed with the theory. Recorded here so they are not re-attempted.
   store-bandwidth bound (it writes `dW`, 4×params bytes), so hand-vectorizing the
   arithmetic wins nothing and the extra shuffle/reduce instructions cost. Kept the
   scalar loop the compiler already vectorizes.
+- **Sharing one range function between the f32 serial and pooled paths** (the
+  clean refactor, and exactly how the narrow path is structured) — **~40%
+  slower serial** (bf16 3.5 → 2.5 GFLOP/s). Passing the serial branch's
+  `W`/`x`/`y` into an external pool worker from the same function makes the
+  pointers *escape*, defeating no-alias analysis and de-vectorizing the serial
+  quantization loop. The narrow path is immune only because it uses the
+  hand-written NEON/AVX2 kernel rather than the auto-vectorizer. Fix shipped:
+  the pristine serial loop lives in its own pool-free function and a thin
+  wrapper dispatches — isolation wins over elegance.
 - **Spin-wait in the thread pool** instead of the condvar barrier — declined:
   it would burn CPU on idle workers, which directly contradicts the
   low-footprint / millions-of-small-calls goal (small layers stay serial and the

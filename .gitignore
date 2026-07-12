@@ -19,3 +19,4 @@ DEV_HISTORY.md
 # multi-agent org spec + local agent workspace — never push (defensive; they live in the parent dir)
 agents.md
 agent/
+.claude/
