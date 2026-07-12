@@ -156,8 +156,12 @@ float tk_train_step_f32(float *W, float *bias,
         float d = y - target[o];
         loss += d * d;
         float dz = 2.0f * d * inv * tk_act_grad_scalar(z, act); /* dL/dz */
-        for (int i = 0; i < in_dim; i++) wr[i] -= lr * dz * x[i]; /* SGD update */
-        if (bias) bias[o] -= lr * dz;
+        if (dz != 0.0f) {                       /* dead row (e.g. relu z<=0): the
+                                                 * update is a no-op; skip the
+                                                 * whole read-modify-write pass */
+            for (int i = 0; i < in_dim; i++) wr[i] -= lr * dz * x[i];
+            if (bias) bias[o] -= lr * dz;
+        }
     }
     return loss * inv;
 }
