@@ -165,3 +165,17 @@ float tk_train_step_f32(float *W, float *bias,
     }
     return loss * inv;
 }
+
+float tk_train_epoch_f32(float *W, float *bias,
+                         const float *X, const float *targets,
+                         int n_samples, int out_dim, int in_dim,
+                         tk_activation_t act, float lr) {
+    if (n_samples <= 0) return 0.0f;
+    double sum = 0.0;                           /* mean over n: f64 keeps it exact */
+    for (int s = 0; s < n_samples; s++)
+        sum += tk_train_step_f32(W, bias,
+                                 X + (size_t)s * in_dim,
+                                 targets + (size_t)s * out_dim,
+                                 out_dim, in_dim, act, lr);
+    return (float)(sum / n_samples);
+}

@@ -6,6 +6,27 @@ dense layer (4.2M params) unless noted, and are indicative, not absolute.
 
 ---
 
+## v0.1.11 — 2026-07-12  (tag `v0.1.11`)
+
+One addition, driven by a real measurement from the sister
+mantissa-perceptron project: its honest benchmark showed our fit time
+~380× behind scikit-learn while running an *identical* algorithm — and
+isolated the cause to per-sample Python→C crossings (~4–5 µs each,
+~137k per fit), not the kernels.
+
+**Added**
+- `tk_train_epoch_f32(W, bias, X, targets, n_samples, out_dim, in_dim,
+  act, lr)` — a whole epoch of sequential SGD in one call; the sample
+  loop runs inside the library. Weight updates are bit-identical to
+  per-sample `tk_train_step_f32` calls (pinned by a new test); returns
+  the mean pre-update loss. Python binding: `Mantissa.train_epoch`.
+- Measured from Python (1000×4 layer, 100 epochs, array('f') zero-copy):
+  per-sample loop **269.2 ms** → epoch API **1.90 ms** = **141×**, final
+  weights identical. That puts interpreted callers in compiled-loop
+  territory while keeping the memory profile untouched.
+
+---
+
 ## v0.1.10 — 2026-07-12  (tag `v0.1.10`)
 
 NEON kernel overhaul, driven by a 20-lens optimization review (every idea

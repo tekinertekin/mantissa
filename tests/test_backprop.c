@@ -190,6 +190,28 @@ int main(void) {
                ok ? "OK" : "!!", kept, N);
     }
 
+    /* tk_train_epoch_f32 must be bit-identical to per-sample tk_train_step_f32
+     * calls: same weights, same bias, matching mean loss. */
+    {
+        enum { NS = 8, OD = 2, ID = 5 };
+        float Wa[OD * ID], Wb[OD * ID], ba[OD], bb[OD], X[NS * ID], T[NS * OD];
+        for (int i = 0; i < OD * ID; i++) Wa[i] = Wb[i] = 0.05f * (float)(i % 7 - 3);
+        for (int i = 0; i < OD; i++)      ba[i] = bb[i] = 0.01f * (float)i;
+        for (int i = 0; i < NS * ID; i++) X[i] = 0.1f * (float)(i % 11 - 5);
+        for (int i = 0; i < NS * OD; i++) T[i] = 0.2f * (float)(i % 3);
+
+        float mean = tk_train_epoch_f32(Wa, ba, X, T, NS, OD, ID, TK_ACT_TANH, 0.05f);
+        float sum = 0.0f;
+        for (int s = 0; s < NS; s++)
+            sum += tk_train_step_f32(Wb, bb, X + s * ID, T + s * OD,
+                                     OD, ID, TK_ACT_TANH, 0.05f);
+        ok = memcmp(Wa, Wb, sizeof Wa) == 0 && memcmp(ba, bb, sizeof ba) == 0
+          && fabsf(mean - sum / NS) < 1e-6f;
+        if (!ok) failures++;
+        printf("  [%s] train_epoch == per-sample train_step (mean loss %.4f)\n",
+               ok ? "OK" : "!!", mean);
+    }
+
     /* L1/L2 regularization path of tk_sgd_step (float32 build: write-back is
      * exact, so the update can be checked against the closed form). */
     {

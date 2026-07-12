@@ -124,6 +124,16 @@ for _ in range(200):
                          act=IDENTITY, lr=0.01, bias=bias)  # zero-copy, in place
 ```
 
+When training over a *dataset*, don't cross the FFI once per sample — pass the
+whole epoch (`X`: `n_samples x in_dim` rows, flat) and let C drive the loop.
+Same sequential SGD, bit-identical weights, one crossing per epoch
+(**~140x faster** at 1000x4 than per-sample `train_step` calls):
+
+```python
+loss = tk.train_epoch(W, X, targets, n_samples=1000, out_dim=1, in_dim=4,
+                      act=IDENTITY, lr=0.01, bias=bias)   # mean loss
+```
+
 Full files: [`python/perceptron_example.py`](../python/perceptron_example.py),
 [`python/train_example.py`](../python/train_example.py). The same two functions
 back the other-language demos in [`clients/`](../clients).
@@ -166,5 +176,6 @@ Worked end-to-end trainer: [`examples/train_xor.c`](../examples/train_xor.c)
 | Dense layer backward | `tk_linear_backward` |
 | Update weights (SGD, L1/L2, SR) | `tk_sgd_step` / `tk_optim_default` |
 | One float32 training step (FFI-friendly) | `tk_train_step_f32` |
+| A whole epoch in one call (amortizes FFI) | `tk_train_epoch_f32` |
 | Dropout forward / backward | `tk_dropout_forward` / `tk_dropout_backward` |
 | Know the active dtype from Python | `Mantissa().dtype` |

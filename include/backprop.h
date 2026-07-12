@@ -77,4 +77,15 @@ TK_API float tk_train_step_f32(float *W, float *bias,
                                int out_dim, int in_dim,
                                tk_activation_t act, float lr);
 
+/* One full epoch of sequential SGD, driven inside the library: X is n_samples
+ * rows of in_dim, targets n_samples rows of out_dim. Weight updates are
+ * numerically identical to calling tk_train_step_f32 once per sample — the
+ * point is one FFI crossing per epoch instead of one per sample (an
+ * interpreted caller pays microseconds per crossing, which dominates small
+ * layers). Returns the mean pre-update loss over the epoch. */
+TK_API float tk_train_epoch_f32(float *W, float *bias,
+                                const float *X, const float *targets,
+                                int n_samples, int out_dim, int in_dim,
+                                tk_activation_t act, float lr);
+
 #endif /* MANTISSA_BACKPROP_H */

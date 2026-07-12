@@ -84,6 +84,14 @@ class Mantissa:
             ctypes.c_int, ctypes.c_float,     # activation, lr
         ]
 
+        # a whole epoch of sequential SGD in one call; returns the mean loss
+        self._lib.tk_train_epoch_f32.restype = ctypes.c_float
+        self._lib.tk_train_epoch_f32.argtypes = [
+            f32p, f32p, f32p, f32p,           # W, bias, X, targets
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,  # n_samples, out_dim, in_dim
+            ctypes.c_int, ctypes.c_float,     # activation, lr
+        ]
+
     @property
     def dtype(self) -> str:
         """Storage type the loaded library was compiled for (e.g. 'bfloat16')."""
@@ -116,6 +124,25 @@ class Mantissa:
         bc, b_wb = _as_c_float(bias, out_dim) if bias is not None else (None, None)
         loss = self._lib.tk_train_step_f32(Wc, bc, xc, tc, out_dim, in_dim, act, lr)
         if W_wb:                              # reflect update back for the copy path
+            W_wb()
+        if b_wb:
+            b_wb()
+        return float(loss)
+
+    def train_epoch(self, W, X, targets, n_samples: int, out_dim: int,
+                    in_dim: int, act: int, lr: float, bias=None) -> float:
+        """A full epoch of sequential SGD in ONE C call: X is n_samples rows of
+        in_dim, targets n_samples rows of out_dim (both flat, row-major).
+        Weight updates are numerically identical to calling train_step once per
+        sample; the win is one FFI crossing per epoch instead of one per sample.
+        Mutates W (and bias) in place; returns the mean pre-update loss."""
+        Wc, W_wb = _as_c_float(W, out_dim * in_dim)
+        Xc, _ = _as_c_float(X, n_samples * in_dim)
+        tc, _ = _as_c_float(targets, n_samples * out_dim)
+        bc, b_wb = _as_c_float(bias, out_dim) if bias is not None else (None, None)
+        loss = self._lib.tk_train_epoch_f32(Wc, bc, Xc, tc,
+                                            n_samples, out_dim, in_dim, act, lr)
+        if W_wb:
             W_wb()
         if b_wb:
             b_wb()
