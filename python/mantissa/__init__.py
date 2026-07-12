@@ -97,16 +97,26 @@ class Mantissa:
         """Storage type the loaded library was compiled for (e.g. 'bfloat16')."""
         return self._lib.tk_dtype_name().decode()
 
-    def linear_forward(self, W, x, bias, out_dim: int, in_dim: int, act: int):
+    def linear_forward(self, W, x, bias, out_dim: int, in_dim: int, act: int,
+                       out=None):
         """y = act(W @ x + bias). W is row-major out_dim x in_dim; bias may be None.
 
         Values are quantized through the library's storage dtype internally.
         Pass W/x/bias as float32 numpy arrays or array('f') to skip the per-
-        element copy (see _as_c_float)."""
+        element copy (see _as_c_float). For repeated calls, pass `out=` (a
+        float32 numpy array or array('f') of out_dim) — the result is written
+        into it directly and `out` is returned: no per-call output allocation,
+        no per-element boxing of the result."""
         Wc, _ = _as_c_float(W, out_dim * in_dim)      # read-only inputs: no writeback
         xc, _ = _as_c_float(x, in_dim)
-        yc = (ctypes.c_float * out_dim)()
         bc = _as_c_float(bias, out_dim)[0] if bias is not None else None
+        if out is not None:
+            yc, y_wb = _as_c_float(out, out_dim)
+            self._lib.tk_linear_forward_f32(Wc, xc, bc, yc, out_dim, in_dim, act)
+            if y_wb:                          # `out` was a plain list: copy back
+                y_wb()
+            return out
+        yc = (ctypes.c_float * out_dim)()
         self._lib.tk_linear_forward_f32(Wc, xc, bc, yc, out_dim, in_dim, act)
         return list(yc)
 

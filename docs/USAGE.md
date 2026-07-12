@@ -134,6 +134,10 @@ loss = tk.train_epoch(W, X, targets, n_samples=1000, out_dim=1, in_dim=4,
                       act=IDENTITY, lr=0.01, bias=bias)   # mean loss
 ```
 
+For repeated *inference*, pass `out=` to `linear_forward` (a float32 numpy
+array or `array('f')` of `out_dim`): the result is written straight into your
+buffer — no per-call output allocation or boxing (~1.24x per call at 256x256).
+
 Full files: [`python/perceptron_example.py`](../python/perceptron_example.py),
 [`python/train_example.py`](../python/train_example.py). The same two functions
 back the other-language demos in [`clients/`](../clients).
