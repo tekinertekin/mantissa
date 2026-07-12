@@ -10,10 +10,36 @@ from __future__ import annotations
 
 import ctypes
 import sys
+from array import array
 from pathlib import Path
+
+try:                                   # optional: enables a zero-copy fast path
+    import numpy as _np
+except ImportError:                    # binding works without it (plain lists)
+    _np = None
 
 # Activation ids must match include/activations.h.
 IDENTITY, STEP, SIGN, RELU, SIGMOID, TANH, GELU = range(7)
+
+_f32p = ctypes.POINTER(ctypes.c_float)
+
+
+def _as_c_float(seq, n: int):
+    """Expose `seq` (length n) to C as float32 without a per-element Python copy
+    when possible. Returns (arg, writeback): `arg` is what to pass to the C call;
+    if `writeback` is not None, call it after the C call to reflect in-place
+    mutation back to `seq`.
+
+    Zero-copy (mutation is seen by the caller automatically, writeback=None) for
+    a C-contiguous float32 numpy.ndarray or an array('f'); a plain list/tuple is
+    boxed into a ctypes buffer and, if the C call mutates it, copied back."""
+    if _np is not None and isinstance(seq, _np.ndarray) \
+            and seq.dtype == _np.float32 and seq.flags["C_CONTIGUOUS"]:
+        return seq.ctypes.data_as(_f32p), None
+    if isinstance(seq, array) and seq.typecode == "f":
+        return (ctypes.c_float * n).from_buffer(seq), None
+    buf = (ctypes.c_float * n)(*seq)                # list/tuple/other: one copy
+    return buf, (lambda: seq.__setitem__(slice(None), buf))
 
 
 def _library_path() -> str:
@@ -59,24 +85,31 @@ class Mantissa:
     def linear_forward(self, W, x, bias, out_dim: int, in_dim: int, act: int):
         """y = act(W @ x + bias). W is row-major out_dim x in_dim; bias may be None.
 
-        Values are quantized through the library's storage dtype internally."""
-        Wc = (ctypes.c_float * (out_dim * in_dim))(*W)
-        xc = (ctypes.c_float * in_dim)(*x)
+        Values are quantized through the library's storage dtype internally.
+        Pass W/x/bias as float32 numpy arrays or array('f') to skip the per-
+        element copy (see _as_c_float)."""
+        Wc, _ = _as_c_float(W, out_dim * in_dim)      # read-only inputs: no writeback
+        xc, _ = _as_c_float(x, in_dim)
         yc = (ctypes.c_float * out_dim)()
-        bc = (ctypes.c_float * out_dim)(*bias) if bias is not None else None
+        bc = _as_c_float(bias, out_dim)[0] if bias is not None else None
         self._lib.tk_linear_forward_f32(Wc, xc, bc, yc, out_dim, in_dim, act)
         return list(yc)
 
     def train_step(self, W, x, target, out_dim: int, in_dim: int,
                    act: int, lr: float, bias=None) -> float:
         """One SGD step on a dense layer. Mutates W (and bias) in place, returns
-        the MSE loss before the update. W is row-major out_dim x in_dim."""
-        Wc = (ctypes.c_float * (out_dim * in_dim))(*W)
-        xc = (ctypes.c_float * in_dim)(*x)
-        tc = (ctypes.c_float * out_dim)(*target)
-        bc = (ctypes.c_float * out_dim)(*bias) if bias is not None else None
+        the MSE loss before the update. W is row-major out_dim x in_dim.
+
+        Pass W/bias as float32 numpy arrays or array('f') for a zero-copy update
+        (mutated directly, no list round-trip); a plain list is copied in and
+        copied back."""
+        Wc, W_wb = _as_c_float(W, out_dim * in_dim)   # mutated -> may need writeback
+        xc, _ = _as_c_float(x, in_dim)
+        tc, _ = _as_c_float(target, out_dim)
+        bc, b_wb = _as_c_float(bias, out_dim) if bias is not None else (None, None)
         loss = self._lib.tk_train_step_f32(Wc, bc, xc, tc, out_dim, in_dim, act, lr)
-        W[:] = list(Wc)                       # reflect in-place update back to caller
-        if bias is not None:
-            bias[:] = list(bc)
+        if W_wb:                              # reflect update back for the copy path
+            W_wb()
+        if b_wb:
+            b_wb()
         return float(loss)
