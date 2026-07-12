@@ -64,8 +64,22 @@ static void pool_create(void) {
     if (want < 1) want = 1;
     if (want > TK_MAX_THREADS) want = TK_MAX_THREADS;
     g_workers = want - 1;                            /* the calling thread is one worker */
+
+    /* Workers only run row kernels (shallow frames, no VLAs), so cap their
+     * stacks at 512 KiB — the macOS default, but 16x below glibc's
+     * RLIMIT_STACK-sized default (commonly 8 MiB *per worker*). Clamped to
+     * the platform minimum; sized generously for sanitizer builds. */
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    {
+        size_t stack = 512u * 1024u;
+        long   smin  = sysconf(_SC_THREAD_STACK_MIN);
+        if (smin > 0 && (size_t)smin > stack) stack = (size_t)smin;
+        pthread_attr_setstacksize(&attr, stack);
+    }
     for (int i = 0; i < g_workers; i++)
-        pthread_create(&g_threads[i], NULL, worker, (void *)(long)i);
+        pthread_create(&g_threads[i], &attr, worker, (void *)(long)i);
+    pthread_attr_destroy(&attr);
 }
 static void pool_init(void) { pthread_once(&g_once, pool_create); }
 
