@@ -365,6 +365,10 @@ Python, C++, C#, Java, JavaScript, and Rust live in
 [`clients/`](clients) — all calling the same C ABI. To build from source
 instead, see below.
 
+For a full, installable client with honest benchmarks, see the sister project
+[mantissa-perceptron](https://github.com/tekinertekin/mantissa-perceptron) — a
+Python perceptron classifier built on this engine.
+
 ## Quick start
 
 ```sh
