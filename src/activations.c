@@ -2,14 +2,13 @@
 #include <math.h>
 
 float tk_act_identity(float z) { return z; }
-float tk_act_step(float z)     { return 1.0f - (float)(tk_act__bits(z) >> 31); }
+float tk_act_step(float z)     { return 1.0f - (float)(tk__act_f2u(z) >> 31); }
 float tk_act_sign(float z)     { return copysignf(1.0f, z); }
 float tk_act_relu(float z)     { return fmaxf(z, 0.0f); }
 float tk_act_sigmoid(float z)  { return tk__sigmoid(z); }
 float tk_act_tanh(float z)     { return tk__tanh(z); }
 float tk_act_gelu(float z) {
-    float z2 = z * z;
-    return 0.5f * z * (1.0f + tk__tanh(0.7978845608028654f * z * (1.0f + 0.044715f * z2)));
+    return tk__gelu(z);
 }
 
 tk_act_fn tk_act_resolve(tk_activation_t a) {

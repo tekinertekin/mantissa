@@ -7,7 +7,7 @@
 #include "tk_export.h"
 
 /* Reinterpret a float's bits (no aliasing violation, no-op at -O2). */
-static inline uint32_t tk_act__bits(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
+static inline uint32_t tk__act_f2u(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
 
 /* exp/tanh backends: exact (libm) by default, or a branchless rational
  * approximation that vectorizes when TK_FAST_MATH is set (see config.h). */
@@ -22,6 +22,17 @@ static inline float tk__sigmoid(float x) { return 0.5f * (tk__tanh(0.5f * x) + 1
 static inline float tk__tanh(float x)    { return __builtin_tanhf(x); }
 static inline float tk__sigmoid(float x) { return 1.0f / (1.0f + __builtin_expf(-x)); }
 #endif
+
+/* GELU tanh-approx (Hendrycks & Gimpel, 2016): 0.5 z (1 + tanh(k(z))),
+ * k(z) = sqrt(2/pi) (z + 0.044715 z^3), factored to reuse z^2. One definition
+ * so the standalone fn, the inline switch, and the gradient's forward
+ * recompute stay bit-identical. */
+static inline float tk__gelu_k(float z) {
+    return 0.7978845608028654f * z * (1.0f + 0.044715f * z * z);
+}
+static inline float tk__gelu(float z) {
+    return 0.5f * z * (1.0f + tk__tanh(tk__gelu_k(z)));
+}
 
 /* Shared by every layer type this library will feed: perceptron (step/sign),
  * MLP/RNN (relu/tanh/sigmoid), LSTM/GRU gates (sigmoid/tanh), Transformer (gelu). */
@@ -58,15 +69,14 @@ static inline float tk_act_scalar(float z, tk_activation_t a) {
     switch (a) {
         /* Read the sign bit directly instead of comparing: measured ~40% faster
          * than `z >= 0 ? 1 : 0` in a vectorized loop (see bench). */
-        case TK_ACT_STEP:    return 1.0f - (float)(tk_act__bits(z) >> 31);
+        case TK_ACT_STEP:    return 1.0f - (float)(tk__act_f2u(z) >> 31);
         /* copysign / fmax lower to a single bitwise/max instruction and
          * vectorize; branchless. */
         case TK_ACT_SIGN:    return __builtin_copysignf(1.0f, z);
         case TK_ACT_RELU:    return __builtin_fmaxf(z, 0.0f);
         case TK_ACT_SIGMOID: return tk__sigmoid(z);
         case TK_ACT_TANH:    return tk__tanh(z);
-        case TK_ACT_GELU:    return 0.5f * z * (1.0f + tk__tanh(
-                                    0.7978845608028654f * (z + 0.044715f * z * z * z)));
+        case TK_ACT_GELU:    return tk__gelu(z);
         default:             return z;
     }
 }
@@ -85,7 +95,7 @@ static inline float tk_act_grad_scalar(float z, tk_activation_t a) {
         case TK_ACT_GELU: {
             const float c = 0.7978845608028654f, a3 = 0.044715f;
             float z2 = z * z;                               /* cache z^2 (FMA-friendly) */
-            float u  = c * z * (1.0f + a3 * z2);
+            float u  = tk__gelu_k(z);
             float th = tk__tanh(u);
             float du = c * (1.0f + (3.0f * a3) * z2);
             return 0.5f * (1.0f + th) + 0.5f * z * (1.0f - th * th) * du;

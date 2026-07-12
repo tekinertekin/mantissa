@@ -2,6 +2,19 @@
 #include "pool.h"
 #include <stdlib.h>
 
+/* Two forward-pass ladders live here; they do NOT share a kernel:
+ *
+ *   narrow API   tk_linear_forward     -> gemv_range      -> tk__dot4 (SIMD)
+ *   batch  API   tk_linear_forward_batch -> gemm_range    -> tk__dot4 (SIMD)
+ *   float32 API  tk_linear_forward_f32 -> gemv_f32_range / _serial (tk_q loops)
+ *
+ * tk__dot4 is the register-blocked 4-row kernel: portable scalar fallback plus
+ * NEON (f32/bf16/fp16 + a FEAT_BF16 BFMLAL path) and runtime-dispatched AVX2.
+ * The f32 ladder deliberately does NOT reuse tk__dot4 or a shared range fn --
+ * folding its serial loop into a pooled worker makes pointers escape and
+ * de-vectorizes it (~40% slower, measured). See docs/DESIGN.md, "The
+ * dot-product loop" and "Optimizations measured and rejected". */
+
 #if defined(__aarch64__)
 #include <arm_neon.h>
 #if TK_DTYPE == TK_DTYPE_FLOAT32
@@ -80,7 +93,7 @@ static void tk__dot4_bfmlal(const tk_bf16_t *W, int in, const tk_bf16_t *x, floa
 static inline float32x4_t tk__fp16x4(const tk_fp16_t *p) {
     return vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(p)));
 }
-#endif
+#endif /* TK_DTYPE, within __aarch64__ */
 
 #elif defined(__x86_64__) && (TK_DTYPE == TK_DTYPE_FLOAT32 || TK_DTYPE == TK_DTYPE_BFLOAT16)
 #include <immintrin.h>
@@ -144,7 +157,7 @@ static void tk__dot4_avx2(const tk_scalar_t *W, int in, const tk_scalar_t *x, fl
     }
     out[0] = s0; out[1] = s1; out[2] = s2; out[3] = s3;
 }
-#endif
+#endif /* arch dispatch */
 
 float tk_dot(const tk_scalar_t *restrict a, const tk_scalar_t *restrict b, int n) {
     /* Four independent accumulators break the loop-carried dependency on the FP
