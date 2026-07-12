@@ -57,6 +57,29 @@ int main(void) {
     printf("\n[GEMV] %d passes in %.3f s -> %.3f ms/pass, %.2f GFLOP/s\n",
            REPS, dt, dt / REPS * 1e3, flops / dt / 1e9);
 
+    /* --- 1a. batch forward (GEMM): W streams once per batch, not per sample --- */
+    {
+        enum { NS = 64 };
+        tk_scalar_t *Xb = malloc((size_t)NS * IN * sizeof(tk_scalar_t));
+        float *Yb = malloc((size_t)NS * OUT * sizeof(float));
+        if (Xb && Yb) {
+            for (long i = 0; i < (long)NS * IN; i++)
+                Xb[i] = TK_FROM_FLOAT(((float)(i % 13) - 6.0f) * 0.1f);
+            tk_linear_forward_batch(W, Xb, b, Yb, NS, OUT, IN, TK_ACT_RELU); /* warm */
+            const int BREPS = REPS / 8 > 0 ? REPS / 8 : 1;
+            double b0 = now_s();
+            for (int r = 0; r < BREPS; r++) {
+                tk_linear_forward_batch(W, Xb, b, Yb, NS, OUT, IN, TK_ACT_RELU);
+                g_sink += Yb[r % (NS * OUT)];
+            }
+            double bdt = now_s() - b0;
+            double bflops = 2.0 * params * NS * BREPS;
+            printf("[GEMM batch=%d] %.3f ms/sample-equiv, %.2f GFLOP/s\n",
+                   NS, bdt / BREPS / NS * 1e3, bflops / bdt / 1e9);
+        }
+        free(Xb); free(Yb);
+    }
+
     /* --- 1b. float32-API GEMV (the path every non-C binding calls) --- */
     {
         float *Wf = malloc((size_t)params * sizeof(float));

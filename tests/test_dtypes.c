@@ -185,6 +185,34 @@ int main(void) {
         free(Wl); free(xl); free(y);
     }
 
+    /* Batch forward must match per-sample tk_linear_forward to reduction-order
+     * noise (same kernel; only chunk boundaries can shift kernel selection). */
+    printf("\ntk_linear_forward_batch vs per-sample:\n");
+    {
+        enum { NS = 5, O = 600, I = 600 };
+        tk_scalar_t *Wl = malloc(sizeof(tk_scalar_t) * O * I);
+        tk_scalar_t *Xl = malloc(sizeof(tk_scalar_t) * NS * I);
+        float *Yb = malloc(sizeof(float) * NS * O), *ys = malloc(sizeof(float) * O);
+        if (Wl && Xl && Yb && ys) {
+            tk_rng r = tk_rng_seed(77);
+            for (int k = 0; k < O * I; k++)  Wl[k] = TK_FROM_FLOAT(tk_rng_f01(&r) - 0.5f);
+            for (int k = 0; k < NS * I; k++) Xl[k] = TK_FROM_FLOAT(tk_rng_f01(&r) - 0.5f);
+            tk_linear_forward_batch(Wl, Xl, NULL, Yb, NS, O, I, TK_ACT_TANH);
+            float max_abs = 0.0f;
+            for (int s = 0; s < NS; s++) {
+                tk_linear_forward(Wl, Xl + (size_t)s * I, NULL, ys, O, I, TK_ACT_TANH);
+                for (int o = 0; o < O; o++) {
+                    float d = fabsf(Yb[(size_t)s * O + o] - ys[o]);
+                    if (d > max_abs) max_abs = d;
+                }
+            }
+            int ok = max_abs < 5e-3f;
+            if (!ok) failures++;
+            printf("  [%s] max |batch - per-sample| = %.2e\n", ok ? "OK" : "!!", max_abs);
+        }
+        free(Wl); free(Xl); free(Yb); free(ys);
+    }
+
     /* Stochastic rounding is unbiased (Gupta et al., 2015): the mean of many
      * independent SR write-backs equals the true value, not the nearest grid
      * point. w = 1.0 (exact in every format), one SGD step to 1.2. */

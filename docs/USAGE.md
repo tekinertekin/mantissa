@@ -174,6 +174,7 @@ Worked end-to-end trainer: [`examples/train_xor.c`](../examples/train_xor.c)
 | Quantize a float weight into storage | `TK_FROM_FLOAT` / `tk_float_to_*` |
 | Read a stored weight back as float | `TK_TO_FLOAT` / `tk_*_to_float` |
 | One neuron / a dense layer forward | `tk_linear_forward` |
+| Many inputs through one layer (GEMM) | `tk_linear_forward_batch` |
 | Just a dot product | `tk_dot` |
 | Apply an activation over a vector | `tk_activate` |
 | Loss + seed gradient | `tk_loss` |

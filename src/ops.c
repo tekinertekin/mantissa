@@ -262,6 +262,65 @@ void tk_linear_forward(const tk_scalar_t *restrict W,
     }
 }
 
+/* Batch forward (GEMM): rows [o0,o1) against ALL samples. Sample-inner order
+ * keeps the current 4-row W block hot in L1 across the sweep, so W streams
+ * from memory once per batch instead of once per sample — the GEMV loop's
+ * bandwidth bound amortized over n. Same tk__dot4 kernel; per-row numerics
+ * match the single-sample path. */
+static void gemm_range(const tk_scalar_t *restrict W, const tk_scalar_t *restrict X,
+                       const tk_scalar_t *restrict bias, float *restrict Y,
+                       int o0, int o1, int n_samples, int out_dim, int in_dim,
+                       tk_activation_t act) {
+    int o = o0;
+    for (; o + 4 <= o1; o += 4) {
+        for (int s = 0; s < n_samples; s++) {
+            float r[4];
+            tk__dot4(W + (size_t)o * in_dim, in_dim, X + (size_t)s * in_dim, r);
+            float *ys = Y + (size_t)s * out_dim + o;
+            for (int k = 0; k < 4; k++) {
+                float z = r[k] + (bias ? TK_TO_FLOAT(bias[o + k]) : 0.0f);
+                ys[k] = tk_act_scalar(z, act);
+            }
+        }
+    }
+    for (; o < o1; o++) {
+        for (int s = 0; s < n_samples; s++) {
+            float z = tk_dot(W + (size_t)o * in_dim, X + (size_t)s * in_dim, in_dim);
+            if (bias) z += TK_TO_FLOAT(bias[o]);
+            Y[(size_t)s * out_dim + o] = tk_act_scalar(z, act);
+        }
+    }
+}
+
+typedef struct {
+    const tk_scalar_t *W, *X, *bias;
+    float *Y;
+    int n_samples, out_dim, in_dim;
+    tk_activation_t act;
+} tk_gemm_ctx;
+
+static void gemm_worker(void *p, int o0, int o1, int worker) {
+    (void)worker;
+    const tk_gemm_ctx *c = (const tk_gemm_ctx *)p;
+    gemm_range(c->W, c->X, c->bias, c->Y, o0, o1,
+               c->n_samples, c->out_dim, c->in_dim, c->act);
+}
+
+void tk_linear_forward_batch(const tk_scalar_t *restrict W,
+                             const tk_scalar_t *restrict X,
+                             const tk_scalar_t *restrict bias,
+                             float *restrict Y,
+                             int n_samples, int out_dim, int in_dim,
+                             tk_activation_t act) {
+    if ((size_t)out_dim * in_dim * (size_t)(n_samples > 0) >= TK_MT_MIN_WORK
+        && tk_num_threads() > 1) {
+        tk_gemm_ctx c = { W, X, bias, Y, n_samples, out_dim, in_dim, act };
+        tk_parallel_for(out_dim, gemm_worker, &c);   /* threads own row ranges */
+        return;
+    }
+    gemm_range(W, X, bias, Y, 0, out_dim, n_samples, out_dim, in_dim, act);
+}
+
 /* Quantize a float through the active storage type (round-trip), so the f32
  * API reproduces that type's precision on plain-float inputs. */
 static inline float tk_q(float v) { return TK_TO_FLOAT(TK_FROM_FLOAT(v)); }

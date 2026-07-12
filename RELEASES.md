@@ -6,6 +6,27 @@ dense layer (4.2M params) unless noted, and are indicative, not absolute.
 
 ---
 
+## v0.1.12 — 2026-07-12  (tag `v0.1.12`)
+
+First true GEMM: batch inference stops re-streaming the weight matrix.
+
+**Added**
+- `tk_linear_forward_batch(W, X, bias, Y, n_samples, out_dim, in_dim, act)` —
+  forward for a whole batch of inputs. Each 4-row W block sweeps every sample
+  before moving on, so W streams from memory **once per batch** instead of
+  once per sample; threads own row ranges (disjoint Y columns, no locking).
+  Same `tk__dot4` kernel — per-sample output is bit-identical to
+  `tk_linear_forward` (pinned by a new test).
+- Measured (2048×2048 bf16, batch 64, interleaved runs): serial
+  60 → 64.8 GFLOP/s (+8% — one core was already near the BFMLAL compute
+  ceiling), **10 threads 127.7 → 348.8 GFLOP/s (2.7×)**. The multithreaded
+  GEMV was bandwidth-bound on ten cores re-streaming the same 8 MB of
+  weights per sample; amortizing W across the batch turns those threads
+  compute-bound. This is the primitive batch predict / MLP mini-batches
+  build on.
+
+---
+
 ## v0.1.11 — 2026-07-12  (tag `v0.1.11`)
 
 One addition, driven by a real measurement from the sister

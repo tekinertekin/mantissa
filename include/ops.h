@@ -32,6 +32,18 @@ TK_API void tk_linear_forward(const tk_scalar_t *restrict W,
                               int out_dim, int in_dim,
                               tk_activation_t act);
 
+/* Batch forward (GEMM): Y[s] = act(W X[s] + bias) for s in [0, n_samples).
+ *   X : n_samples x in_dim rows (narrow), Y : n_samples x out_dim (float32).
+ * Sweeps every sample per 4-row W block, so W streams from memory once per
+ * batch instead of once per sample -- prefer this over per-sample
+ * tk_linear_forward whenever multiple inputs are available at once. */
+TK_API void tk_linear_forward_batch(const tk_scalar_t *restrict W,
+                                    const tk_scalar_t *restrict X,
+                                    const tk_scalar_t *restrict bias,
+                                    float *restrict Y,
+                                    int n_samples, int out_dim, int in_dim,
+                                    tk_activation_t act);
+
 /* Narrow n floats into the configured storage type (dst[i] = FROM_FLOAT(src[i])).
  * A caller doing repeated inference narrows W once with this, then calls the fast
  * tk_linear_forward -- avoiding tk_linear_forward_f32's re-quantization of every
