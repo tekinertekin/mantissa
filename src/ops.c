@@ -13,6 +13,73 @@
 static inline float32x4_t tk__bf16x4(const tk_bf16_t *p) {
     return vreinterpretq_f32_u32(vshll_n_u16(vld1_u16(p), 16));
 }
+
+#if defined(__clang__)
+#define TK_HAVE_BF16_MLAL 1
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#elif defined(__linux__)
+#include <sys/auxv.h>
+#include <asm/hwcap.h>
+#endif
+
+/* FEAT_BF16 (ARMv8.6, Apple M2+, Graviton3+): cached runtime check, same
+ * pattern as the AVX2 dispatch — compile unconditionally via the target
+ * attribute, call only when the CPU reports the feature. Clang-only: GCC's
+ * arm_neon.h gates the bf16 intrinsics on global -march. */
+static int tk__cpu_has_bf16(void) {
+    static int cached = -1;
+    if (cached < 0) {
+#if defined(__APPLE__)
+        int v = 0; size_t sz = sizeof v;
+        cached = (sysctlbyname("hw.optional.arm.FEAT_BF16", &v, &sz, NULL, 0) == 0 && v != 0);
+#elif defined(__linux__) && defined(HWCAP2_BF16)
+        cached = (getauxval(AT_HWCAP2) & HWCAP2_BF16) != 0;
+#else
+        cached = 0;
+#endif
+    }
+    return cached;
+}
+
+/* BFMLALB/BFMLALT: exact f32 FMAs of exact bf16 products, 2 instructions per
+ * row per 8 elements (vs 4 widen+FMA). Two accumulator chains per row — a
+ * single chain is FMA-latency bound and measures no faster than widen+FMA;
+ * split even/odd chains measure ~1.9-2.4x over the depth-4 kernel (M4). */
+__attribute__((target("arch=armv8.6-a+bf16")))
+static void tk__dot4_bfmlal(const tk_bf16_t *W, int in, const tk_bf16_t *x, float *out) {
+    const tk_bf16_t *w0 = W, *w1 = W + in, *w2 = W + 2 * in, *w3 = W + 3 * in;
+    float32x4_t a0 = vdupq_n_f32(0), a1 = a0, a2 = a0, a3 = a0;
+    float32x4_t b0 = a0, b1 = a0, b2 = a0, b3 = a0;
+    int i = 0;
+    for (; i + 8 <= in; i += 8) {
+        bfloat16x8_t xv = vreinterpretq_bf16_u16(vld1q_u16(x + i));
+        bfloat16x8_t v0 = vreinterpretq_bf16_u16(vld1q_u16(w0 + i));
+        bfloat16x8_t v1 = vreinterpretq_bf16_u16(vld1q_u16(w1 + i));
+        bfloat16x8_t v2 = vreinterpretq_bf16_u16(vld1q_u16(w2 + i));
+        bfloat16x8_t v3 = vreinterpretq_bf16_u16(vld1q_u16(w3 + i));
+        a0 = vbfmlalbq_f32(a0, v0, xv); b0 = vbfmlaltq_f32(b0, v0, xv);
+        a1 = vbfmlalbq_f32(a1, v1, xv); b1 = vbfmlaltq_f32(b1, v1, xv);
+        a2 = vbfmlalbq_f32(a2, v2, xv); b2 = vbfmlaltq_f32(b2, v2, xv);
+        a3 = vbfmlalbq_f32(a3, v3, xv); b3 = vbfmlaltq_f32(b3, v3, xv);
+    }
+    float s0 = vaddvq_f32(vaddq_f32(a0, b0)), s1 = vaddvq_f32(vaddq_f32(a1, b1));
+    float s2 = vaddvq_f32(vaddq_f32(a2, b2)), s3 = vaddvq_f32(vaddq_f32(a3, b3));
+    for (; i < in; i++) {
+        float xi = tk_bf16_to_float(x[i]);
+        s0 += tk_bf16_to_float(w0[i]) * xi; s1 += tk_bf16_to_float(w1[i]) * xi;
+        s2 += tk_bf16_to_float(w2[i]) * xi; s3 += tk_bf16_to_float(w3[i]) * xi;
+    }
+    out[0] = s0; out[1] = s1; out[2] = s2; out[3] = s3;
+}
+#endif /* __clang__ */
+#elif TK_DTYPE == TK_DTYPE_FP16
+#define TK_HAVE_NEON_FP16 1
+/* Load 4 fp16 as float32: a single FCVTL (base A64) per vector — IEEE-exact,
+ * including subnormals, same contract as the scalar FCVT read path. */
+static inline float32x4_t tk__fp16x4(const tk_fp16_t *p) {
+    return vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(p)));
+}
 #endif
 
 #elif defined(__x86_64__) && (TK_DTYPE == TK_DTYPE_FLOAT32 || TK_DTYPE == TK_DTYPE_BFLOAT16)
@@ -98,10 +165,12 @@ float tk_dot(const tk_scalar_t *restrict a, const tk_scalar_t *restrict b, int n
 }
 
 /* Four dot products (4 consecutive weight rows against the same x) at once.
- * Register blocking: each x element is loaded once and feeds 4 independent FMA
+ * Register blocking: each x element is loaded once and feeds independent FMA
  * chains, so the FP units stay busy and x conversions are shared across rows —
- * a single-row loop can do neither. ~1.3x portable; the float32 build adds an
- * explicit NEON FMA kernel on arm64 for ~2x. */
+ * a single-row loop can do neither. On arm64, float32/bfloat16/fp16 use
+ * explicit NEON kernels with two accumulator chains per row (depth-8); bf16
+ * additionally dispatches to a BFMLALB/T kernel on FEAT_BF16 CPUs. x86-64
+ * runtime-dispatches AVX2+FMA for float32/bfloat16. */
 static inline void tk__dot4(const tk_scalar_t *restrict W, int in,
                             const tk_scalar_t *restrict x,
                             float *restrict out) {
@@ -109,24 +178,31 @@ static inline void tk__dot4(const tk_scalar_t *restrict W, int in,
                        *restrict w2 = W + 2 * in, *restrict w3 = W + 3 * in;
     float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
     int i = 0;
-#if defined(TK_HAVE_NEON_F32) || defined(TK_HAVE_NEON_BF16)
-    float32x4_t a0 = vdupq_n_f32(0), a1 = a0, a2 = a0, a3 = a0;
-    for (; i + 4 <= in; i += 4) {
-  #ifdef TK_HAVE_NEON_F32
-        float32x4_t xv = vld1q_f32(x + i);
-        a0 = vfmaq_f32(a0, vld1q_f32(w0 + i), xv);
-        a1 = vfmaq_f32(a1, vld1q_f32(w1 + i), xv);
-        a2 = vfmaq_f32(a2, vld1q_f32(w2 + i), xv);
-        a3 = vfmaq_f32(a3, vld1q_f32(w3 + i), xv);
-  #else /* bf16: load + widen each vector */
-        float32x4_t xv = tk__bf16x4(x + i);
-        a0 = vfmaq_f32(a0, tk__bf16x4(w0 + i), xv);
-        a1 = vfmaq_f32(a1, tk__bf16x4(w1 + i), xv);
-        a2 = vfmaq_f32(a2, tk__bf16x4(w2 + i), xv);
-        a3 = vfmaq_f32(a3, tk__bf16x4(w3 + i), xv);
+#if defined(TK_HAVE_NEON_F32) || defined(TK_HAVE_NEON_BF16) || defined(TK_HAVE_NEON_FP16)
+  #if defined(TK_HAVE_BF16_MLAL)
+    if (tk__cpu_has_bf16()) { tk__dot4_bfmlal(W, in, x, out); return; }
   #endif
+  #if defined(TK_HAVE_NEON_F32)
+    #define TK__LD4(p) vld1q_f32(p)
+  #elif defined(TK_HAVE_NEON_BF16)
+    #define TK__LD4(p) tk__bf16x4(p)         /* load + widen */
+  #else
+    #define TK__LD4(p) tk__fp16x4(p)         /* load + FCVTL */
+  #endif
+    /* Two accumulator chains per row (depth-8): one chain is bound by FMA
+     * latency, not throughput — splitting it measured ~1.6-2x (M4, bf16). */
+    float32x4_t a0 = vdupq_n_f32(0), a1 = a0, a2 = a0, a3 = a0;
+    float32x4_t b0 = a0, b1 = a0, b2 = a0, b3 = a0;
+    for (; i + 8 <= in; i += 8) {
+        float32x4_t x0 = TK__LD4(x + i), x1 = TK__LD4(x + i + 4);
+        a0 = vfmaq_f32(a0, TK__LD4(w0 + i), x0); b0 = vfmaq_f32(b0, TK__LD4(w0 + i + 4), x1);
+        a1 = vfmaq_f32(a1, TK__LD4(w1 + i), x0); b1 = vfmaq_f32(b1, TK__LD4(w1 + i + 4), x1);
+        a2 = vfmaq_f32(a2, TK__LD4(w2 + i), x0); b2 = vfmaq_f32(b2, TK__LD4(w2 + i + 4), x1);
+        a3 = vfmaq_f32(a3, TK__LD4(w3 + i), x0); b3 = vfmaq_f32(b3, TK__LD4(w3 + i + 4), x1);
     }
-    s0 = vaddvq_f32(a0); s1 = vaddvq_f32(a1); s2 = vaddvq_f32(a2); s3 = vaddvq_f32(a3);
+  #undef TK__LD4
+    s0 = vaddvq_f32(vaddq_f32(a0, b0)); s1 = vaddvq_f32(vaddq_f32(a1, b1));
+    s2 = vaddvq_f32(vaddq_f32(a2, b2)); s3 = vaddvq_f32(vaddq_f32(a3, b3));
 #elif defined(TK_HAVE_AVX2)
     if (tk__cpu_has_avx2()) { tk__dot4_avx2(W, in, x, out); return; }  /* else portable below */
 #endif
