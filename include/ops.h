@@ -32,6 +32,12 @@ TK_API void tk_linear_forward(const tk_scalar_t *restrict W,
                               int out_dim, int in_dim,
                               tk_activation_t act);
 
+/* Narrow n floats into the configured storage type (dst[i] = FROM_FLOAT(src[i])).
+ * A caller doing repeated inference narrows W once with this, then calls the fast
+ * tk_linear_forward -- avoiding tk_linear_forward_f32's re-quantization of every
+ * weight on each call. dst is tk_scalar_t*; size it with tk_scalar_size(). */
+TK_API void tk_quantize(const float *restrict src, tk_scalar_t *restrict dst, int n);
+
 /* Same forward pass, but all buffers are plain float32. Each value is quantized
  * through the configured storage type before the multiply, so the caller sees
  * that type's numerical behavior while passing ordinary floats. This is the

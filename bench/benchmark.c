@@ -57,6 +57,48 @@ int main(void) {
     printf("\n[GEMV] %d passes in %.3f s -> %.3f ms/pass, %.2f GFLOP/s\n",
            REPS, dt, dt / REPS * 1e3, flops / dt / 1e9);
 
+    /* --- 1b. float32-API GEMV (the path every non-C binding calls) --- */
+    {
+        float *Wf = malloc((size_t)params * sizeof(float));
+        float *xf = malloc((size_t)IN * sizeof(float));
+        float *bf = malloc((size_t)OUT * sizeof(float));
+        if (Wf && xf && bf) {
+            for (long i = 0; i < params; i++) Wf[i] = ((float)(i % 17) - 8.0f) * 0.05f;
+            for (int i = 0; i < IN; i++)  xf[i] = ((float)(i % 13) - 6.0f) * 0.1f;
+            for (int i = 0; i < OUT; i++) bf[i] = 0.01f;
+
+            tk_linear_forward_f32(Wf, xf, bf, y, OUT, IN, TK_ACT_RELU);   /* warm up */
+            double f0 = now_s();
+            for (int r = 0; r < REPS; r++) {
+                tk_linear_forward_f32(Wf, xf, bf, y, OUT, IN, TK_ACT_RELU);
+                g_sink += y[r % OUT];
+            }
+            double fdt = now_s() - f0;
+            printf("[GEMV f32] %d passes in %.3f s -> %.3f ms/pass, %.2f GFLOP/s\n",
+                   REPS, fdt, fdt / REPS * 1e3, flops / fdt / 1e9);
+
+            /* Prepared path: quantize W once, then call the narrow fast API. */
+            tk_scalar_t *Wq = malloc((size_t)params * sizeof(tk_scalar_t));
+            tk_scalar_t *xq = malloc((size_t)IN * sizeof(tk_scalar_t));
+            tk_scalar_t *bq = malloc((size_t)OUT * sizeof(tk_scalar_t));
+            if (Wq && xq && bq) {
+                tk_quantize(Wf, Wq, (int)params);
+                tk_quantize(bf, bq, OUT);
+                double p0 = now_s();
+                for (int r = 0; r < REPS; r++) {
+                    tk_quantize(xf, xq, IN);      /* x changes per call; W stays prepared */
+                    tk_linear_forward(Wq, xq, bq, y, OUT, IN, TK_ACT_RELU);
+                    g_sink += y[r % OUT];
+                }
+                double pdt = now_s() - p0;
+                printf("[GEMV f32 prepared] %d passes in %.3f s -> %.3f ms/pass, %.2f GFLOP/s\n",
+                       REPS, pdt, pdt / REPS * 1e3, flops / pdt / 1e9);
+            }
+            free(Wq); free(xq); free(bq);
+        }
+        free(Wf); free(xf); free(bf);
+    }
+
     /* --- 2. activation dispatch: switch (per element) vs resolved pointer --- */
     const int N = 1 << 22;                                 /* 4M elements */
     float *v = malloc((size_t)N * sizeof(float));

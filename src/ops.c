@@ -190,18 +190,27 @@ void tk_linear_forward(const tk_scalar_t *restrict W,
  * API reproduces that type's precision on plain-float inputs. */
 static inline float tk_q(float v) { return TK_TO_FLOAT(TK_FROM_FLOAT(v)); }
 
-void tk_linear_forward_f32(const float *restrict W,
-                           const float *restrict x,
-                           const float *restrict bias,
-                           float *restrict y,
-                           int out_dim, int in_dim,
-                           tk_activation_t act) {
-    /* Quantize x once up front rather than once per output row: x is read
-     * out_dim times, so this removes the x-side round-trip from the hot loop
-     * (roughly halving the quantization work). W is quantized inline because it
-     * is passed as float here; the narrow-storage path (tk_linear_forward) has
-     * no such cost. Falls back to inline quantization if the scratch can't be
-     * allocated. */
+void tk_quantize(const float *restrict src, tk_scalar_t *restrict dst, int n) {
+    for (int i = 0; i < n; i++) dst[i] = TK_FROM_FLOAT(src[i]);
+}
+
+/* Serial f32-API forward. Kept in its own function, deliberately free of the
+ * pool-dispatch call: routing the multithread branch's W/x/y pointers into an
+ * external pool worker in the same function makes them escape, which defeats
+ * the compiler's no-alias analysis and de-vectorizes THIS loop (~40% slower,
+ * measured). Isolating the serial loop here restores its auto-vectorized
+ * codegen while the wrapper below still gets to thread.
+ *
+ * Quantizes x once up front (x is read out_dim times, so this removes the
+ * x-side round-trip from the hot loop); W is quantized inline because it
+ * arrives as float. Falls back to inline x-quantization if scratch can't be
+ * allocated. */
+static void tk_linear_forward_f32_serial(const float *restrict W,
+                                         const float *restrict x,
+                                         const float *restrict bias,
+                                         float *restrict y,
+                                         int out_dim, int in_dim,
+                                         tk_activation_t act) {
     float *xq = (float *)malloc((size_t)in_dim * sizeof(float));
     if (xq) for (int i = 0; i < in_dim; i++) xq[i] = tk_q(x[i]);
 
@@ -225,4 +234,62 @@ void tk_linear_forward_f32(const float *restrict W,
         y[o] = tk_act_scalar(z, act);
     }
     free(xq);
+}
+
+/* Output rows [o0, o1) for the pooled path; xq is pre-quantized and shared
+ * read-only across workers, W is quantized inline. Rows are disjoint. */
+static void gemv_f32_range(const float *restrict W, const float *restrict xq,
+                           const float *restrict bias, float *restrict y,
+                           int o0, int o1, int in_dim, tk_activation_t act) {
+    for (int o = o0; o < o1; o++) {
+        const float *restrict wr = W + (size_t)o * in_dim;
+        float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+        int i = 0;
+        for (; i + 4 <= in_dim; i += 4) {
+            s0 += tk_q(wr[i + 0]) * xq[i + 0];
+            s1 += tk_q(wr[i + 1]) * xq[i + 1];
+            s2 += tk_q(wr[i + 2]) * xq[i + 2];
+            s3 += tk_q(wr[i + 3]) * xq[i + 3];
+        }
+        for (; i < in_dim; i++) s0 += tk_q(wr[i]) * xq[i];
+        float z = (s0 + s1) + (s2 + s3);
+        if (bias) z += tk_q(bias[o]);
+        y[o] = tk_act_scalar(z, act);
+    }
+}
+
+typedef struct {
+    const float *W, *xq, *bias;
+    float *y;
+    int in_dim;
+    tk_activation_t act;
+} tk_gemv_f32_ctx;
+
+static void gemv_f32_worker(void *p, int o0, int o1, int worker) {
+    (void)worker;
+    const tk_gemv_f32_ctx *c = (const tk_gemv_f32_ctx *)p;
+    gemv_f32_range(c->W, c->xq, c->bias, c->y, o0, o1, c->in_dim, c->act);
+}
+
+void tk_linear_forward_f32(const float *restrict W,
+                           const float *restrict x,
+                           const float *restrict bias,
+                           float *restrict y,
+                           int out_dim, int in_dim,
+                           tk_activation_t act) {
+    /* Rows are independent (disjoint y[o]), so threading changes no per-row
+     * numerics -- results are bit-identical to the serial path. Threshold and
+     * dispatch mirror tk_linear_forward; on the serial/small-layer path we call
+     * the isolated serial routine to keep its auto-vectorized codegen. */
+    if ((size_t)out_dim * in_dim >= TK_MT_MIN_WORK && tk_num_threads() > 1) {
+        float *xq = (float *)malloc((size_t)in_dim * sizeof(float));
+        if (xq) {
+            for (int i = 0; i < in_dim; i++) xq[i] = tk_q(x[i]);
+            tk_gemv_f32_ctx c = { W, xq, bias, y, in_dim, act };
+            tk_parallel_for(out_dim, gemv_f32_worker, &c);
+            free(xq);
+            return;
+        }
+    }
+    tk_linear_forward_f32_serial(W, x, bias, y, out_dim, in_dim, act);
 }
