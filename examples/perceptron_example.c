@@ -10,7 +10,7 @@
 int main(void) {
     enum { IN = 2, OUT = 1 };
 
-    /* Weights/bias are stored in the configured type (float32 by default). */
+    /* Weights/bias are stored in the configured type (bfloat16 by default). */
     tk_scalar_t W[OUT * IN] = { TK_FROM_FLOAT(1.0f), TK_FROM_FLOAT(1.0f) };
 #if TK_USE_BIAS
     tk_scalar_t bias[OUT]   = { TK_FROM_FLOAT(-0.5f) };

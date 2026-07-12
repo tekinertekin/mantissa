@@ -131,7 +131,9 @@ not the goal itself.
 | 3 | `tekin32`  | 4 | custom high-fidelity accumulator |
 | 4 | `tekin8`   | 1 | FP8 E4M3 — 4× smaller |
 | 5 | `fp8_e5m2` | 1 | FP8, wider range |
-| 6 | `fp4_e2m1` | ½ | FP4 — the extreme |
+| 6 | `fp4_e2m1` | ½* | FP4 — the extreme |
+
+*\*fp4 is stored one value per byte today (1 B); the "½" is the logical E2M1 width. Two-per-byte packing is a roadmap item gated on block-scaling — see [`docs/DESIGN.md`](docs/DESIGN.md).*
 
 Bit layouts, the `tekin` formats' design rationale, the hot/cold conversion
 split, and the current-research context (MX / NVFP4 / posit / IEEE P3109) all
@@ -193,7 +195,7 @@ work threshold) so the pool never hurts the millions-of-small-calls case; set
 |----------|:----------------:|:----------------:|:------------------------:|
 | float32  | 1.03 | 12.21 | 9379 |
 | bfloat16 | 0.98 | 12.83 |  994 |
-| tekin8   | 3.04 |  4.14 |  298 |
+| tekin8   | 3.04 |  4.14 |  321 |
 
 **Activation dispatch** (4M elements): a per-element `switch` beats a resolved
 function pointer ~7× for `relu` and ~1.5× for `sigmoid`. The inline `switch`
@@ -214,6 +216,10 @@ tk_linear_forward(W1, x,  b1,   h1, 6, 4, TK_ACT_TANH);     /* bias + tanh    */
 tk_linear_forward(W2, h1, NULL, h2, 5, 6, TK_ACT_RELU);     /* no bias + relu */
 tk_linear_forward(W3, h2, b3,   y,  2, 5, TK_ACT_SIGMOID);  /* bias + sigmoid */
 ```
+
+*(Under the default narrow storage each float output is requantized to
+`tk_scalar_t` before it feeds the next layer — see [`examples/mlp_example.c`](examples/mlp_example.c);
+the snippet elides that for readability. It compiles as-is only under `DTYPE=0`.)*
 
 That is a full 3-layer MLP with three different bias/activation setups —
 exactly the heterogeneity a Transformer needs (bias-free attention projections,
@@ -248,8 +254,8 @@ flowchart LR
 ```
 
 Correctness is proven by a **gradient check** (`make testbp`): analytic
-gradients vs central finite differences, matching to <1e-3 for tanh, sigmoid,
-relu, and gelu.
+gradients vs central finite differences, matching to <1e-2 relative error for
+tanh, sigmoid, relu, and gelu.
 
 `make train` learns **XOR** — the problem a single perceptron *cannot* solve —
 end to end, in the default **bfloat16**:
@@ -318,7 +324,8 @@ straight from Python, no compiler or `make` needed:
 ```python
 import ctypes
 lib = ctypes.CDLL("./libmantissa-linux-x86_64.so")   # the file you downloaded
-print(lib.tk_dtype_name.restype == None or "loaded")
+lib.tk_dtype_name.restype = ctypes.c_char_p
+print(lib.tk_dtype_name().decode())                  # -> e.g. "bfloat16"
 ```
 
 Or use the ctypes wrapper in [`python/mantissa.py`](python/mantissa.py) (point
@@ -348,8 +355,8 @@ The low-precision frontier moves fast; `mantissa` tracks it deliberately:
 - **Microscaling (MX)** — OCP MX v1.0 (2023): blocks of 32 elements share one
   E8M0 scale, mitigating the tiny dynamic range of 4/6-bit elements. `MXFP8`,
   `MXFP6`, `MXFP4`.
-- **NVFP4** — NVIDIA Blackwell (2024): 16-element blocks with an FP8 E4M3 block
-  scale; used to pretrain LLMs at 4 bits (arXiv:2509.25149).
+- **NVFP4** — NVIDIA Blackwell (2024 hardware): 16-element blocks with an FP8
+  E4M3 block scale; used to pretrain LLMs at 4 bits (arXiv:2509.25149, 2025).
 - **Posit / takum** — tapered-precision alternatives to IEEE floats, strong for
   ≤8-bit inference on zero-centered weights.
 - **IEEE P3109** — an emerging standard for ML arithmetic formats.

@@ -205,6 +205,16 @@ disagreed with the theory. Recorded here so they are not re-attempted.
 - **Manual branchless `dropout`/L1-sign and loop unswitching** — no change:
   `-O3` already emits `csel`/`cmov` for the data-dependent selects and hoists the
   loop-invariant branches.
+- **Explicit NEON for the backward pass** — **~40% slower** for the `dx`
+  reduction than the compiler's auto-vectorized scalar loop. Backward is
+  store-bandwidth bound (it writes `dW`, 4×params bytes), so hand-vectorizing the
+  arithmetic wins nothing and the extra shuffle/reduce instructions cost. Kept the
+  scalar loop the compiler already vectorizes.
+- **Spin-wait in the thread pool** instead of the condvar barrier — declined:
+  it would burn CPU on idle workers, which directly contradicts the
+  low-footprint / millions-of-small-calls goal (small layers stay serial and the
+  pool sits idle most of the time). The condvar's wake latency is negligible
+  against the per-GEMV work above the threshold.
 
 Two suggestions were already in place: `dW`/`dx` are computed in one pass over
 the weights (no double read), and small layers skip the thread pool via a work
@@ -239,9 +249,9 @@ of reimplementing the numerics.
   E8M0 scale, restoring the dynamic range that 4/6-bit elements lack. Element
   types MXFP8 (E4M3/E5M2), MXFP6, MXFP4 (E2M1). mantissa implements the element
   formats; a shared per-block scale is the next step.
-- **NVFP4** — NVIDIA Blackwell (2024): 16-element blocks, an FP8 E4M3 block
-  scale plus a per-tensor FP32 scalar; LLMs pretrained at 4 bits
-  (arXiv:2509.25149).
+- **NVFP4** — NVIDIA Blackwell (2024 hardware): 16-element blocks, an FP8 E4M3
+  block scale plus a per-tensor FP32 scalar; LLMs pretrained at 4 bits per
+  "Pretraining LLMs with NVFP4" (NVIDIA, arXiv:2509.25149, 2025).
 - **Posit / takum** (Gustafson) — tapered-precision alternatives to IEEE
   floats; more precision near ±1 where zero-centered weights concentrate.
 - **IEEE P3109** — emerging standard for ML arithmetic formats (2025).

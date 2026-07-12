@@ -9,7 +9,7 @@
 /* Narrow storage formats held in plain integers. See docs/DESIGN.md for the
  * bit layouts and the rationale behind tekin32 / tekin8.
  *
- *   fp16     1-5-10  IEEE-754 half   (Micikevicius et al., 2017)
+ *   fp16     1-5-10  IEEE-754 half   (IEEE 754-2008 binary16)
  *   bf16     1-8-7   Google bfloat16 (Kalamkar et al., 2019, arXiv:1905.12322)
  *   tekin32  1-7-24  range traded for precision, tuned to NN value ranges
  *   tekin8   1-4-3   FP8 E4M3        (Micikevicius et al., 2022, arXiv:2209.05433)
