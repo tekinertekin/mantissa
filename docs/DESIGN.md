@@ -196,7 +196,7 @@ storage matters.
 
 Intuition says an indirect `function pointer` avoids the cost of a `switch`.
 The benchmark says otherwise: applying an activation element-wise, the inline
-`switch` runs ~3× faster than a resolved pointer for `relu`. Reason — the
+`switch` runs ~7× faster than a resolved pointer for `relu`. Reason — the
 `switch` body inlines and the loop **vectorizes**; an indirect call per element
 is opaque to the vectorizer and pays call overhead each iteration. So
 `tk_activate` uses the `switch`, and `tk_act_resolve()` (the pointer table) is

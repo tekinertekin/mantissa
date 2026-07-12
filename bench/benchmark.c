@@ -20,8 +20,10 @@ static double now_s(void) {
 
 static volatile float g_sink = 0.0f;   /* keeps results "used" */
 
-int main(void) {
-    const int IN = 2048, OUT = 2048, REPS = 200;
+int main(int argc, char **argv) {
+    const int IN = 2048, OUT = 2048;
+    int REPS = (argc > 1) ? atoi(argv[1]) : 200;
+    if (REPS <= 0) REPS = 200;
     const long params = (long)IN * OUT;
 
     tk_scalar_t *W = malloc((size_t)params * sizeof(tk_scalar_t));
@@ -36,6 +38,7 @@ int main(void) {
 
     printf("=== mantissa benchmark  (dtype=%s, %d bytes/param) ===\n",
            tk_dtype_name(), tk_scalar_size());
+    printf("note: single runs lie under DVFS -- compare medians of interleaved runs\n");
 
     /* --- weight-matrix memory footprint --- */
     double mb = (double)params * tk_scalar_size() / (1024.0 * 1024.0);
@@ -107,6 +110,8 @@ int main(void) {
             if (Wq && xq && bq) {
                 tk_quantize(Wf, Wq, (int)params);
                 tk_quantize(bf, bq, OUT);
+                tk_quantize(xf, xq, IN);                               /* warm up */
+                tk_linear_forward(Wq, xq, bq, y, OUT, IN, TK_ACT_RELU);
                 double p0 = now_s();
                 for (int r = 0; r < REPS; r++) {
                     tk_quantize(xf, xq, IN);      /* x changes per call; W stays prepared */
@@ -131,6 +136,7 @@ int main(void) {
         tk_activation_t act = trial ? TK_ACT_SIGMOID : TK_ACT_RELU;
         const char *name = trial ? "sigmoid" : "relu";
 
+        for (int i = 0; i < N; i++) v[i] = tk_act_scalar(v[i], act); /* warm up: both timed loops see hot cache */
         double s = now_s();
         for (int i = 0; i < N; i++) v[i] = tk_act_scalar(v[i], act);   /* per-element switch */
         double t_switch = now_s() - s;
