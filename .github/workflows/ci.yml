@@ -3,8 +3,15 @@ name: ci
 on: [push, pull_request]
 
 jobs:
+  # Runs the full test matrix on x86-64 (ubuntu) and Apple Silicon (macos-14),
+  # so the arm64 NEON kernels — including the FEAT_BF16 BFMLAL dispatch — are
+  # actually exercised in CI and not only on Linux/x86.
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - name: Forward tests (all 7 storage formats)
@@ -15,3 +22,47 @@ jobs:
           done
       - name: Back-propagation gradient check
         run: make testbp
+      # Exercise the -fPIC/-shared build here rather than discovering a broken
+      # shared object at release time (release.yml is tag-gated).
+      - name: Shared library build
+        run: make lib
+      # Warnings can't fail the normal build, so recompile everything with the
+      # Makefile's exact flags plus -Werror to gate on a clean compile.
+      - name: Warnings check (-Werror)
+        run: |
+          mkdir -p build
+          cc -O3 -funroll-loops -ffp-contract=fast -Wall -Wextra -std=c11 \
+             -Iinclude -DTK_DTYPE=2 -fvisibility=hidden -pthread -Werror \
+             -o build/test_dtypes_werror \
+             src/dtypes.c src/activations.c src/ops.c src/loss.c src/backprop.c src/pool.c \
+             tests/test_dtypes.c -lm -pthread
+
+  # AddressSanitizer + UndefinedBehaviorSanitizer so memory/UB bugs regress
+  # loudly. One storage format (DTYPE=2) plus the backprop check is enough.
+  # Flags mirror the Makefile except -ffp-contract=fast is dropped: a sanitizer
+  # build targets memory/UB, not FP numerics, and fast contraction reorders
+  # multiply-adds enough to trip the exact-equality dropout assertion under
+  # ASAN codegen (a 1-ULP false alarm, not a real defect).
+  sanitizer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: ASAN + UBSAN (forward, DTYPE=2)
+        run: |
+          mkdir -p build
+          cc -O3 -funroll-loops -Wall -Wextra -std=c11 \
+             -Iinclude -DTK_DTYPE=2 -fvisibility=hidden -pthread \
+             -fsanitize=address,undefined -fno-omit-frame-pointer -g \
+             -o build/test_dtypes_san \
+             src/dtypes.c src/activations.c src/ops.c src/loss.c src/backprop.c src/pool.c \
+             tests/test_dtypes.c -lm -pthread
+          ./build/test_dtypes_san
+      - name: ASAN + UBSAN (back-propagation)
+        run: |
+          cc -O3 -funroll-loops -Wall -Wextra -std=c11 \
+             -Iinclude -DTK_DTYPE=0 -pthread \
+             -fsanitize=address,undefined -fno-omit-frame-pointer -g \
+             -o build/test_backprop_san \
+             src/dtypes.c src/activations.c src/ops.c src/loss.c src/backprop.c src/pool.c \
+             tests/test_backprop.c -lm -pthread
+          ./build/test_backprop_san
