@@ -2,6 +2,7 @@
 #include <math.h>
 
 float tk_loss(const float *y, const float *target, float *grad, int n, tk_loss_t which) {
+    if (n <= 0) return 0.0f;                 /* empty batch: 0, not 0/0 = NaN */
     const float inv = 1.0f / (float)n;
     float sum = 0.0f;
 

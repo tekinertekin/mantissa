@@ -46,7 +46,7 @@ void tk_linear_backward(const tk_scalar_t *restrict W,
                         float *restrict dx,
                         int out_dim, int in_dim,
                         tk_activation_t act) {
-    const int T = ((long)out_dim * in_dim >= TK_MT_MIN_WORK) ? tk_num_threads() : 1;
+    const int T = ((size_t)out_dim * in_dim >= TK_MT_MIN_WORK) ? tk_num_threads() : 1;
 
     if (T > 1 && !dx) {                       /* no input gradient: pure row-parallel */
         tk_bwd_ctx c = { W, x, z, dy, dW, db, NULL, in_dim, act };
@@ -135,6 +135,7 @@ float tk_train_step_f32(float *W, float *bias,
                         const float *x, const float *target,
                         int out_dim, int in_dim,
                         tk_activation_t act, float lr) {
+    if (out_dim <= 0) return 0.0f;                      /* empty layer: 0, not NaN */
     const float inv = 1.0f / (float)out_dim;
     float loss = 0.0f;
     for (int o = 0; o < out_dim; o++) {

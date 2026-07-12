@@ -178,7 +178,7 @@ void tk_linear_forward(const tk_scalar_t *restrict W,
                        float *restrict y,
                        int out_dim, int in_dim,
                        tk_activation_t act) {
-    if ((long)out_dim * in_dim >= TK_MT_MIN_WORK && tk_num_threads() > 1) {
+    if ((size_t)out_dim * in_dim >= TK_MT_MIN_WORK && tk_num_threads() > 1) {
         tk_gemv_ctx c = { W, x, bias, y, in_dim, act };
         tk_parallel_for(out_dim, gemv_worker, &c);   /* split rows across the pool */
     } else {
