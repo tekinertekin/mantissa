@@ -6,6 +6,10 @@
 #include "config.h"
 #include "tk_export.h"
 
+#if !defined(__aarch64__) && defined(__F16C__)
+#include <immintrin.h>   /* _mm_cvtph_ps for the fp16 read path */
+#endif
+
 /* Narrow storage formats held in plain integers. See docs/DESIGN.md for the
  * bit layouts and the rationale behind tekin32 / tekin8.
  *
@@ -34,6 +38,14 @@ static inline float tk_bf16_to_float(tk_bf16_t v) {
 }
 
 static inline float tk_fp16_to_float(tk_fp16_t h) {
+#if defined(__aarch64__) && (defined(__clang__) || defined(__GNUC__))
+    /* Single FCVT (ARMv8 base ISA): branchless, IEEE-exact incl. subnormals.
+     * The software path below is ~10 insts + 2 branches per element, which
+     * throttles the fp16 GEMV far below memory bandwidth. */
+    __fp16 x; memcpy(&x, &h, 2); return (float)x;
+#elif defined(__F16C__)
+    return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(h)));  /* vcvtph2ps */
+#else
     const uint32_t s = (uint32_t)(h & 0x8000u) << 16;
     const uint32_t e = (h >> 10) & 0x1Fu;
     const uint32_t m = h & 0x3FFu;
@@ -42,6 +54,7 @@ static inline float tk_fp16_to_float(tk_fp16_t h) {
     if (e == 0x1Fu)                                /* inf / nan */
         return tk__u2f(s | 0x7F800000u | (m << 13));
     return tk__u2f(s | ((e + 112u) << 23) | (m << 13));   /* bias 15 -> 127 */
+#endif
 }
 
 static inline float tk_t32_to_float(tk_t32_t v) {
