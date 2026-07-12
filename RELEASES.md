@@ -6,6 +6,43 @@ dense layer (4.2M params) unless noted, and are indicative, not absolute.
 
 ---
 
+## v0.1.10 — 2026-07-12  (tag `v0.1.10`)
+
+NEON kernel overhaul, driven by a 20-lens optimization review (every idea
+adversarially verified, then benchmarked before merging — several died on the
+bench; see DESIGN.md's rejected list). Serial numbers below are medians of
+interleaved before/after runs on an M4 (DVFS makes single runs lie).
+
+**Optimized**
+- **fp16 read path uses hardware conversion**: a single `FCVT` on arm64 (base
+  ISA), `_mm_cvtph_ps` on x86 F16C builds; software converter stays as the
+  portable fallback. Verified bit-exact against the old converter for all
+  65536 bit patterns (sNaN payload quieting excepted). The fp16 GEMV was
+  conversion-bound at ~3 GFLOP/s — with the new NEON `FCVTL` kernel below it
+  now runs at bfloat16 speed.
+- **NEON GEMV kernels rebuilt at depth-8** (two accumulator chains per row —
+  one chain is FMA-latency bound), and **fp16 gets an explicit NEON kernel**
+  for the first time. Serial 2048×2048: float32 31 → 39 GFLOP/s (+25%),
+  bfloat16 34 → 53 (+55%), fp16 3 → ~54 (**~18×**).
+- **BFMLALB/T kernel for bfloat16 on FEAT_BF16 CPUs** (Apple M2+, Graviton3+),
+  runtime-dispatched like the AVX2 path: serial ~65 GFLOP/s (**1.9×** total),
+  ~140 GFLOP/s at 10 threads (was ~93). Note for the record: the naive
+  single-chain BFMLAL form measured *no* gain — the win only appears with
+  split even/odd accumulator chains.
+- `tk_train_step_f32` skips the weight-update pass for dead rows (`dz == 0`,
+  e.g. inactive relu units): +3–6% on the mixed benchmark, up to the full
+  update traffic on sparse-activation layers, and a `0*inf=NaN` edge case gone.
+- Worker thread stacks capped at 512 KiB (glibc default is RLIMIT_STACK,
+  commonly 8 MiB *per worker* — 63 workers held ~500 MB of address space).
+  Workers only run shallow row kernels; macOS behavior unchanged.
+
+**Verified**
+- All 7 dtypes + gradient check pass; fp16 converter swept exhaustively;
+  kernel outputs match scalar reference within reduction-order tolerance
+  (tests from v0.1.9 pin this envelope).
+
+---
+
 ## v0.1.9 — 2026-07-12  (tag `v0.1.9`)
 
 The float32 API — the entry point every non-C binding calls — was serial and

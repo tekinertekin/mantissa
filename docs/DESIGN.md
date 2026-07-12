@@ -106,9 +106,14 @@ why the conversion hot path matters as much as the byte count.
 - **float32 → narrow (cold)**: runs once, when weights are quantized/loaded, so
   `dtypes.c` favors clear, correct code (`frexpf`/`lroundf`).
 
-A production hot path would replace the scalar reads with hardware conversion —
-`_mm256_cvtph_ps` (F16C) for fp16, AVX512-BF16 for bfloat16. The split keeps
-that door open without complicating the cold path.
+For fp16 that door is now walked through: the hot read uses **hardware
+conversion** — a single `FCVT` on arm64 (base ISA, via `__fp16`; verified
+bit-exact against the software converter across all 65536 patterns, sNaN
+payloads excepted) and `_mm_cvtph_ps` on x86 builds compiled with F16C. The
+software converter remains the portable fallback. This took the fp16 GEMV from
+~3 GFLOP/s (conversion-bound: ~10 instructions + 2 branches per element) to
+parity with bfloat16 — the tekin8 lesson above, closed for fp16. AVX512-BF16
+remains future work for the x86 bf16 path.
 
 ### The dot-product loop
 
@@ -125,14 +130,25 @@ loaded and converted once and feeds four independent FMA chains, so the FP units
 stay busy and the shared input is reused instead of reloaded per row — a
 single-row loop can do neither. This is ~1.3× across all dtypes.
 
-**Explicit NEON.** On arm64, `tk__dot4` uses hand-written NEON kernels
-(`vfmaq_f32` into four `float32x4_t` accumulators, `vaddvq_f32` to reduce), with
-the portable blocked loop as the fallback on every other target/dtype:
-- **float32** loads with `vld1q_f32` — ~1.9× (7.97 → ~15 GFLOP/s).
+**Explicit NEON.** On arm64, `tk__dot4` uses hand-written NEON kernels with
+**two accumulator chains per row** (depth-8): a single 4-wide chain per row is
+bound by FMA *latency*, not throughput, and splitting it measured ~1.55× on its
+own (M4, interleaved runs). The portable blocked loop stays as the fallback on
+every other target/dtype:
+- **float32** loads with `vld1q_f32` — serial 31 → 39 GFLOP/s (+25%,
+  bandwidth-bound at 4 B/element).
 - **bfloat16** loads 4 values with `vld1_u16` and widens them in-register with
   `vshll_n_u16(v, 16)` (bf16 *is* the top 16 bits of a float32, so the shift is
-  the conversion), then reinterprets to `float32x4_t` — ~2.5× (8.57 → ~21).
-  bfloat16 ends up fastest overall: half the bytes of float32 for the same FMAs.
+  the conversion) — serial 34 → 53 GFLOP/s with depth-8.
+- **fp16** loads 4 values and widens with a single `FCVTL`
+  (`vcvt_f32_f16`, base A64) — with the hardware scalar read above, serial
+  ~3 → ~54 GFLOP/s overall (~18×).
+- **bfloat16 on FEAT_BF16 CPUs** (ARMv8.6: Apple M2+, Graviton3+) additionally
+  dispatches to a `BFMLALB`/`BFMLALT` kernel — exact f32 FMAs of exact bf16
+  products, two instructions per row per 8 elements — for serial ~65 GFLOP/s
+  (1.9× total over the old depth-4 kernel; ~140 GFLOP/s at 10 threads). Runtime
+  detection mirrors the AVX2 pattern: compiled via a per-function target
+  attribute, called only when `sysctl`/`hwcap` reports the feature.
 
 On **x86-64** the same kernels exist as **AVX2 + FMA** (`_mm256_fmadd_ps` into
 four `__m256` accumulators; bfloat16 widened with `_mm256_cvtepu16_epi32` +
@@ -217,6 +233,14 @@ disagreed with the theory. Recorded here so they are not re-attempted.
   store-bandwidth bound (it writes `dW`, 4×params bytes), so hand-vectorizing the
   arithmetic wins nothing and the extra shuffle/reduce instructions cost. Kept the
   scalar loop the compiler already vectorizes.
+- **Depth-16 (four accumulator chains per row)** in the NEON GEMV — no gain
+  over depth-8 (56.5 vs 56.3 GFLOP/s): two chains already cover the FMA
+  latency-throughput product; more only burns registers.
+- **Single-chain BFMLALB/T** (the naive form: both instructions accumulating
+  into one register) — no gain over widen+FMA (~37 vs ~35 GFLOP/s): the two
+  BFMLALs form one serial dependency chain, so it is latency-bound exactly like
+  a depth-4 loop. The instruction only pays with split even/odd accumulator
+  chains (see the kernel section above).
 - **Sharing one range function between the f32 serial and pooled paths** (the
   clean refactor, and exactly how the narrow path is structured) — **~40%
   slower serial** (bf16 3.5 → 2.5 GFLOP/s). Passing the serial branch's
