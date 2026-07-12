@@ -148,12 +148,19 @@ instruction, so it stays on the portable path on both architectures.
 a fixed set of workers created once (lazily) and woken per call via a
 condition-variable barrier — never `pthread_create` per call, which would be
 fatal for a function invoked millions of times. Each thread owns a contiguous
-row range and writes its own slice of `y`, so there is no locking and the result
-is **bitwise identical to the serial path** (each dot product is still computed
-start-to-finish by one thread — no cross-thread reduction reordering). Small
-layers run serially below a work threshold so the pool never adds overhead to
-the common small-call case; `MANTISSA_THREADS` overrides the worker count, and
-platforms without pthreads compile a serial stub.
+row range and writes its own slice of `y`, so there is no locking and every dot
+product is still computed start-to-finish by one thread — no cross-thread
+reduction ever happens. One honest caveat on reproducibility: each chunk runs
+rows through the 4-row SIMD kernel and finishes its `<4` leftover rows with the
+scalar kernel, whose reduction orders differ by ~1–2 ULP. Chunk boundaries move
+with the thread count, so a row near a boundary can switch kernels between
+`MANTISSA_THREADS` settings — results are **bitwise reproducible for a fixed
+thread count**, but only ULP-stable across different ones (a determinism test
+in `tests/test_dtypes.c` pins this envelope). Pin `MANTISSA_THREADS` when exact
+run-to-run bit-reproducibility matters. Small layers run serially below a work
+threshold so the pool never adds overhead to the common small-call case;
+`MANTISSA_THREADS` overrides the worker count, and platforms without pthreads
+compile a serial stub.
 
 The **backward pass** parallelizes the same way, with one wrinkle: `dW` and `db`
 are per-row (disjoint, bitwise-identical to serial), but `dx = Σ_o Wᵀ·dz` is a

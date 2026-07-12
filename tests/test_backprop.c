@@ -98,6 +98,113 @@ int main(void) {
     if (!ok) failures++;
     printf("  [%s] SGD reduced loss %.4f -> %.4f\n", ok ? "OK" : "!!", L0, L1);
 
+    /* Empty batch/layer must yield 0, not 0/0 = NaN (guards in tk_loss and
+     * tk_train_step_f32). */
+    {
+        float y1[1] = { 0.5f }, t1[1] = { 0.5f }, g1[1];
+        float L = tk_loss(y1, t1, g1, 0, TK_LOSS_MSE);
+        ok = (L == 0.0f) && !isnan(L);
+        if (!ok) failures++;
+        printf("  [%s] empty-batch loss == 0 (got %g)\n", ok ? "OK" : "!!", (double)L);
+
+        float Wf[4] = { 0 }, xf[4] = { 0 }, tf[1] = { 0 };
+        float Ls = tk_train_step_f32(Wf, NULL, xf, tf, 0, 4, TK_ACT_IDENTITY, 0.1f);
+        ok = (Ls == 0.0f) && !isnan(Ls);
+        if (!ok) failures++;
+        printf("  [%s] empty-layer train_step == 0 (got %g)\n", ok ? "OK" : "!!", (double)Ls);
+    }
+
+    /* BCE: value against the closed form, gradient against central differences,
+     * and the eps-clamped extremes staying finite. */
+    {
+        enum { N = 3 };
+        float y[N]  = { 0.3f, 0.7f, 0.9f };
+        float t[N]  = { 0.0f, 1.0f, 1.0f };
+        float dy[N];
+        float L    = tk_loss(y, t, dy, N, TK_LOSS_BCE);
+        float want = -(logf(1.0f - 0.3f) + logf(0.7f) + logf(0.9f)) / 3.0f;
+        ok = fabsf(L - want) < 1e-5f;
+        if (!ok) failures++;
+        printf("  [%s] BCE loss %.6f (want %.6f)\n", ok ? "OK" : "!!", L, want);
+
+        const float hb = 1e-3f;
+        float max_rel = 0.0f, gtmp[N];
+        for (int k = 0; k < N; k++) {
+            float y0 = y[k];
+            y[k] = y0 + hb; float Lp = tk_loss(y, t, gtmp, N, TK_LOSS_BCE);
+            y[k] = y0 - hb; float Lm = tk_loss(y, t, gtmp, N, TK_LOSS_BCE);
+            y[k] = y0;
+            float num = (Lp - Lm) / (2.0f * hb);
+            float rel = fabsf(num - dy[k]) / (fabsf(dy[k]) + 1e-6f);
+            if (rel > max_rel) max_rel = rel;
+        }
+        ok = max_rel < 1e-2f;
+        if (!ok) failures++;
+        printf("  [%s] BCE gradcheck max rel error %.2e\n", ok ? "OK" : "!!", max_rel);
+
+        float ye[2] = { 0.0f, 1.0f }, te[2] = { 1.0f, 0.0f }, ge[2];
+        float Le = tk_loss(ye, te, ge, 2, TK_LOSS_BCE);
+        ok = isfinite(Le) && isfinite(ge[0]) && isfinite(ge[1]);
+        if (!ok) failures++;
+        printf("  [%s] BCE extremes stay finite (loss %.3f)\n", ok ? "OK" : "!!", Le);
+    }
+
+    /* Dropout: rate 0 = identity, rate 1 = all-zero without NaN, backward
+     * mirrors the forward mask, and a seed fully determines the mask. */
+    {
+        enum { N = 64 };
+        float y[N], y2[N], dy[N]; uint8_t m[N], m2[N];
+        tk_rng r = tk_rng_seed(11);
+        for (int i = 0; i < N; i++) y[i] = 1.0f + 0.01f * (float)i;
+        tk_dropout_forward(y, m, N, 0.0f, &r);
+        ok = 1;
+        for (int i = 0; i < N; i++) ok &= (m[i] == 1) && (y[i] == 1.0f + 0.01f * (float)i);
+        if (!ok) failures++;
+        printf("  [%s] dropout rate=0 is the identity\n", ok ? "OK" : "!!");
+
+        for (int i = 0; i < N; i++) y[i] = 1.0f;
+        tk_dropout_forward(y, m, N, 1.0f, &r);
+        ok = 1;
+        for (int i = 0; i < N; i++) ok &= (y[i] == 0.0f) && !isnan(y[i]);
+        if (!ok) failures++;
+        printf("  [%s] dropout rate=1 zeroes without NaN\n", ok ? "OK" : "!!");
+
+        int kept = 0;
+        r = tk_rng_seed(42);
+        for (int i = 0; i < N; i++) { y[i] = 1.0f; dy[i] = 1.0f; }
+        tk_dropout_forward(y, m, N, 0.5f, &r);
+        tk_dropout_backward(dy, m, N, 0.5f);
+        ok = 1;
+        for (int i = 0; i < N; i++) {
+            ok &= (y[i] == dy[i]);                          /* fwd/bwd scale identically */
+            ok &= m[i] ? (y[i] == 2.0f) : (y[i] == 0.0f);   /* inverted scaling, 1/(1-rate) */
+            kept += m[i];
+        }
+        ok &= kept > 0 && kept < N;
+        r = tk_rng_seed(42);
+        for (int i = 0; i < N; i++) y2[i] = 1.0f;
+        tk_dropout_forward(y2, m2, N, 0.5f, &r);
+        for (int i = 0; i < N; i++) ok &= (m[i] == m2[i]);  /* seeded determinism */
+        if (!ok) failures++;
+        printf("  [%s] dropout mask/backward consistency (kept %d/%d)\n",
+               ok ? "OK" : "!!", kept, N);
+    }
+
+    /* L1/L2 regularization path of tk_sgd_step (float32 build: write-back is
+     * exact, so the update can be checked against the closed form). */
+    {
+        tk_scalar_t w[2] = { TK_FROM_FLOAT(1.0f), TK_FROM_FLOAT(-1.0f) };
+        float g[2] = { 0.1f, 0.0f };
+        tk_optim opt = { 0.5f, 0.001f, 0.01f, 0 };
+        tk_sgd_step(w, g, 2, &opt, NULL);
+        /* w0: g' = 0.1 + 0.01*1  + 0.001*(+1) = 0.111  -> 1 - 0.5*0.111  =  0.9445
+         * w1: g' = 0   + 0.01*-1 + 0.001*(-1) = -0.011 -> -1 + 0.5*0.011 = -0.9945 */
+        ok = fabsf(TK_TO_FLOAT(w[0]) - 0.9445f) < 1e-6f &&
+             fabsf(TK_TO_FLOAT(w[1]) + 0.9945f) < 1e-6f;
+        if (!ok) failures++;
+        printf("  [%s] SGD L1+L2 update matches the closed form\n", ok ? "OK" : "!!");
+    }
+
     printf("\n%s\n", failures ? "FAILED" : "ALL PASSED");
     return failures ? 1 : 0;
 }
