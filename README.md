@@ -309,6 +309,35 @@ the safe general-purpose default. Override only when you want to:
 make DTYPE=4 test     # switch storage to tekin8
 ```
 
+## Install
+
+```sh
+pip install mantissa-nn        # import name stays `mantissa`
+```
+
+The wheel ships a **prebuilt** `libmantissa` (default bfloat16) — no compiler or
+`make` needed. numpy is optional; install `mantissa-nn[numpy]` for the zero-copy
+training path. Then:
+
+```python
+from mantissa import Mantissa, STEP
+tk = Mantissa()
+print(tk.dtype)                # 'bfloat16'
+```
+
+> The distribution is named **`mantissa-nn`** on PyPI (the bare `mantissa` name
+> is taken by an unrelated project); the Python import name is still `mantissa`.
+
+Installing from an **sdist** (or `pip install .` from a checkout) compiles the C
+core on your machine, so a C toolchain (`cc`, `make`-grade compiler) is required
+for that path — wheel users need nothing. Override the storage dtype at build
+time with `MANTISSA_DTYPE=<id>` (same ids as `DTYPE`; default 2 = bfloat16):
+
+```sh
+pip install .                       # from a source checkout
+MANTISSA_DTYPE=4 pip install .      # build the tekin8 (FP8) library instead
+```
+
 ## Download
 
 Prebuilt shared libraries are attached to every [release](https://github.com/tekinertekin/mantissa/releases) —
@@ -328,7 +357,7 @@ lib.tk_dtype_name.restype = ctypes.c_char_p
 print(lib.tk_dtype_name().decode())                  # -> e.g. "bfloat16"
 ```
 
-Or use the ctypes wrapper in [`python/mantissa.py`](python/mantissa.py) (point
+Or use the ctypes wrapper in [`python/mantissa/`](python/mantissa) (point
 it at the downloaded file) — pass float32 `numpy` arrays (or `array('f')`) for
 a zero-copy, in-place training path, ~200× faster per step than plain lists
 (numpy optional). Runnable **forward + back-prop** examples for

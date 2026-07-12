@@ -1,0 +1,14 @@
+# sdist must ship the C sources so `pip install` from an sdist can compile the
+# library on the user's machine (a C toolchain is then required).
+include LICENSE
+include README.md
+include Makefile
+recursive-include src *.c
+recursive-include include *.h
+recursive-include docs *.md
+recursive-include python *.py
+
+# Keep build artifacts out of the sdist.
+prune build
+prune dist
+global-exclude *.so *.dylib *.dll *.o

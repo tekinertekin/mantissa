@@ -18,6 +18,8 @@ try:                                   # optional: enables a zero-copy fast path
 except ImportError:                    # binding works without it (plain lists)
     _np = None
 
+__all__ = ["Mantissa", "IDENTITY", "STEP", "SIGN", "RELU", "SIGMOID", "TANH", "GELU"]
+
 # Activation ids must match include/activations.h.
 IDENTITY, STEP, SIGN, RELU, SIGMOID, TANH, GELU = range(7)
 
@@ -44,13 +46,18 @@ def _as_c_float(seq, n: int):
 
 def _library_path() -> str:
     ext = {"darwin": "dylib", "win32": "dll"}.get(sys.platform, "so")
-    root = Path(__file__).resolve().parent.parent
-    # Prefer the committed prebuilt library; fall back to a local `make dist`.
-    for lib in (root / "dist" / f"libmantissa.{ext}", root / "build" / f"libmantissa.{ext}"):
+    here = Path(__file__).resolve().parent           # python/mantissa (or the installed package)
+    root = here.parent.parent                        # repo root in a source checkout
+    # Prefer the library bundled inside the installed package (wheel), then fall
+    # back to a source-tree `make dist` / `make lib`.
+    for lib in (here / f"libmantissa.{ext}",
+                root / "dist" / f"libmantissa.{ext}",
+                root / "build" / f"libmantissa.{ext}"):
         if lib.exists():
             return str(lib)
     raise FileNotFoundError(
-        f"libmantissa.{ext} not found in dist/ or build/. Build it:  make dist"
+        f"libmantissa.{ext} not found (bundled, dist/, or build/). "
+        f"Build it:  make dist   (or reinstall the wheel)"
     )
 
 

@@ -6,6 +6,12 @@ dist/
 *.dll
 __pycache__/
 *.pyc
+# python packaging artifacts
+*.egg-info/
+.eggs/
+wheelhouse/
+*.whl
+*.tar.gz
 # language client build artifacts
 node_modules/
 package-lock.json
