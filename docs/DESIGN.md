@@ -272,6 +272,38 @@ Measured (M4, VGG 64x32x32 → 64@3x3 batch 16, interleaved medians): forward
 (148 → 320 GFLOP/s) — with the portable C micro-kernel alone, before the
 explicit NEON kernel.
 
+**The micro-kernel (arm64 NEON, x86-64 AVX2).** The portable tile loop was
+then replaced with a BLIS-style outer-product register kernel: on arm64 a
+**6x16 f32 tile** — 24 accumulator registers, 4 B loads + 1.5 A loads per k
+step feeding 24 *independent* FMAs. Unlike the dot-product kernels there is
+no per-accumulator latency chain to split: each accumulator sees one FMA per
+k step, so tile width covers the FMA latency-throughput product structurally
+(the ops.c dual-chain argument, resolved by shape). On x86-64 the same
+kernel is a **6x16 AVX2 tile** (12 YMM accumulators, 2 B loads + 6 A
+broadcasts per k), compiled via the per-function target attribute and
+runtime-dispatched exactly like the ops.c kernels, portable C fallback
+otherwise.
+
+Two flanking costs turned out to matter as much as the kernel:
+
+- **The tile store de-vectorized.** The first store looped elements with a
+  per-element `if (Z)` and `tk_act_scalar` switch — ~6 ms of a 16 ms forward
+  (the activation-dispatch lesson again, in a two-destination loop).
+  Hoisting both out of the element loops (branchless relu/identity bodies,
+  scalar switch only for the exotic activations) shrank the store to ~1.5%
+  of the pass.
+- **Packing B was per-element bounds-checked** (~5.5 ms). Rewritten
+  run-based: a micro-panel's columns split into runs sharing (sample, output
+  row), so at stride 1 each (c, ky, kx) is one clipped contiguous copy from
+  an X row instead of 16 predicated gathers. Pack is now ~25% of the pass;
+  profiling (`sample`) puts the kernel itself at ~86% of the core's ~144
+  GFLOP/s f32 peak in situ.
+
+Net stage 2 (same shape): forward 17.9 → 12.3 ms single-thread (67 → 98
+GFLOP/s), 3.8 → 3.0 ms at 10 threads (320 → 401 GFLOP/s). The 3-channel VGG
+stem (kdim = 27) gains more: 2.28 → 0.73 ms serial, 0.58 → 0.22 ms at 10T —
+short-kdim GEMMs live and die by pack/store overhead.
+
 ### Activation dispatch: switch beats a function pointer
 
 Intuition says an indirect `function pointer` avoids the cost of a `switch`.
@@ -418,6 +450,18 @@ disagreed with the theory. Recorded here so they are not re-attempted.
   sub-5% gain on a path the resident-narrow route already replaces. (The Python
   binding exposes that route as `Mantissa.prepare()` / `Prepared`.)
 
+- **8x12 conv micro-kernel tile** (vs the shipped 6x16; both 24 NEON
+  accumulators) — the *order of optimizations changed the winner*, so both
+  measurements are recorded. Against the per-element pack, 8x12 won (16.5 vs
+  18.2 ms, VGG64 block 1T): its 3-vector B row is cheaper to feed from a
+  12-wide pack. After the run-based pack rewrite, 6x16 wins (12.0–12.6 vs
+  13.2–13.6 ms 1T; 2.8–3.5 vs 3.3–3.9 ms 10T, interleaved pairs): NR=16
+  makes fewer micro-panels (less pack bookkeeping), divides the common ow=32
+  so pack runs stay whole, and streams less A per FLOP. 8x12 stays buildable
+  under `TK_CONV_TILE_8X12` for re-measurement.
+- **k-unrolling the conv micro-kernel x2** — no change (16.42 vs 16.46 ms,
+  interleaved): 24 independent accumulators already saturate the FMA pipes,
+  so the loop overhead it removes was hidden anyway.
 - **Conv B-panel width NC other than 256** — swept 128/256/512 on the VGG
   64-channel block (M4, interleaved, two rounds). NC=512 is ~2% faster
   single-thread (17.4 vs 17.7/17.9 ms) but 10–15% *slower* at 10 threads

@@ -197,8 +197,19 @@ static void conv_fwd_direct(const float *restrict X, const float *restrict K,
  * kernel, so the forward is bit-identical across thread counts. */
 
 #if defined(__aarch64__)
+  /* 6x16 f32 tile: 24 accumulator registers + 1 A + 4 B of the 32 NEON
+   * registers. An 8x12 tile (same 24 accumulators) measured ~8% slower once
+   * packing became run-based: NR=16 needs fewer micro-panels (less pack
+   * bookkeeping, and 16 | 32 = the common ow, so runs stay whole) and
+   * streams less A per FLOP. See DESIGN.md, rejected list;
+   * TK_CONV_TILE_8X12 keeps the loser buildable for re-measurement. */
+  #if defined(TK_CONV_TILE_8X12)
 enum { TK_CONV_MR = 8, TK_CONV_NR = 12 };
+  #else
+enum { TK_CONV_MR = 6, TK_CONV_NR = 16 };
+  #endif
 #elif defined(__x86_64__)
+/* 6x16: 12 YMM accumulators + 2 B + 1 A broadcast of the 16 YMM registers. */
 enum { TK_CONV_MR = 6, TK_CONV_NR = 16 };
 #else
 enum { TK_CONV_MR = 4, TK_CONV_NR = 4 };
@@ -251,47 +262,80 @@ static void convg_pack_A(const float *restrict K, float *restrict Ap,
     }
 }
 
+/* Pack `run` consecutive-ox columns (one sample, one output row) into a
+ * micro-panel at column offset `dst`: dst[k*NR + t], k walks (c, ky, kx),
+ * out-of-image taps zero-filled. At stride 1 the t loop is a contiguous
+ * clipped copy from one X row -- the packing cost is a straight stream, not
+ * a per-element bounds check (measured 1.5x on the whole forward). */
+static void convg_pack_run(const float *restrict xs, float *restrict dst,
+                           int run, int oy, int ox, const tk_conv_geom *g) {
+    const int NR = TK_CONV_NR;
+    const int iy0 = oy * g->stride - g->pad, ixb = ox * g->stride - g->pad;
+    float *restrict d = dst;
+    for (int c = 0; c < g->in_c; c++) {
+        const float *restrict plane = xs + (size_t)c * g->in_h * g->in_w;
+        for (int ky = 0; ky < g->kh; ky++) {
+            const int iy = iy0 + ky;
+            if (iy < 0 || iy >= g->in_h) {
+                for (int kx = 0; kx < g->kw; kx++, d += NR)
+                    for (int t = 0; t < run; t++) d[t] = 0.0f;
+                continue;
+            }
+            const float *restrict row = plane + (size_t)iy * g->in_w;
+            if (g->stride == 1) {
+                for (int kx = 0; kx < g->kw; kx++, d += NR) {
+                    const int lo = ixb + kx;         /* src ix for t = 0 */
+                    int a = lo < 0 ? -lo : 0;        /* first in-image t */
+                    int b = (lo + run > g->in_w) ? g->in_w - lo : run;
+                    if (b < a) b = a;
+                    for (int t = 0; t < a; t++)   d[t] = 0.0f;
+                    for (int t = a; t < b; t++)   d[t] = row[lo + t];
+                    for (int t = b; t < run; t++) d[t] = 0.0f;
+                }
+            } else {
+                for (int kx = 0; kx < g->kw; kx++, d += NR)
+                    for (int t = 0; t < run; t++) {
+                        const int ix = ixb + t * g->stride + kx;
+                        d[t] = (ix >= 0 && ix < g->in_w) ? row[ix] : 0.0f;
+                    }
+            }
+        }
+    }
+}
+
 /* Pack im2col columns [j0, j0+nc) into NR-column micro-panels:
  * Bp[panel][k][NR]. Column j is output pixel (sample j/npatch, patch
- * j%npatch); k walks (c, ky, kx), out-of-image taps zero-filled. k-outer /
- * column-inner keeps the X reads contiguous at stride 1 (adjacent columns
- * are adjacent ix). Columns past nc are zero-filled. */
+ * j%npatch); each micro-panel's columns are split into runs sharing
+ * (sample, output row) so convg_pack_run can stream them. Columns past nc
+ * are zero-filled (the kernel always runs full NR). */
 static void convg_pack_B(const float *restrict X, float *restrict Bp,
                          const tk_conv_geom *g, long j0, int nc) {
     const int NR = TK_CONV_NR;
-    const float *xb[TK_CONV_NR];
-    int iy0[TK_CONV_NR], ix0[TK_CONV_NR];
     for (int jj = 0; jj < nc; jj += NR) {
         const int jn = (nc - jj < NR) ? nc - jj : NR;
-        for (int t = 0; t < NR; t++) {
-            if (t < jn) {
-                const long j = j0 + jj + t;
-                const int s = (int)(j / g->npatch), p = (int)(j % g->npatch);
-                xb[t] = X + (size_t)s * g->in_sz;
-                iy0[t] = (p / g->ow) * g->stride - g->pad;
-                ix0[t] = (p % g->ow) * g->stride - g->pad;
-            } else { xb[t] = NULL; iy0[t] = 0; ix0[t] = 0; }
-        }
         float *restrict dst = Bp + (size_t)(jj / NR) * g->kdim * NR;
-        for (int c = 0; c < g->in_c; c++) {
-            const size_t coff = (size_t)c * g->in_h * g->in_w;
-            for (int ky = 0; ky < g->kh; ky++)
-                for (int kx = 0; kx < g->kw; kx++)
-                    for (int t = 0; t < NR; t++) {
-                        const int iy = iy0[t] + ky, ix = ix0[t] + kx;
-                        *dst++ = (xb[t] && iy >= 0 && iy < g->in_h
-                                        && ix >= 0 && ix < g->in_w)
-                            ? xb[t][coff + (size_t)iy * g->in_w + ix] : 0.0f;
-                    }
+        if (jn < NR)                                  /* pad columns to NR */
+            memset(dst, 0, (size_t)g->kdim * NR * sizeof(float));
+        int t = 0;
+        while (t < jn) {
+            const long j = j0 + jj + t;
+            const int s = (int)(j / g->npatch), p = (int)(j % g->npatch);
+            const int oy = p / g->ow, ox = p % g->ow;
+            int run = g->ow - ox;                     /* to end of output row */
+            if (run > jn - t) run = jn - t;
+            convg_pack_run(X + (size_t)s * g->in_sz, dst + t, run, oy, ox, g);
+            t += run;
         }
     }
 }
 
 /* MR x NR micro-kernel over packed panels: Ct[MR][NR] = sum_k A[k][:] outer
  * B[k][:]. Portable C form; each accumulator is one register, fully
- * unrolled by the compiler (the local array never escapes). */
-static void convg_kern(int kc, const float *restrict A,
-                       const float *restrict B, float *restrict Ct) {
+ * unrolled by the compiler (the local array never escapes). Fallback for
+ * targets without an explicit kernel below. */
+#if !defined(__aarch64__)
+static void convg_kern_c(int kc, const float *restrict A,
+                         const float *restrict B, float *restrict Ct) {
     float acc[TK_CONV_MR * TK_CONV_NR] = { 0 };
     for (int k = 0; k < kc; k++) {
         const float *restrict a = A + (size_t)k * TK_CONV_MR;
@@ -302,10 +346,179 @@ static void convg_kern(int kc, const float *restrict A,
     }
     memcpy(Ct, acc, sizeof acc);
 }
+#endif /* !__aarch64__ */
+
+#if defined(__aarch64__) && defined(TK_CONV_TILE_8X12)
+/* NEON 8x12 outer-product kernel. Per k step: 2 A loads + 3 B loads feed 24
+ * independent FMAs (one per accumulator), so unlike the dot-product kernels
+ * there is no per-accumulator latency chain to split -- each accumulator
+ * sees one FMA every ~6 cycles against ~4-cycle FMA latency (the same
+ * latency-vs-throughput argument as ops.c's dual chains, satisfied here by
+ * tile width instead). vfmaq_laneq broadcasts A lanes for free. */
+static void convg_kern_neon(int kc, const float *restrict A,
+                            const float *restrict B, float *restrict Ct) {
+    float32x4_t c00 = vdupq_n_f32(0), c01 = c00, c02 = c00;
+    float32x4_t c10 = c00, c11 = c00, c12 = c00;
+    float32x4_t c20 = c00, c21 = c00, c22 = c00;
+    float32x4_t c30 = c00, c31 = c00, c32 = c00;
+    float32x4_t c40 = c00, c41 = c00, c42 = c00;
+    float32x4_t c50 = c00, c51 = c00, c52 = c00;
+    float32x4_t c60 = c00, c61 = c00, c62 = c00;
+    float32x4_t c70 = c00, c71 = c00, c72 = c00;
+    /* k unrolled x2: halves the loop overhead per 24-FMA block and lets the
+     * scheduler overlap the next step's loads with this step's FMAs. Each
+     * accumulator still sees strictly sequential k order (same numerics). */
+#define TK__CONV_STEP(o)                                                      \
+    do {                                                                      \
+        const float32x4_t b0 = vld1q_f32(B + 12 * (o)),                       \
+                          b1 = vld1q_f32(B + 12 * (o) + 4),                   \
+                          b2 = vld1q_f32(B + 12 * (o) + 8);                   \
+        const float32x4_t a0 = vld1q_f32(A + 8 * (o)),                        \
+                          a1 = vld1q_f32(A + 8 * (o) + 4);                    \
+        c00 = vfmaq_laneq_f32(c00, b0, a0, 0);                                \
+        c01 = vfmaq_laneq_f32(c01, b1, a0, 0);                                \
+        c02 = vfmaq_laneq_f32(c02, b2, a0, 0);                                \
+        c10 = vfmaq_laneq_f32(c10, b0, a0, 1);                                \
+        c11 = vfmaq_laneq_f32(c11, b1, a0, 1);                                \
+        c12 = vfmaq_laneq_f32(c12, b2, a0, 1);                                \
+        c20 = vfmaq_laneq_f32(c20, b0, a0, 2);                                \
+        c21 = vfmaq_laneq_f32(c21, b1, a0, 2);                                \
+        c22 = vfmaq_laneq_f32(c22, b2, a0, 2);                                \
+        c30 = vfmaq_laneq_f32(c30, b0, a0, 3);                                \
+        c31 = vfmaq_laneq_f32(c31, b1, a0, 3);                                \
+        c32 = vfmaq_laneq_f32(c32, b2, a0, 3);                                \
+        c40 = vfmaq_laneq_f32(c40, b0, a1, 0);                                \
+        c41 = vfmaq_laneq_f32(c41, b1, a1, 0);                                \
+        c42 = vfmaq_laneq_f32(c42, b2, a1, 0);                                \
+        c50 = vfmaq_laneq_f32(c50, b0, a1, 1);                                \
+        c51 = vfmaq_laneq_f32(c51, b1, a1, 1);                                \
+        c52 = vfmaq_laneq_f32(c52, b2, a1, 1);                                \
+        c60 = vfmaq_laneq_f32(c60, b0, a1, 2);                                \
+        c61 = vfmaq_laneq_f32(c61, b1, a1, 2);                                \
+        c62 = vfmaq_laneq_f32(c62, b2, a1, 2);                                \
+        c70 = vfmaq_laneq_f32(c70, b0, a1, 3);                                \
+        c71 = vfmaq_laneq_f32(c71, b1, a1, 3);                                \
+        c72 = vfmaq_laneq_f32(c72, b2, a1, 3);                                \
+    } while (0)
+    int k = 0;
+    for (; k + 2 <= kc; k += 2) {
+        TK__CONV_STEP(0);
+        TK__CONV_STEP(1);
+        A += 16; B += 24;
+    }
+    if (k < kc) TK__CONV_STEP(0);
+#undef TK__CONV_STEP
+    vst1q_f32(Ct,      c00); vst1q_f32(Ct +  4, c01); vst1q_f32(Ct +  8, c02);
+    vst1q_f32(Ct + 12, c10); vst1q_f32(Ct + 16, c11); vst1q_f32(Ct + 20, c12);
+    vst1q_f32(Ct + 24, c20); vst1q_f32(Ct + 28, c21); vst1q_f32(Ct + 32, c22);
+    vst1q_f32(Ct + 36, c30); vst1q_f32(Ct + 40, c31); vst1q_f32(Ct + 44, c32);
+    vst1q_f32(Ct + 48, c40); vst1q_f32(Ct + 52, c41); vst1q_f32(Ct + 56, c42);
+    vst1q_f32(Ct + 60, c50); vst1q_f32(Ct + 64, c51); vst1q_f32(Ct + 68, c52);
+    vst1q_f32(Ct + 72, c60); vst1q_f32(Ct + 76, c61); vst1q_f32(Ct + 80, c62);
+    vst1q_f32(Ct + 84, c70); vst1q_f32(Ct + 88, c71); vst1q_f32(Ct + 92, c72);
+}
+
+#elif defined(__aarch64__)
+/* NEON 6x16 kernel (the default tile): 24 accumulators, 4 B loads + 1.5 A
+ * loads per k step feed 24 independent FMAs -- one FMA per accumulator per
+ * k step against ~4-cycle FMA latency, covered by tile width (the ops.c
+ * dual-chain argument, satisfied structurally). */
+static void convg_kern_neon(int kc, const float *restrict A,
+                            const float *restrict B, float *restrict Ct) {
+    float32x4_t c0[4], c1[4], c2[4], c3[4], c4[4], c5[4];
+    for (int j = 0; j < 4; j++)
+        c0[j] = c1[j] = c2[j] = c3[j] = c4[j] = c5[j] = vdupq_n_f32(0);
+    for (int k = 0; k < kc; k++) {
+        const float32x4_t a0 = vld1q_f32(A);       /* rows 0-3 */
+        const float32x2_t a1 = vld1_f32(A + 4);    /* rows 4-5 */
+        for (int j = 0; j < 4; j++) {
+            const float32x4_t b = vld1q_f32(B + 4 * j);
+            c0[j] = vfmaq_laneq_f32(c0[j], b, a0, 0);
+            c1[j] = vfmaq_laneq_f32(c1[j], b, a0, 1);
+            c2[j] = vfmaq_laneq_f32(c2[j], b, a0, 2);
+            c3[j] = vfmaq_laneq_f32(c3[j], b, a0, 3);
+            c4[j] = vfmaq_lane_f32(c4[j], b, a1, 0);
+            c5[j] = vfmaq_lane_f32(c5[j], b, a1, 1);
+        }
+        A += 6; B += 16;
+    }
+    for (int j = 0; j < 4; j++) {
+        vst1q_f32(Ct +      4 * j, c0[j]); vst1q_f32(Ct + 16 + 4 * j, c1[j]);
+        vst1q_f32(Ct + 32 + 4 * j, c2[j]); vst1q_f32(Ct + 48 + 4 * j, c3[j]);
+        vst1q_f32(Ct + 64 + 4 * j, c4[j]); vst1q_f32(Ct + 80 + 4 * j, c5[j]);
+    }
+}
+
+#elif defined(__x86_64__)
+#include <immintrin.h>
+#define TK_CONV_HAVE_AVX2 1
+
+/* Same cached runtime check as ops.c (private there; conv must not touch
+ * ops.c): compile the AVX2 kernel unconditionally via the target attribute,
+ * call it only when the CPU reports AVX2+FMA. */
+static int tk__conv_cpu_avx2(void) {
+    static int cached = -1;
+    if (cached < 0) cached = (__builtin_cpu_supports("avx2")
+                              && __builtin_cpu_supports("fma"));
+    return cached;
+}
+
+/* AVX2 6x16 outer-product kernel: 12 YMM accumulators, 2 B loads + 6 A
+ * broadcasts per k step feed 12 independent FMAs across ports 0/1 -- tile
+ * width covers the FMA latency-throughput product exactly as the NEON
+ * kernel does (and as ops.c's 8-chain dot kernel argues). */
+__attribute__((target("avx2,fma")))
+static void convg_kern_avx2(int kc, const float *restrict A,
+                            const float *restrict B, float *restrict Ct) {
+    __m256 c00 = _mm256_setzero_ps(), c01 = c00, c10 = c00, c11 = c00,
+           c20 = c00, c21 = c00, c30 = c00, c31 = c00,
+           c40 = c00, c41 = c00, c50 = c00, c51 = c00;
+    for (int k = 0; k < kc; k++) {
+        const __m256 b0 = _mm256_loadu_ps(B), b1 = _mm256_loadu_ps(B + 8);
+        __m256 a;
+        a = _mm256_broadcast_ss(A + 0);
+        c00 = _mm256_fmadd_ps(a, b0, c00); c01 = _mm256_fmadd_ps(a, b1, c01);
+        a = _mm256_broadcast_ss(A + 1);
+        c10 = _mm256_fmadd_ps(a, b0, c10); c11 = _mm256_fmadd_ps(a, b1, c11);
+        a = _mm256_broadcast_ss(A + 2);
+        c20 = _mm256_fmadd_ps(a, b0, c20); c21 = _mm256_fmadd_ps(a, b1, c21);
+        a = _mm256_broadcast_ss(A + 3);
+        c30 = _mm256_fmadd_ps(a, b0, c30); c31 = _mm256_fmadd_ps(a, b1, c31);
+        a = _mm256_broadcast_ss(A + 4);
+        c40 = _mm256_fmadd_ps(a, b0, c40); c41 = _mm256_fmadd_ps(a, b1, c41);
+        a = _mm256_broadcast_ss(A + 5);
+        c50 = _mm256_fmadd_ps(a, b0, c50); c51 = _mm256_fmadd_ps(a, b1, c51);
+        A += 6; B += 16;
+    }
+    _mm256_storeu_ps(Ct,      c00); _mm256_storeu_ps(Ct +  8, c01);
+    _mm256_storeu_ps(Ct + 16, c10); _mm256_storeu_ps(Ct + 24, c11);
+    _mm256_storeu_ps(Ct + 32, c20); _mm256_storeu_ps(Ct + 40, c21);
+    _mm256_storeu_ps(Ct + 48, c30); _mm256_storeu_ps(Ct + 56, c31);
+    _mm256_storeu_ps(Ct + 64, c40); _mm256_storeu_ps(Ct + 72, c41);
+    _mm256_storeu_ps(Ct + 80, c50); _mm256_storeu_ps(Ct + 88, c51);
+}
+#endif /* arch kernels */
+
+static inline void convg_kern(int kc, const float *restrict A,
+                              const float *restrict B, float *restrict Ct) {
+#if defined(__aarch64__)
+    convg_kern_neon(kc, A, B, Ct);        /* NEON is arm64 baseline */
+#else
+  #if defined(TK_CONV_HAVE_AVX2)
+    if (tk__conv_cpu_avx2()) { convg_kern_avx2(kc, A, B, Ct); return; }
+  #endif
+    convg_kern_c(kc, A, B, Ct);
+#endif
+}
 
 /* Store an m x nf tile of C into Z/Y with bias + activation. Y rows are
  * contiguous per sample (stride npatch between filter rows); a tile whose
- * columns cross a sample boundary is split at the boundary. */
+ * columns cross a sample boundary is split at the boundary. The Z test and
+ * the activation dispatch are hoisted OUT of the element loops: a
+ * per-element switch (or NULL test) de-vectorizes the store, which measured
+ * ~6 ms of a 16 ms forward -- the same lesson as tk_activate's switch
+ * benchmark, applied to a two-destination loop. relu/identity get branchless
+ * vectorizable bodies; other activations take the scalar switch. */
 static void convg_store(const float *restrict Ct, float *Z, float *Y,
                         const float *bias, const tk_conv_geom *g,
                         tk_activation_t act, int oc0, int m,
@@ -320,13 +533,41 @@ static void convg_store(const float *restrict Ct, float *Z, float *Y,
         for (int i = 0; i < m; i++) {
             const float b = bias ? bias[oc0 + i] : 0.0f;
             const float *restrict src = Ct + (size_t)i * TK_CONV_NR + done;
-            float *restrict zr = Z ? Z + base + (size_t)(oc0 + i) * g->npatch
-                                   : NULL;
             float *restrict yr = Y + base + (size_t)(oc0 + i) * g->npatch;
-            for (int t = 0; t < chunk; t++) {
-                const float z = src[t] + b;
-                if (zr) zr[t] = z;
-                yr[t] = tk_act_scalar(z, act);
+            if (Z) {
+                float *restrict zr = Z + base + (size_t)(oc0 + i) * g->npatch;
+                switch (act) {
+                case TK_ACT_RELU:
+                    for (int t = 0; t < chunk; t++) {
+                        const float z = src[t] + b;
+                        zr[t] = z; yr[t] = __builtin_fmaxf(z, 0.0f);
+                    }
+                    break;
+                case TK_ACT_IDENTITY:
+                    for (int t = 0; t < chunk; t++) {
+                        const float z = src[t] + b;
+                        zr[t] = z; yr[t] = z;
+                    }
+                    break;
+                default:
+                    for (int t = 0; t < chunk; t++) {
+                        const float z = src[t] + b;
+                        zr[t] = z; yr[t] = tk_act_scalar(z, act);
+                    }
+                }
+            } else {
+                switch (act) {
+                case TK_ACT_RELU:
+                    for (int t = 0; t < chunk; t++)
+                        yr[t] = __builtin_fmaxf(src[t] + b, 0.0f);
+                    break;
+                case TK_ACT_IDENTITY:
+                    for (int t = 0; t < chunk; t++) yr[t] = src[t] + b;
+                    break;
+                default:
+                    for (int t = 0; t < chunk; t++)
+                        yr[t] = tk_act_scalar(src[t] + b, act);
+                }
             }
         }
         done += chunk;
