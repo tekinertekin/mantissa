@@ -637,6 +637,358 @@ static int conv_fwd_gemm(const float *X, const float *K, const float *bias,
     return 1;
 }
 
+/* --- batched conv GEMM backward --------------------------------------------
+ *
+ * Both gradients are GEMMs over the same packed layouts as the forward:
+ *   dK (out_c x kdim)   = dZ (out_c x N) . im2col^T (N x kdim)
+ *   dcols (kdim x N)    = K^T (kdim x out_c) . dZ (out_c x N),  col2im -> dX
+ * with N = n*oh*ow and dZ = dY * act'(Z) computed once into scratch (the
+ * only full-size intermediate; it is the same size as dY).
+ *
+ * Race-freedom keeps the v0.2.1 design, mapped onto the new axes:
+ *   - dK reduces over N, so N is split into fixed-size column chunks and
+ *     each worker accumulates a private dK partial, reduced after the join
+ *     (the tk_linear_backward pattern). Chunk boundaries depend only on the
+ *     thread count, so dK stays bit-reproducible at fixed MANTISSA_THREADS.
+ *   - dX is split by SAMPLE (each worker owns whole samples): overlapping
+ *     patches of one sample scatter into the same dX pixels, so patch-level
+ *     splitting would race. The per-tile col2im scatter runs right after
+ *     the micro-kernel while the tile is L1-hot; no kdim x N dcols matrix
+ *     is ever materialized.
+ *   - db falls out of the dZ pass with per-worker partials. */
+
+typedef struct {
+    const float *Z, *dY;
+    float *dZ, *dbp;             /* dbp: one zeroed out_c slice per worker */
+    tk_conv_geom g;
+    tk_activation_t act;
+} tk_convb_dz_ctx;
+
+/* dZ = dY * act'(Z) for samples [s0, s1), plus db row sums. The activation
+ * switch is hoisted (same de-vectorization lesson as convg_store). */
+static void convb_dz_worker(void *pv, int s0, int s1, int worker) {
+    const tk_convb_dz_ctx *c = (const tk_convb_dz_ctx *)pv;
+    const tk_conv_geom *g = &c->g;
+    float *dbp = c->dbp ? c->dbp + (size_t)worker * g->out_c : NULL;
+    for (int s = s0; s < s1; s++)
+        for (int oc = 0; oc < g->out_c; oc++) {
+            const size_t r = (size_t)s * g->out_sz + (size_t)oc * g->npatch;
+            const float *restrict zr = c->Z + r, *restrict dyr = c->dY + r;
+            float *restrict dzr = c->dZ + r;
+            float bsum = 0.0f;
+            switch (c->act) {
+            case TK_ACT_RELU:
+                for (int p = 0; p < g->npatch; p++) {
+                    const float v = zr[p] > 0.0f ? dyr[p] : 0.0f;
+                    dzr[p] = v; bsum += v;
+                }
+                break;
+            case TK_ACT_IDENTITY:
+                for (int p = 0; p < g->npatch; p++) {
+                    dzr[p] = dyr[p]; bsum += dyr[p];
+                }
+                break;
+            default:
+                for (int p = 0; p < g->npatch; p++) {
+                    const float v = dyr[p] * tk_act_grad_scalar(zr[p], c->act);
+                    dzr[p] = v; bsum += v;
+                }
+            }
+            if (dbp) dbp[oc] += bsum;
+        }
+}
+
+/* Reduction-dimension chunk for the dK GEMM (columns of dZ / rows of
+ * im2col^T per packed block). Swept 128/256/512 on M4 (DESIGN.md). */
+#ifndef TK_CONV_JC
+#define TK_CONV_JC 256
+#endif
+
+/* Pack dZ columns [j0, j0+jc) as the dK GEMM's A: Ap[mpanel][k][MR], where
+ * k walks the chunk's columns and lanes are MR consecutive out_c rows
+ * (zero-padded). Consecutive k = consecutive patches of one sample, so the
+ * MR strided source rows stay in cache across the k loop. */
+static void convb_pack_dzT(const float *restrict dZ, float *restrict Ap,
+                           const tk_conv_geom *g, long j0, int jc) {
+    const int MR = TK_CONV_MR;
+    for (int oc0 = 0; oc0 < g->out_c; oc0 += MR) {
+        const int m = (g->out_c - oc0 < MR) ? g->out_c - oc0 : MR;
+        float *restrict dst = Ap + (size_t)(oc0 / MR) * jc * MR;
+        for (int k = 0; k < jc; k++) {
+            const long j = j0 + k;
+            const int s = (int)(j / g->npatch), p = (int)(j % g->npatch);
+            const float *restrict base =
+                dZ + (size_t)s * g->out_sz + (size_t)oc0 * g->npatch + p;
+            for (int i = 0; i < m; i++)
+                dst[i] = base[(size_t)i * g->npatch];
+            for (int i = m; i < MR; i++) dst[i] = 0.0f;
+            dst += MR;
+        }
+    }
+}
+
+/* Pack im2col rows [j0, j0+jc) as the dK GEMM's B: Bp[npanel][k][NR], lanes
+ * NR consecutive kdim taps. Loops tap-outer / column-inner in runs sharing
+ * (sample, output row), so at stride 1 each tap reads a contiguous X row
+ * segment; the NR-strided writes land one cache line apart and each line is
+ * filled across the t loop. */
+static void convb_pack_colsT(const float *restrict X, float *restrict Bp,
+                             const tk_conv_geom *g, long j0, int jc) {
+    const int NR = TK_CONV_NR;
+    const int khw = g->kh * g->kw;
+    for (int kd0 = 0; kd0 < g->kdim; kd0 += NR) {
+        const int nt = (g->kdim - kd0 < NR) ? g->kdim - kd0 : NR;
+        float *restrict dst = Bp + (size_t)(kd0 / NR) * jc * NR;
+        int k = 0;
+        while (k < jc) {
+            const long j = j0 + k;
+            const int s = (int)(j / g->npatch), p = (int)(j % g->npatch);
+            const int oy = p / g->ow, ox = p % g->ow;
+            int run = g->ow - ox;
+            if (run > jc - k) run = jc - k;
+            const float *restrict xs = X + (size_t)s * g->in_sz;
+            const int iy0 = oy * g->stride - g->pad;
+            const int ixb = ox * g->stride - g->pad;
+            for (int t = 0; t < NR; t++) {
+                float *restrict d = dst + (size_t)k * NR + t;
+                if (t >= nt) {
+                    for (int r = 0; r < run; r++) d[(size_t)r * NR] = 0.0f;
+                    continue;
+                }
+                const int kd = kd0 + t;
+                const int c = kd / khw, rem = kd % khw;
+                const int ky = rem / g->kw, kx = rem % g->kw;
+                const int iy = iy0 + ky;
+                if (iy < 0 || iy >= g->in_h) {
+                    for (int r = 0; r < run; r++) d[(size_t)r * NR] = 0.0f;
+                    continue;
+                }
+                const float *restrict row =
+                    xs + ((size_t)c * g->in_h + iy) * g->in_w;
+                if (g->stride == 1) {
+                    const int lo = ixb + kx;
+                    int a = lo < 0 ? -lo : 0;
+                    int b = (lo + run > g->in_w) ? g->in_w - lo : run;
+                    if (b < a) b = a;
+                    for (int r = 0; r < a; r++)   d[(size_t)r * NR] = 0.0f;
+                    for (int r = a; r < b; r++)   d[(size_t)r * NR] = row[lo + r];
+                    for (int r = b; r < run; r++) d[(size_t)r * NR] = 0.0f;
+                } else {
+                    for (int r = 0; r < run; r++) {
+                        const int ix = ixb + r * g->stride + kx;
+                        d[(size_t)r * NR] =
+                            (ix >= 0 && ix < g->in_w) ? row[ix] : 0.0f;
+                    }
+                }
+            }
+            k += run;
+        }
+    }
+}
+
+typedef struct {
+    const float *X, *dZ;
+    float *dKp;                  /* one zeroed out_c*kdim slice per worker */
+    float *Ap, *Bp;              /* per-worker pack scratch */
+    tk_conv_geom g;
+} tk_convb_dk_ctx;
+
+/* dK chunks [c0, c1): each chunk is a full (out_c x kdim) GEMM update over
+ * TK_CONV_JC columns, accumulated into this worker's dK partial. */
+static void convb_dk_worker(void *pv, int c0, int c1, int worker) {
+    const tk_convb_dk_ctx *c = (const tk_convb_dk_ctx *)pv;
+    const tk_conv_geom *g = &c->g;
+    const int MR = TK_CONV_MR, NR = TK_CONV_NR;
+    const int mpad = (g->out_c + MR - 1) / MR * MR;
+    const int npad = (g->kdim + NR - 1) / NR * NR;
+    float *Ap = c->Ap + (size_t)worker * mpad * TK_CONV_JC;
+    float *Bp = c->Bp + (size_t)worker * npad * TK_CONV_JC;
+    float *dKp = c->dKp + (size_t)worker * g->out_c * g->kdim;
+    for (int ch = c0; ch < c1; ch++) {
+        const long j0 = (long)ch * TK_CONV_JC;
+        const int jc = (g->ncols - j0 < TK_CONV_JC) ? (int)(g->ncols - j0)
+                                                    : TK_CONV_JC;
+        convb_pack_dzT(c->dZ, Ap, g, j0, jc);
+        convb_pack_colsT(c->X, Bp, g, j0, jc);
+        for (int kd0 = 0; kd0 < g->kdim; kd0 += NR) {
+            const int nf = (g->kdim - kd0 < NR) ? g->kdim - kd0 : NR;
+            const float *restrict Bmp = Bp + (size_t)(kd0 / NR) * jc * NR;
+            for (int oc0 = 0; oc0 < g->out_c; oc0 += MR) {
+                const int m = (g->out_c - oc0 < MR) ? g->out_c - oc0 : MR;
+                float Ct[TK_CONV_MR * TK_CONV_NR];
+                convg_kern(jc, Ap + (size_t)(oc0 / MR) * jc * MR, Bmp, Ct);
+                for (int i = 0; i < m; i++) {
+                    float *restrict dkr =
+                        dKp + (size_t)(oc0 + i) * g->kdim + kd0;
+                    const float *restrict src = Ct + (size_t)i * NR;
+                    for (int t = 0; t < nf; t++) dkr[t] += src[t];
+                }
+            }
+        }
+    }
+}
+
+/* Pack K^T as the dX GEMM's A: Kt[mpanel][k=oc][MR], lanes MR consecutive
+ * kdim taps (zero-padded); K rows are contiguous along kdim so this is a
+ * straight strided copy. Shared read-only by all workers. */
+static void convb_pack_Kt(const float *restrict K, float *restrict Kt,
+                          int out_c, int kdim) {
+    const int MR = TK_CONV_MR;
+    for (int kd0 = 0; kd0 < kdim; kd0 += MR) {
+        const int m = (kdim - kd0 < MR) ? kdim - kd0 : MR;
+        float *restrict dst = Kt + (size_t)(kd0 / MR) * out_c * MR;
+        for (int oc = 0; oc < out_c; oc++) {
+            const float *restrict kr = K + (size_t)oc * kdim + kd0;
+            for (int i = 0; i < m; i++)  *dst++ = kr[i];
+            for (int i = m; i < MR; i++) *dst++ = 0.0f;
+        }
+    }
+}
+
+typedef struct {
+    const float *dZ, *Kt;
+    float *dX, *B3;              /* B3: one out_c*NR slice per worker */
+    tk_conv_geom g;
+} tk_convb_dx_ctx;
+
+/* dX for samples [s0, s1): per NR-patch panel, pack dZ_s columns (contiguous
+ * copies), run the K^T GEMM one MR-tap tile at a time, and col2im-scatter
+ * each tile into dX while it is register/L1 hot. Samples are worker-owned,
+ * so overlapping-patch scatters never race. */
+static void convb_dx_worker(void *pv, int s0, int s1, int worker) {
+    const tk_convb_dx_ctx *c = (const tk_convb_dx_ctx *)pv;
+    const tk_conv_geom *g = &c->g;
+    const int MR = TK_CONV_MR, NR = TK_CONV_NR;
+    const int khw = g->kh * g->kw;
+    float *B3 = c->B3 + (size_t)worker * g->out_c * NR;
+    for (int s = s0; s < s1; s++) {
+        const float *restrict dzs = c->dZ + (size_t)s * g->out_sz;
+        float *restrict dxs = c->dX + (size_t)s * g->in_sz;
+        memset(dxs, 0, g->in_sz * sizeof(float));
+        for (int p0 = 0; p0 < g->npatch; p0 += NR) {
+            const int nf = (g->npatch - p0 < NR) ? g->npatch - p0 : NR;
+            for (int oc = 0; oc < g->out_c; oc++) {
+                const float *restrict src = dzs + (size_t)oc * g->npatch + p0;
+                float *restrict d = B3 + (size_t)oc * NR;
+                for (int t = 0; t < nf; t++)  d[t] = src[t];
+                for (int t = nf; t < NR; t++) d[t] = 0.0f;
+            }
+            /* The panel's patches split into runs sharing an output row, so
+             * the scatter below becomes contiguous clipped adds into one dX
+             * row per (run, tap) -- per-element index math + bounds tests
+             * measured ~57% of the whole dX phase (`sample`). */
+            int run_t0[TK_CONV_NR], run_len[TK_CONV_NR];
+            int run_iy0[TK_CONV_NR], run_ixb[TK_CONV_NR], nruns = 0;
+            for (int t = 0; t < nf; nruns++) {
+                const int p = p0 + t;
+                const int oy = p / g->ow, ox = p % g->ow;
+                int len = g->ow - ox;
+                if (len > nf - t) len = nf - t;
+                run_t0[nruns] = t; run_len[nruns] = len;
+                run_iy0[nruns] = oy * g->stride - g->pad;
+                run_ixb[nruns] = ox * g->stride - g->pad;
+                t += len;
+            }
+            for (int kd0 = 0; kd0 < g->kdim; kd0 += MR) {
+                const int m = (g->kdim - kd0 < MR) ? g->kdim - kd0 : MR;
+                float Ct[TK_CONV_MR * TK_CONV_NR];
+                convg_kern(g->out_c,
+                           c->Kt + (size_t)(kd0 / MR) * g->out_c * MR,
+                           B3, Ct);
+                for (int r = 0; r < nruns; r++) {       /* col2im scatter */
+                    const int t0 = run_t0[r], len = run_len[r];
+                    for (int i = 0; i < m; i++) {
+                        const int kd = kd0 + i;
+                        const int ch = kd / khw, rem = kd % khw;
+                        const int iy = run_iy0[r] + rem / g->kw;
+                        if (iy < 0 || iy >= g->in_h) continue;
+                        const int kx = rem % g->kw;
+                        float *restrict dst =
+                            dxs + ((size_t)ch * g->in_h + iy) * g->in_w;
+                        const float *restrict src = Ct + (size_t)i * NR + t0;
+                        if (g->stride == 1) {
+                            const int lo = run_ixb[r] + kx;
+                            const int a = lo < 0 ? -lo : 0;
+                            const int b = (lo + len > g->in_w) ? g->in_w - lo
+                                                               : len;
+                            for (int t = a; t < b; t++) dst[lo + t] += src[t];
+                        } else {
+                            for (int t = 0; t < len; t++) {
+                                const int ix = run_ixb[r] + t * g->stride + kx;
+                                if (ix >= 0 && ix < g->in_w) dst[ix] += src[t];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/* Whole-batch GEMM backward. Returns 0 if scratch allocation failed (caller
+ * falls back to the per-sample path). */
+static int conv_bwd_gemm(const float *X, const float *K, const float *Z,
+                         const float *dY, float *dK, float *db, float *dX,
+                         const tk_conv_geom *g, tk_activation_t act, int T) {
+    const int MR = TK_CONV_MR, NR = TK_CONV_NR;
+    const int Tw = (T > 1) ? tk_num_threads() : 1;
+    const int mpad = (g->out_c + MR - 1) / MR * MR;
+    const int npad = (g->kdim + NR - 1) / NR * NR;
+    const int ktpanels = (g->kdim + MR - 1) / MR;
+    const size_t ksz = (size_t)g->out_c * g->kdim;
+
+    float *dZ  = malloc((size_t)g->n * g->out_sz * sizeof(float));
+    float *dKp = calloc((size_t)Tw * ksz + (db ? (size_t)Tw * g->out_c : 0),
+                        sizeof(float));
+    float *Ap  = malloc((size_t)Tw * (mpad + npad) * TK_CONV_JC
+                        * sizeof(float));
+    float *Kt = NULL, *B3 = NULL;
+    if (dX) {
+        Kt = malloc((size_t)ktpanels * MR * g->out_c * sizeof(float));
+        B3 = malloc((size_t)Tw * g->out_c * NR * sizeof(float));
+    }
+    if (!dZ || !dKp || !Ap || (dX && (!Kt || !B3))) {
+        free(dZ); free(dKp); free(Ap); free(Kt); free(B3);
+        return 0;
+    }
+    float *dbp = db ? dKp + (size_t)Tw * ksz : NULL;
+
+    /* pass 1: dZ = dY * act'(Z), db partials (samples split, no races) */
+    tk_convb_dz_ctx cz = { Z, dY, dZ, dbp, *g, act };
+    if (T > 1) tk_parallel_for(g->n, convb_dz_worker, &cz);
+    else       convb_dz_worker(&cz, 0, g->n, 0);
+
+    /* pass 2: dK over column chunks, per-worker partials + reduction */
+    const int nchunks = (int)((g->ncols + TK_CONV_JC - 1) / TK_CONV_JC);
+    tk_convb_dk_ctx ck = { X, dZ, dKp, Ap,
+                           Ap + (size_t)Tw * mpad * TK_CONV_JC, *g };
+    if (T > 1) tk_parallel_for(nchunks, convb_dk_worker, &ck);
+    else       convb_dk_worker(&ck, 0, nchunks, 0);
+
+    memcpy(dK, dKp, ksz * sizeof(float));
+    for (int t = 1; t < Tw; t++) {
+        const float *pt = dKp + (size_t)t * ksz;
+        for (size_t i = 0; i < ksz; i++) dK[i] += pt[i];
+    }
+    if (db) {
+        memcpy(db, dbp, (size_t)g->out_c * sizeof(float));
+        for (int t = 1; t < Tw; t++) {
+            const float *pt = dbp + (size_t)t * g->out_c;
+            for (int i = 0; i < g->out_c; i++) db[i] += pt[i];
+        }
+    }
+
+    /* pass 3: dX by sample ownership (col2im scatters stay private) */
+    if (dX) {
+        convb_pack_Kt(K, Kt, g->out_c, g->kdim);
+        tk_convb_dx_ctx cx = { dZ, Kt, dX, B3, *g };
+        if (T > 1) tk_parallel_for(g->n, convb_dx_worker, &cx);
+        else       convb_dx_worker(&cx, 0, g->n, 0);
+    }
+    free(dZ); free(dKp); free(Ap); free(Kt); free(B3);
+    return 1;
+}
+
 typedef struct {
     const float *X, *K, *bias;
     float *Z, *Y, *cols;         /* cols: one npatch*kdim slice per worker */
@@ -856,6 +1208,16 @@ void tk_conv2d_backward_f32(const float *X, const float *K, const float *Z,
     }
 
     const size_t work = (size_t)n * out_c * npatch * kdim;
+
+    if (work >= TK_CONV_GEMM_MIN_MACS) {          /* big shapes: batch GEMM */
+        const tk_conv_geom g = conv_geom(n, in_c, in_h, in_w, out_c, kh, kw,
+                                         stride, pad, oh, ow);
+        const int Tg = (work >= TK_MT_MIN_WORK) ? tk_num_threads() : 1;
+        if (conv_bwd_gemm(X, K, Z, dY, dK, db, dX, &g,
+                          (tk_activation_t)act, Tg))
+            return;                               /* else: alloc failed, fall through */
+    }
+
     const int T = (work >= TK_MT_MIN_WORK && n > 1) ? tk_num_threads() : 1;
     /* Per-worker: im2col + dz + dcol scratch, and zeroed dK/db partials for
      * the batch-summed reduction (same pattern as tk_linear_backward's dx). */

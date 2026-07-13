@@ -304,6 +304,38 @@ GFLOP/s), 3.8 → 3.0 ms at 10 threads (320 → 401 GFLOP/s). The 3-channel VGG
 stem (kdim = 27) gains more: 2.28 → 0.73 ms serial, 0.58 → 0.22 ms at 10T —
 short-kdim GEMMs live and die by pack/store overhead.
 
+**Backward through the same machinery.** Both gradients are GEMMs over the
+same packed layouts and the same micro-kernel:
+`dK (out_c x kdim) = dZ · im2col^T` and `dcols (kdim x N) = K^T · dZ`
+followed by col2im, with `dZ = dY · act'(Z)` computed once into scratch (the
+only full-size intermediate — same size as dY, so the whole-batch-im2col
+rejection still stands). Race-freedom keeps the v0.2.1 design, mapped onto
+the new axes:
+
+- **dK reduces over N** (all batch columns), so N is split into fixed
+  JC=256-column chunks, each worker accumulates a private dK partial, and
+  partials are reduced after the join — the `tk_linear_backward` pattern.
+  Chunk boundaries depend only on the thread count: dK stays
+  **bit-reproducible at fixed MANTISSA_THREADS**.
+- **dX is split by sample ownership**: overlapping patches of one sample
+  scatter into the same dX pixels, so patch-level splitting would race.
+  The col2im scatter runs per micro-kernel tile, while the tile is L1-hot —
+  no kdim x N dcols matrix is ever materialized. The scatter itself is
+  run-based like the pack (patches sharing an output row become contiguous
+  clipped adds into one dX row per tap); its first per-element form was
+  ~57% of the whole dX phase (`sample` profile).
+- db falls out of the dZ pass with per-worker partials.
+
+Measured (M4, VGG 64-channel block): backward 53.9 → 31.6 ms single-thread
+(45 → 77 GFLOP/s), 15.0 → 8.5 ms at 10 threads (161 → 284 GFLOP/s) —
+backward now runs at ~78% of the forward's GFLOP/s serial (it was ~2x slower
+per FLOP before). Two honest deltas vs the old path: the GEMM backward no
+longer skips dead-relu patches (the old path's `g == 0` shortcut — dense
+compute is still 1.7x faster than the sparse shortcut at these shapes), and
+dX's reduction order over out_c is the kernel's tile order (ULP-level
+differences, same envelope as the forward's documented reduction-order
+caveat; the finite-difference and numpy cross-checks are the contract).
+
 ### Activation dispatch: switch beats a function pointer
 
 Intuition says an indirect `function pointer` avoids the cost of a `switch`.
@@ -462,6 +494,12 @@ disagreed with the theory. Recorded here so they are not re-attempted.
 - **k-unrolling the conv micro-kernel x2** — no change (16.42 vs 16.46 ms,
   interleaved): 24 independent accumulators already saturate the FMA pipes,
   so the loop overhead it removes was hidden anyway.
+- **dK reduction-chunk width JC other than 256** — swept 128/256/512 (VGG
+  64-channel block, 1T and 10T backward, two interleaved rounds): all within
+  the run-to-run noise band (1T 31.0–34.5 ms with no consistent ordering;
+  10T likewise). The chunk only bounds the per-worker pack scratch and the
+  partial-accumulate cadence, neither of which is the bottleneck. 256 kept
+  for symmetry with NC.
 - **Conv B-panel width NC other than 256** — swept 128/256/512 on the VGG
   64-channel block (M4, interleaved, two rounds). NC=512 is ~2% faster
   single-thread (17.4 vs 17.7/17.9 ms) but 10–15% *slower* at 10 threads
