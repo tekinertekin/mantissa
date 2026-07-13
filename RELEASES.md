@@ -6,6 +6,69 @@ dense layer (4.2M params) unless noted, and are indicative, not absolute.
 
 ---
 
+## v0.2.1 — 2026-07-13  (tag `v0.2.1`)
+
+The CNN release — a minor-version bump because a whole primitive family
+lands: 2-D convolution, max pooling, a batched dense head, fused
+softmax-cross-entropy and a plain-f32 SGD step (`include/conv.h`,
+`src/conv.c`), per the fixed mantissa ↔ mantissa-cnn engine contract. The
+family is pure float32 end to end — the `_f32` training-path convention —
+NCHW, batch outermost, all buffers caller-allocated.
+
+**Added**
+- **`tk_conv2d_forward_f32` / `tk_conv2d_backward_f32`** — im2col + GEMM
+  (Chellapilla et al., 2006) with a 4-row register-blocked f32 dot kernel
+  (NEON on arm64, portable scalar elsewhere; measured on the VGG-block GEMM:
+  8.5 → 63.4 GFLOP/s over the single-row scalar loop). One sample's patch
+  matrix at a time, heap scratch allocated once per call; threaded across
+  batch samples above `TK_MT_MIN_WORK`. Backward: dK by im2col^T
+  accumulation with per-worker partials (batch-summed, reproducible at fixed
+  thread counts), dX by col2im scatter; `dz = dy * act'(z)`, the
+  `tk_linear_backward` convention. Alloc-failure falls back to exact direct
+  loops.
+- **`tk_maxpool2d_f32` / `tk_maxpool2d_backward_f32`** — floor semantics
+  (ragged edges dropped, documented), int32 argmax of each winner's
+  plane-flat index; backward zeroes dX and scatters, overlaps accumulate.
+- **`tk_linear_forward_batch_f32` / `tk_linear_backward_batch_f32`** — the
+  CNN head: batched f32 dense layer on the same blocked kernel; backward is
+  two race-free parallel passes (dW/db row-parallel, dX sample-parallel).
+- **`tk_softmax_xent_f32`** — fused, max-subtracted; mean loss out,
+  `dlogits = (softmax - onehot)/n` in one pass. **`tk_sgd_update_f32`** —
+  `W -= lr*dW` (the f32 sibling of narrow-storage `tk_sgd_step`).
+  **`tk_conv2d_out_dim`** — the shared output-size rule, exported.
+- **Python bindings** for the whole family (zero-copy numpy float32/int32;
+  `hasattr(tk, "conv2d_forward")` is the feature probe), plus
+  `python/test_conv_binding.py` cross-checking every op against numpy
+  references (conv vs a naive im2col; analytic einsum gradients).
+- **`make testconv`** — finite-difference gradient checks (dK/db/dX,
+  maxpool, dense batch, softmax-xent) over stride 1/2, pad 0/1/2, kh≠kw,
+  non-square inputs, identity/tanh/relu (relu bias-nudged off its z==0
+  kink, asserted); rel err < 1e-2, measured ≤ 1.6e-3. **`make benchconv`**
+  — LeNet-5/VGG shapes, serial + threaded.
+
+Measured (M4, clang -O3, float32 family, 50 reps; fwd/bwd ms per batch):
+
+| shape (batch)                   | fwd 1T | fwd 10T | bwd 1T | bwd 10T |
+|---------------------------------|-------:|--------:|-------:|--------:|
+| LeNet C1 1×28×28→6@5×5 (32)     | 1.00 ms | 0.15 ms | 1.32 ms | 0.34 ms |
+| LeNet C3 6×14×14→16@5×5 (32)    | 0.52 ms | 0.17 ms | 1.18 ms | 0.34 ms |
+| VGG 3×32×32→64@3×3 p1 (16)      | 2.23 ms | 0.58 ms | 11.1 ms | 2.38 ms |
+| VGG 64×32×32→64@3×3 p1 (16)     | 24.4 ms | 6.07 ms | 52.6 ms | 14.8 ms |
+
+Peak: 199 GFLOP/s forward / 163 backward (VGG 64→64, threaded).
+
+**Deliberately NOT done**
+- **Narrow-dtype conv**: the family quantizes nothing. Storage-dtype conv is
+  gated on the block-scaling design (per-block scales are what make 8/4-bit
+  conv weights viable), same roadmap item as fp4 two-per-byte packing.
+- **Whole-batch im2col**: n× the scratch footprint for no measured speed
+  win over per-sample unrolling — the batch loop already streams K.
+- **Pure-C 4-row GEMM block**: measured 13.8 GFLOP/s vs 63.4 for the NEON
+  kernel on the same shape; clang would not keep eight independent chains
+  live from scalar code, so the intrinsics body ships (ops.c precedent).
+
+---
+
 ## v0.1.14 — 2026-07-13  (tag `v0.1.14`)
 
 The FFI-was-the-bottleneck release. Profiling the sister project's per-epoch

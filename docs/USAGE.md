@@ -229,6 +229,66 @@ tk_sgd_step(W, dW, out_dim * in_dim, &opt, &rng);   // W -= lr*(dW + reg)
 Worked end-to-end trainer: [`examples/train_xor.c`](../examples/train_xor.c)
 (`make train`). Gradient check: `make testbp`.
 
+## Convolution (CNN primitives)
+
+The conv family (`conv.h`, since v0.2.1) is pure **float32** end to end — no
+storage-dtype quantization on the training path (narrow-storage conv is a
+roadmap item). Layout is **NCHW**, row-major, batch outermost; every buffer is
+caller-allocated. Convolution is im2col + a register-blocked GEMM (Chellapilla
+et al., 2006), one sample's patch matrix at a time, threaded across the batch.
+Max pooling uses floor semantics (no padding: `out = (in - pool)/stride + 1`,
+ragged edges dropped) and hands the backward its argmax indices.
+
+```c
+#include "conv.h"
+
+/* one conv layer + softmax head, forward and backward */
+int oh = tk_conv2d_out_dim(28, 5, /*stride*/1, /*pad*/0);   /* 24 */
+tk_conv2d_forward_f32(X, K, bias, Z, Y, n, 1, 28, 28,       /* X: n x 1x28x28 */
+                      6, 5, 5, 1, 0, TK_ACT_RELU);          /* -> n x 6x24x24 */
+tk_maxpool2d_f32(Y, P, argmax, n, 6, oh, oh, 2, 2);         /* -> n x 6x12x12 */
+tk_linear_forward_batch_f32(W, Pflat, wb, Zl, logits, n, 10, 6*12*12,
+                            TK_ACT_IDENTITY);
+float loss = tk_softmax_xent_f32(logits, labels, dlogits, n, 10);
+
+tk_linear_backward_batch_f32(W, Pflat, Zl, dlogits, dW, dwb, dP,
+                             n, 10, 6*12*12, TK_ACT_IDENTITY);
+tk_maxpool2d_backward_f32(dP, argmax, dY, n, 6, oh, oh, 12, 12);
+tk_conv2d_backward_f32(X, K, Z, dY, dK, db, NULL /*first layer*/,
+                       n, 1, 28, 28, 6, 5, 5, 1, 0, TK_ACT_RELU);
+tk_sgd_update_f32(K, dK, 6*1*5*5, 0.05f);                   /* plain f32 SGD */
+```
+
+`Z` is the saved pre-activation the backward needs (pass `NULL` with
+`TK_ACT_IDENTITY` if you only want `Y`); `dK`/`db` come back summed over the
+batch. Gradient checks: `make testconv`. Shapes bench: `make benchconv` —
+measured (M4, float32): VGG-block 64×32×32 → 64@3×3 forward 24.4 ms serial /
+6.1 ms threaded (199 GFLOP/s), backward 52.6 / 14.8 ms.
+
+The same family from Python (zero-copy on C-contiguous float32 / int32 numpy
+arrays; feature-detect with `hasattr(tk, "conv2d_forward")`):
+
+```python
+import numpy as np
+from mantissa import Mantissa, RELU, IDENTITY
+
+tk = Mantissa()
+n, oh = 32, tk.conv2d_out_dim(28, 5, 1, 0)          # 24
+X  = np.random.rand(n * 1 * 28 * 28).astype(np.float32)
+K  = (np.random.rand(6 * 1 * 5 * 5).astype(np.float32) - 0.5) * 0.2
+kb = np.zeros(6, np.float32)
+Z  = np.empty(n * 6 * oh * oh, np.float32); Y = np.empty_like(Z)
+
+tk.conv2d_forward(X, K, kb, Z, Y, n, 1, 28, 28, 6, 5, 5, 1, 0, RELU)
+# ... maxpool2d / linear_forward_batch / softmax_xent mirror the C calls ...
+dY = np.empty_like(Y); dK = np.empty_like(K); db = np.empty_like(kb)
+tk.conv2d_backward(X, K, Z, dY, dK, db, None, n, 1, 28, 28, 6, 5, 5, 1, 0, RELU)
+tk.sgd_update(K, dK, K.size, 0.05)                  # in place
+```
+
+Runnable cross-check: [`python/test_conv_binding.py`](../python/test_conv_binding.py)
+(conv vs a numpy im2col reference, plus the whole family on random data).
+
 ## Which functions to call
 
 | You want to… | Call |
@@ -249,4 +309,11 @@ Worked end-to-end trainer: [`examples/train_xor.c`](../examples/train_xor.c)
 | Epoch calls in a loop without per-call pointer rebinding (Python) | `Mantissa().trainer(...)` |
 | Repeated inference on fixed weights (Python) | `Mantissa().prepare(...).forward(...)` |
 | Dropout forward / backward | `tk_dropout_forward` / `tk_dropout_backward` |
+| Conv layer forward, batched float32 (NCHW) | `tk_conv2d_forward_f32` |
+| Conv layer backward (dK/db/dX, batch-summed) | `tk_conv2d_backward_f32` |
+| Max pooling forward / backward (argmax scatter) | `tk_maxpool2d_f32` / `tk_maxpool2d_backward_f32` |
+| A whole batch through a float32 dense layer (CNN head) | `tk_linear_forward_batch_f32` / `tk_linear_backward_batch_f32` |
+| Softmax + cross-entropy, fused (loss + dlogits) | `tk_softmax_xent_f32` |
+| Plain float32 SGD update | `tk_sgd_update_f32` |
+| Conv/pool output spatial size | `tk_conv2d_out_dim` |
 | Know the active dtype from Python | `Mantissa().dtype` |

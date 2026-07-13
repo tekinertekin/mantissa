@@ -299,8 +299,9 @@ That is the whole reason the technique exists.
 | `TK_USE_STOCHASTIC_ROUNDING`         | SR on the weight write-back |
 
 Each sets a default; the runtime `tk_optim` / dropout calls override per layer.
-Back-propagation is scoped to the dense layer for now (the shared primitive);
-conv/recurrent backward reuse the same pieces later.
+Back-propagation covers the dense layer (the shared primitive) and, since
+v0.2.1, the conv/pool family (`conv.h`, float32 — see the roadmap section);
+recurrent backward reuses the same pieces later.
 
 ## Zero-config
 
@@ -402,21 +403,24 @@ The low-precision frontier moves fast; `mantissa` tracks it deliberately:
 - **IEEE P3109** — an emerging standard for ML arithmetic formats.
 
 `mantissa` implements the *element* formats (E4M3, E5M2, E2M1); block-level
-microscaling (a shared per-block scale) is the next planned step. **Convolution
-is already within reach**: a conv layer is a batch of dot products of a filter
-against input patches, and `tk_dot` is exactly that primitive — a CNN needs an
-`im2col`/patch iterator on top, no new numerics. Back-propagation for the dense
-layer is implemented (gradient-checked); conv/recurrent backward will reuse the
-same gradient and optimizer pieces.
+microscaling (a shared per-block scale) is the next planned step. **The
+conv/pool primitives landed in v0.2.1** (`conv.h`): im2col + register-blocked
+GEMM convolution, max pooling with argmax scatter, a batched dense head, fused
+softmax-cross-entropy and plain-f32 SGD — the full CNN training family,
+gradient-checked (`make testconv`) and benched at LeNet-5/VGG shapes
+(`make benchconv`; VGG 64→64@3×3 forward 199 GFLOP/s threaded on M4). This
+family is deliberately pure float32: narrow-storage conv stays on the roadmap,
+gated on the same block-scaling work as the 4-bit packing. Recurrent backward
+will reuse the same gradient and optimizer pieces.
 
 ## Project layout
 
 ```
-include/   config, dtypes + conversions, activations, ops, loss, backprop, pool
-src/       implementations
-tests/     forward round-trip checks (7 formats) + backprop gradient check
+include/   config, dtypes + conversions, activations, ops, loss, backprop, conv, pool
+src/       implementations (conv.c: the float32 CNN family — conv2d, maxpool, softmax-xent)
+tests/     forward round-trip checks (7 formats) + backprop & conv gradient checks
 examples/  perceptron, mixed-MLP, XOR training
-bench/     GEMV + activation-dispatch benchmark
+bench/     GEMV + activation-dispatch benchmark, conv shapes (benchconv)
 python/    ctypes binding + Python perceptron & training examples
 clients/   forward + back-prop demos in C++, C#, Java, JavaScript, Rust
 docs/      DESIGN.md (numerics, optimization), USAGE.md (API + examples)

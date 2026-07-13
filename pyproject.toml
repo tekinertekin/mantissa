@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 # PyPI distribution name (the import name stays `mantissa`; the bare "mantissa"
 # project is already taken on PyPI by an unrelated package).
 name = "mantissa-nn"
-version = "0.1.14"
+version = "0.2.1"
 description = "A fast, memory-lean neural-network core in C, with a Python binding."
 readme = "README.md"
 requires-python = ">=3.8"
