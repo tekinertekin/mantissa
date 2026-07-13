@@ -162,6 +162,59 @@ class Mantissa:
             ctypes.c_float, _i32p,            # lr, order (or NULL)
         ]
 
+        # CNN primitive family (conv.h; >= 0.2.1) — pure float32, NCHW.
+        # Consumers feature-detect with hasattr(tk, "conv2d_forward").
+        self._lib.tk_conv2d_out_dim.restype = ctypes.c_int
+        self._lib.tk_conv2d_out_dim.argtypes = [ctypes.c_int] * 4
+
+        self._lib.tk_conv2d_forward_f32.restype = None
+        self._lib.tk_conv2d_forward_f32.argtypes = [
+            _f32p, _f32p, _f32p, _f32p, _f32p,    # X, K, bias, Z, Y
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,  # n, in_c, in_h, in_w
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,  # out_c, kh, kw
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,  # stride, pad, act
+        ]
+        self._lib.tk_conv2d_backward_f32.restype = None
+        self._lib.tk_conv2d_backward_f32.argtypes = [
+            _f32p, _f32p, _f32p, _f32p,           # X, K, Z, dY
+            _f32p, _f32p, _f32p,                  # dK, db, dX
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,  # n, in_c, in_h, in_w
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,  # out_c, kh, kw
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,  # stride, pad, act
+        ]
+        self._lib.tk_maxpool2d_f32.restype = None
+        self._lib.tk_maxpool2d_f32.argtypes = [
+            _f32p, _f32p, _i32p,                  # X, Y, argmax
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,  # n, c, in_h, in_w
+            ctypes.c_int, ctypes.c_int,           # pool, stride
+        ]
+        self._lib.tk_maxpool2d_backward_f32.restype = None
+        self._lib.tk_maxpool2d_backward_f32.argtypes = [
+            _f32p, _i32p, _f32p,                  # dY, argmax, dX
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,  # n, c, in_h, in_w
+            ctypes.c_int, ctypes.c_int,           # out_h, out_w
+        ]
+        self._lib.tk_linear_forward_batch_f32.restype = None
+        self._lib.tk_linear_forward_batch_f32.argtypes = [
+            _f32p, _f32p, _f32p, _f32p, _f32p,    # W, X, bias, Z, Y
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,  # n, out_dim, in_dim, act
+        ]
+        self._lib.tk_linear_backward_batch_f32.restype = None
+        self._lib.tk_linear_backward_batch_f32.argtypes = [
+            _f32p, _f32p, _f32p, _f32p,           # W, X, Z, dY
+            _f32p, _f32p, _f32p,                  # dW, db, dX
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,  # n, out_dim, in_dim, act
+        ]
+        self._lib.tk_softmax_xent_f32.restype = ctypes.c_float
+        self._lib.tk_softmax_xent_f32.argtypes = [
+            _f32p, _i32p, _f32p,                  # logits, labels, dlogits
+            ctypes.c_int, ctypes.c_int,           # n, classes
+        ]
+        self._lib.tk_sgd_update_f32.restype = None
+        self._lib.tk_sgd_update_f32.argtypes = [
+            _f32p, _f32p, ctypes.c_int, ctypes.c_float,  # W, dW, n, lr
+        ]
+
     @property
     def dtype(self) -> str:
         """Storage type the loaded library was compiled for (e.g. 'bfloat16')."""
@@ -296,6 +349,158 @@ class Mantissa:
         if b_wb:
             b_wb()
         return int(m)
+
+    # ---- CNN primitives (pure float32, NCHW, batch outermost) --------------
+    # All buffers are flat, C-contiguous float32 (argmax/labels: int32) numpy
+    # arrays for zero-copy; outputs are mutated in place. Feature-detect with
+    # hasattr(tk, "conv2d_forward") (needs mantissa-nn >= 0.2.1).
+
+    def conv2d_out_dim(self, in_dim: int, k: int, stride: int, pad: int) -> int:
+        """Conv/pool output spatial size: (in + 2*pad - k)//stride + 1,
+        clamped to >= 0 (0 on degenerate arguments)."""
+        return int(self._lib.tk_conv2d_out_dim(in_dim, k, stride, pad))
+
+    def conv2d_forward(self, X, K, bias, Z, Y, n: int, in_c: int, in_h: int,
+                       in_w: int, out_c: int, kh: int, kw: int,
+                       stride: int, pad: int, act: int):
+        """Batched conv2d forward: Y = act(conv(X, K) + bias), NCHW.
+        X: n*in_c*in_h*in_w, K: out_c*in_c*kh*kw, bias: out_c or None,
+        Z (pre-activation, needed by backward): n*out_c*oh*ow or None
+        (identity only), Y: same shape as Z. Returns Y. im2col + GEMM in C,
+        one sample's patch matrix at a time, threaded over the batch.
+        Measured (M4, VGG 64x32x32->64@3x3 pad 1, batch 16): 24.8 ms serial /
+        5.97 ms threaded, 202 GFLOP/s."""
+        oh = self.conv2d_out_dim(in_h, kh, stride, pad)
+        ow = self.conv2d_out_dim(in_w, kw, stride, pad)
+        ysz = n * out_c * oh * ow
+        Xc, _ = _as_c_float(X, n * in_c * in_h * in_w, "X")
+        Kc, _ = _as_c_float(K, out_c * in_c * kh * kw, "K")
+        bc = _as_c_float(bias, out_c, "bias")[0] if bias is not None else None
+        Zc, Z_wb = _as_c_float(Z, ysz, "Z") if Z is not None else (None, None)
+        Yc, Y_wb = _as_c_float(Y, ysz, "Y")
+        self._lib.tk_conv2d_forward_f32(Xc, Kc, bc, Zc, Yc, n, in_c, in_h,
+                                        in_w, out_c, kh, kw, stride, pad, act)
+        if Z_wb:
+            Z_wb()
+        if Y_wb:
+            Y_wb()
+        return Y
+
+    def conv2d_backward(self, X, K, Z, dY, dK, db, dX, n: int, in_c: int,
+                        in_h: int, in_w: int, out_c: int, kh: int, kw: int,
+                        stride: int, pad: int, act: int):
+        """Batched conv2d backward. Writes dK (out_c*in_c*kh*kw, summed over
+        the batch), db (out_c, summed, or None) and dX (n*in_c*in_h*in_w, or
+        None for the first layer); Z is the saved pre-activation. dK via
+        im2col^T accumulation, dX via col2im scatter. Measured (M4, VGG
+        64x32x32->64@3x3 pad 1, batch 16): 54.7 ms serial / 16.6 threaded."""
+        oh = self.conv2d_out_dim(in_h, kh, stride, pad)
+        ow = self.conv2d_out_dim(in_w, kw, stride, pad)
+        ysz = n * out_c * oh * ow
+        xsz = n * in_c * in_h * in_w
+        ksz = out_c * in_c * kh * kw
+        Xc, _ = _as_c_float(X, xsz, "X")
+        Kc, _ = _as_c_float(K, ksz, "K")
+        Zc, _ = _as_c_float(Z, ysz, "Z")
+        dYc, _ = _as_c_float(dY, ysz, "dY")
+        dKc, dK_wb = _as_c_float(dK, ksz, "dK")
+        dbc, db_wb = _as_c_float(db, out_c, "db") if db is not None else (None, None)
+        dXc, dX_wb = _as_c_float(dX, xsz, "dX") if dX is not None else (None, None)
+        self._lib.tk_conv2d_backward_f32(Xc, Kc, Zc, dYc, dKc, dbc, dXc,
+                                         n, in_c, in_h, in_w, out_c, kh, kw,
+                                         stride, pad, act)
+        for wb in (dK_wb, db_wb, dX_wb):
+            if wb:
+                wb()
+
+    def maxpool2d(self, X, Y, argmax, n: int, c: int, in_h: int, in_w: int,
+                  pool: int, stride: int):
+        """Max pooling, no padding, floor semantics: oh = (in_h - pool)//stride
+        + 1 (ragged edges dropped). Y: n*c*oh*ow float32; argmax: same shape,
+        int32 (pass a numpy int32 array — it receives each winner's flat
+        h*in_w + w index, which maxpool2d_backward consumes). Returns Y."""
+        oh = self.conv2d_out_dim(in_h, pool, stride, 0)
+        ow = self.conv2d_out_dim(in_w, pool, stride, 0)
+        ysz = n * c * oh * ow
+        Xc, _ = _as_c_float(X, n * c * in_h * in_w, "X")
+        Yc, Y_wb = _as_c_float(Y, ysz, "Y")
+        ac = _as_c_int32(argmax, ysz, "argmax")
+        self._lib.tk_maxpool2d_f32(Xc, Yc, ac, n, c, in_h, in_w, pool, stride)
+        if Y_wb:
+            Y_wb()
+        return Y
+
+    def maxpool2d_backward(self, dY, argmax, dX, n: int, c: int, in_h: int,
+                           in_w: int, out_h: int, out_w: int):
+        """Max pooling backward: zeroes dX (n*c*in_h*in_w) then scatters dY
+        (n*c*out_h*out_w) through argmax. Overlapping windows accumulate."""
+        ysz = n * c * out_h * out_w
+        dYc, _ = _as_c_float(dY, ysz, "dY")
+        ac = _as_c_int32(argmax, ysz, "argmax")
+        dXc, dX_wb = _as_c_float(dX, n * c * in_h * in_w, "dX")
+        self._lib.tk_maxpool2d_backward_f32(dYc, ac, dXc, n, c, in_h, in_w,
+                                            out_h, out_w)
+        if dX_wb:
+            dX_wb()
+
+    def linear_forward_batch(self, W, X, bias, Z, Y, n: int, out_dim: int,
+                             in_dim: int, act: int):
+        """Batched float32 dense forward (the CNN head): Y = act(X @ W^T +
+        bias). X: n*in_dim, W: out_dim*in_dim row-major, Z/Y: n*out_dim
+        (Z may be None). Returns Y. Same 4-row register-blocked kernel as the
+        conv GEMM."""
+        Wc, _ = _as_c_float(W, out_dim * in_dim, "W")
+        Xc, _ = _as_c_float(X, n * in_dim, "X")
+        bc = _as_c_float(bias, out_dim, "bias")[0] if bias is not None else None
+        Zc, Z_wb = _as_c_float(Z, n * out_dim, "Z") if Z is not None else (None, None)
+        Yc, Y_wb = _as_c_float(Y, n * out_dim, "Y")
+        self._lib.tk_linear_forward_batch_f32(Wc, Xc, bc, Zc, Yc,
+                                              n, out_dim, in_dim, act)
+        if Z_wb:
+            Z_wb()
+        if Y_wb:
+            Y_wb()
+        return Y
+
+    def linear_backward_batch(self, W, X, Z, dY, dW, db, dX, n: int,
+                              out_dim: int, in_dim: int, act: int):
+        """Batched float32 dense backward: writes dW (out_dim*in_dim, summed
+        over the batch), db (out_dim, summed, or None) and dX (n*in_dim, or
+        None); Z is the saved pre-activation, dz = dy * act'(z)."""
+        Wc, _ = _as_c_float(W, out_dim * in_dim, "W")
+        Xc, _ = _as_c_float(X, n * in_dim, "X")
+        Zc, _ = _as_c_float(Z, n * out_dim, "Z")
+        dYc, _ = _as_c_float(dY, n * out_dim, "dY")
+        dWc, dW_wb = _as_c_float(dW, out_dim * in_dim, "dW")
+        dbc, db_wb = _as_c_float(db, out_dim, "db") if db is not None else (None, None)
+        dXc, dX_wb = _as_c_float(dX, n * in_dim, "dX") if dX is not None else (None, None)
+        self._lib.tk_linear_backward_batch_f32(Wc, Xc, Zc, dYc, dWc, dbc, dXc,
+                                               n, out_dim, in_dim, act)
+        for wb in (dW_wb, db_wb, dX_wb):
+            if wb:
+                wb()
+
+    def softmax_xent(self, logits, labels, dlogits, n: int, classes: int) -> float:
+        """Fused softmax + cross-entropy, numerically stable (row-max
+        subtraction): logits n*classes float32, labels n int32 class ids.
+        Writes dlogits = (softmax - onehot)/n and returns the mean loss."""
+        lc, _ = _as_c_float(logits, n * classes, "logits")
+        yc = _as_c_int32(labels, n, "labels")
+        dc, d_wb = _as_c_float(dlogits, n * classes, "dlogits")
+        loss = self._lib.tk_softmax_xent_f32(lc, yc, dc, n, classes)
+        if d_wb:
+            d_wb()
+        return float(loss)
+
+    def sgd_update(self, W, dW, n: int, lr: float):
+        """Plain float32 SGD: W -= lr * dW over n elements, in place (the
+        narrow-storage counterpart is tk_sgd_step; the CNN family trains
+        pure float32)."""
+        Wc, W_wb = _as_c_float(W, n, "W")
+        dWc, _ = _as_c_float(dW, n, "dW")
+        self._lib.tk_sgd_update_f32(Wc, dWc, n, lr)
+        if W_wb:
+            W_wb()
 
 
 class Trainer:
