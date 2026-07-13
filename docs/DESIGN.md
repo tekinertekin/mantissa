@@ -192,6 +192,37 @@ because GEMV's low arithmetic intensity (~2 FLOPs per byte) makes it
 memory-bandwidth bound before it is compute bound — the classic reason narrow
 storage matters.
 
+**Where it saturates, and why (M4, 4 P-cores + 6 E-cores, bf16, interleaved
+medians).** The scaling curve is not monotone in thread count, and the reason is
+the heterogeneous cores under a static equal-split barrier:
+
+| threads | 2048² (8 MB, cache-resident) | 4096² (32 MB, DRAM-bound) |
+|:-------:|:----------------------------:|:-------------------------:|
+| 1       | 1.00×                        | 1.00×                     |
+| 2       | 1.76×                        | 1.67×                     |
+| 4       | **2.87× (peak)**             | 2.44×                     |
+| 6       | 2.42×                        | **3.12× (peak)**          |
+| 8       | 2.44×                        | 2.91×                     |
+| 10      | 2.35×                        | 2.73×                     |
+
+A cache-resident layer peaks at **4 threads — the P-core count** — then
+*regresses*: `tk_parallel_for` gives every thread an equal row range, so once the
+6 slower E-cores join, the fork-join barrier waits on an E-core straggler while
+the P-cores idle, and total throughput falls below the P-core-only peak. A
+DRAM-bound layer (working set past the SLC) peaks later, at ~6 threads, because
+there the E-cores buy *memory-level parallelism* — more outstanding loads against
+shared DRAM bandwidth — before that too saturates. Either way the ceiling is
+bandwidth, not cores: ~2.9–3.1× is the most this GEMV extracts from 10 cores, and
+the online-CPU-count default (10) is slightly past the sweet spot for
+cache-resident work. Pin `MANTISSA_THREADS` to the P-core count for the
+cache-resident regime if a workload lives there. (`make benchscale` /
+`benchscale-cross`, `bench/bench_scaling.c`, reproduce the curve, the crossover,
+and the per-dispatch barrier latency — ~19 µs at T=10, ~7.5 µs at T=4.)
+
+The multithread work threshold (`TK_MT_MIN_WORK = 1<<18`) was swept per dtype
+against this barrier cost and kept as one conservative constant — see the
+rejected list below.
+
 ### Activation dispatch: switch beats a function pointer
 
 Intuition says an indirect `function pointer` avoids the cost of a `switch`.
@@ -255,6 +286,46 @@ disagreed with the theory. Recorded here so they are not re-attempted.
   low-footprint / millions-of-small-calls goal (small layers stay serial and the
   pool sits idle most of the time). The condvar's wake latency is negligible
   against the per-GEMV work above the threshold.
+- **Dynamic atomic-counter chunking** in the pool (fixed-grain chunks handed out
+  from a shared `atomic_int` so fast P-cores drain more than slow E-cores) —
+  measured a real but *narrow* win and dropped. At T=10 on the M4 it recovered
+  the E-core straggler loss on large layers (2048²/4096²: ~6–10% over the static
+  split, best grain ~256 rows: +25%), but (a) it *regressed* small layers ~5–15%
+  (atomic contention + finer dispatch), (b) the auto-grain the pool can pick
+  blindly (~8 chunks/thread) captured only part of the win — the peak needs
+  size-dependent tuning, (c) it breaks the documented **fixed-thread-count
+  bit-reproducibility** of the backward `dx` reduction: each worker's private
+  partial would sum a race-dependent set of rows, so `dx` would vary run-to-run
+  even at pinned `MANTISSA_THREADS`. Decisively, its best case (T=10, ~150
+  GFLOP/s) is still *below* simply running the static split at T=4 (~189): the
+  real lever for the P+E asymmetry is the thread count (see the scaling curve
+  above), not a cleverer load balancer. Static equal chunks stay.
+- **Per-dtype `TK_MT_MIN_WORK`** instead of one constant — swept and rejected in
+  favor of the single conservative `1<<18`. The break-even where threading beats
+  serial tracks the per-element cost: the fast SIMD dtypes (f32/fp16/bf16) break
+  even *near* the current threshold at T=10 (the ~19 µs dispatch ≈ a 512² serial
+  GEMV), while the slow portable-path dtypes (tekin8/e5m2/fp4, ~10× the per-
+  element cost) break even at smaller layers but have large absolute runtimes
+  regardless. One constant is therefore correct for the fast common case and
+  merely *conservative* — never harmful — for the slow types; a dtype-varying
+  threshold adds a moving constant across three consumers (`ops.c` ×2,
+  `backprop.c`) for no common-case gain. Honesty over cleverness.
+- **Row padding for the SIMD tail at odd `in_dim`** (pad each weight row to a
+  multiple of the vector width so the kernel never runs a scalar tail) — the
+  tail is not the cost, so this was dropped. bf16/fp16 GEMV at `in_dim` = 2049 /
+  2050 / 2055 is within noise (±1–3%) of the aligned 2048/2056. float32 *does*
+  show a real ~7–10% penalty at those widths, but it is **row-stride**-driven,
+  not scalar-tail-driven: adding a 4-wide NEON tail step to the kernel did not
+  help, and even `in_dim` = 2049 (a one-element tail) regresses — the penalty is
+  the odd row stride mis-aligning the 4-row-blocked `vld1q_f32` loads and
+  crossing cache lines. The only remedy is caller-side padded row *stride*, which
+  the library cannot impose without copying the whole caller-owned `W` each call
+  (far more than the 7% saved), it bites only float32 (not the narrow-storage
+  headline), and it vanishes once the layer is DRAM-bandwidth bound. Callers who
+  hit it can pad the stride themselves: the public API already accepts a padded
+  `in_dim` with zeroed tail columns and returns bit-consistent results (verified
+  in `bench/bench_layout.c`). `make benchlayout` reproduces the tail, padding,
+  alignment, and cache-residency sweeps.
 
 Two suggestions were already in place: `dW`/`dx` are computed in one pass over
 the weights (no double read), and small layers skip the thread pool via a work

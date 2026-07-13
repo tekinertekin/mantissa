@@ -78,5 +78,22 @@ benchbp: $(SRC) bench/bench_backprop.c
 	$(CC) $(CFLAGS) -o $(BUILD)/bench_backprop $^ $(LDFLAGS)
 	@./$(BUILD)/bench_backprop
 
+# Data-layout / cache harness (SIMD tail, padding, alignment, residency).
+benchlayout: $(SRC) bench/bench_layout.c
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -Isrc -o $(BUILD)/bench_layout $^ $(LDFLAGS)
+	@./$(BUILD)/bench_layout
+
+# Thread-pool scaling harness. benchscale builds the standard binary;
+# benchscale-cross forces TK_MT_MIN_WORK=1 so threading always engages, to map
+# the serial-vs-threaded crossover. Drive thread count via MANTISSA_THREADS.
+benchscale: $(SRC) bench/bench_scaling.c
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -Isrc -o $(BUILD)/bench_scaling $^ $(LDFLAGS)
+
+benchscale-cross: $(SRC) bench/bench_scaling.c
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -Isrc -DTK_MT_MIN_WORK=1 -o $(BUILD)/bench_scaling_cross $^ $(LDFLAGS)
+
 clean:
 	rm -rf $(BUILD)

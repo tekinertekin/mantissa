@@ -6,6 +6,42 @@ dense layer (4.2M params) unless noted, and are indicative, not absolute.
 
 ---
 
+## Unreleased — thread-pool & data-layout investigation (all-drop)
+
+A measurement pass on two fronts — thread-pool load balancing and SIMD/cache
+data layout — that shipped **no kernel change**: every candidate lost on the
+bench. Recorded because a well-evidenced rejection is worth as much as a merge
+(see DESIGN.md's rejected list for the full teardown).
+
+**Added (tooling only)**
+- `bench/bench_scaling.c` (`make benchscale` / `benchscale-cross`) — GEMV scaling
+  across `MANTISSA_THREADS`, the serial-vs-threaded crossover that locates the
+  `TK_MT_MIN_WORK` payoff, and per-dispatch barrier latency. Interleaved medians.
+- `bench/bench_layout.c` (`make benchlayout`) — SIMD-tail cost vs `in_dim`,
+  zero-padding as remedy, base-pointer alignment, and layer-stack cache
+  residency.
+
+**Measured and rejected**
+- **Dynamic atomic-counter chunking** in the pool: a real but narrow win (T=10
+  large layers +6–10%) that regressed small layers, needed untunable per-size
+  grain, and broke fixed-thread-count reproducibility of the backward `dx`
+  reduction. Its best case still trailed the plain static split at 4 threads —
+  the P+E asymmetry is a thread-count lever, not a load-balancer one.
+- **Per-dtype `TK_MT_MIN_WORK`**: the fast SIMD dtypes break even near the
+  current `1<<18`; the slow portable dtypes only benefit below it but run long
+  regardless. One conservative constant kept.
+- **Row padding for the odd-`in_dim` SIMD tail**: bf16/fp16 tail cost is noise;
+  float32's ~7–10% penalty at 2049/2050/2055 is row-stride-, not tail-, driven
+  (a 4-wide kernel tail did not help) and only fixable by caller-side stride
+  padding, which the API already permits.
+
+**Documented**
+- DESIGN.md scaling curve: bf16 GEMV peaks at ~4 threads (cache-resident) to ~6
+  (DRAM-bound) on the M4's 4P+6E cores, ~2.9–3.1× — bandwidth-bound, and static
+  chunking regresses past the P-core count as E-core stragglers hold the barrier.
+
+---
+
 ## v0.1.12 — 2026-07-12  (tag `v0.1.12`)
 
 First true GEMM: batch inference stops re-streaming the weight matrix.
