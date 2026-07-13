@@ -45,4 +45,20 @@ TK_API void tk_conv2d_backward_f32(const float *X, const float *K, const float *
                                    int out_c, int kh, int kw,
                                    int stride, int pad, int act);
 
+/* Max pooling forward, no padding, FLOOR semantics: out = (in - pool)/stride
+ * + 1, so a ragged right/bottom edge narrower than the window is dropped.
+ *   Y      : n x c x oh x ow
+ *   argmax : same shape, int32: flat index (h*in_w + w) of the winner within
+ *            its channel plane -- exactly what the backward scatter needs. */
+TK_API void tk_maxpool2d_f32(const float *X, float *Y, int32_t *argmax,
+                             int n, int c, int in_h, int in_w,
+                             int pool, int stride);
+
+/* Max pooling backward: zeroes dX (callee-side), then scatters dY through
+ * argmax. Overlapping windows (stride < pool) accumulate. */
+TK_API void tk_maxpool2d_backward_f32(const float *dY, const int32_t *argmax,
+                                      float *dX,
+                                      int n, int c, int in_h, int in_w,
+                                      int out_h, int out_w);
+
 #endif /* MANTISSA_CONV_H */

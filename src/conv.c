@@ -424,3 +424,48 @@ void tk_conv2d_backward_f32(const float *X, const float *K, const float *Z,
     }
     free(cols); free(part);
 }
+
+void tk_maxpool2d_f32(const float *X, float *Y, int32_t *argmax,
+                      int n, int c, int in_h, int in_w,
+                      int pool, int stride) {
+    /* Floor semantics, no padding: a ragged right/bottom edge narrower than
+     * the window is dropped (documented in conv.h). */
+    const int oh = tk_conv2d_out_dim(in_h, pool, stride, 0);
+    const int ow = tk_conv2d_out_dim(in_w, pool, stride, 0);
+    if (n <= 0 || c <= 0 || oh <= 0 || ow <= 0) return;
+    const size_t planes = (size_t)n * c;
+    for (size_t pl = 0; pl < planes; pl++) {
+        const float *restrict xp = X + pl * (size_t)in_h * in_w;
+        float *restrict yp = Y + pl * (size_t)oh * ow;
+        int32_t *restrict ap = argmax + pl * (size_t)oh * ow;
+        for (int oy = 0; oy < oh; oy++)
+            for (int ox = 0; ox < ow; ox++) {
+                const int iy0 = oy * stride, ix0 = ox * stride;
+                int best = iy0 * in_w + ix0;
+                float m = xp[best];
+                for (int py = 0; py < pool; py++) {
+                    const int base = (iy0 + py) * in_w + ix0;
+                    for (int px = 0; px < pool; px++)
+                        if (xp[base + px] > m) { m = xp[base + px]; best = base + px; }
+                }
+                yp[(size_t)oy * ow + ox] = m;
+                ap[(size_t)oy * ow + ox] = (int32_t)best;
+            }
+    }
+}
+
+void tk_maxpool2d_backward_f32(const float *dY, const int32_t *argmax,
+                               float *dX,
+                               int n, int c, int in_h, int in_w,
+                               int out_h, int out_w) {
+    if (n <= 0 || c <= 0 || in_h <= 0 || in_w <= 0) return;
+    const size_t planes = (size_t)n * c, opix = (size_t)out_h * out_w;
+    memset(dX, 0, planes * (size_t)in_h * in_w * sizeof(float));
+    if (out_h <= 0 || out_w <= 0) return;
+    for (size_t pl = 0; pl < planes; pl++) {
+        const float *restrict dyp = dY + pl * opix;
+        const int32_t *restrict ap = argmax + pl * opix;
+        float *restrict dxp = dX + pl * (size_t)in_h * in_w;
+        for (size_t i = 0; i < opix; i++) dxp[ap[i]] += dyp[i];
+    }
+}
