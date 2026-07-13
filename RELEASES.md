@@ -6,12 +6,33 @@ dense layer (4.2M params) unless noted, and are indicative, not absolute.
 
 ---
 
-## Unreleased — thread-pool & data-layout investigation (all-drop)
+## v0.1.13 — 2026-07-13  (tag `v0.1.13`)
 
-A measurement pass on two fronts — thread-pool load balancing and SIMD/cache
-data layout — that shipped **no kernel change**: every candidate lost on the
-bench. Recorded because a well-evidenced rejection is worth as much as a merge
-(see DESIGN.md's rejected list for the full teardown).
+The fridge-clearing release: five parallel investigation lanes closed —
+three shipped, two buried with evidence. Plus pip wheels on every release
+from here on.
+
+**Added**
+- **Prebuilt wheels + sdist on every release tag**: Linux x86-64
+  (manylinux_2_28 + auditwheel), macOS arm64 (platform tag pinned —
+  unpinned bdist_wheel over-claims universal2 with an arm64-only dylib),
+  Windows via MinGW (non-blocking until CI proves it). Fixed the sdist
+  being uncompilable (MANIFEST.in shipped src/*.c but not src/pool.h).
+- **`Mantissa.prepare()` / `Prepared`** — resident narrow-weight inference
+  from Python: quantize a layer once (half the weight bytes at bf16),
+  narrow only x per call, run the SIMD kernel. 2.3x at 64x64, 7x at
+  256x256, 16-35x at 1024x1024 over `linear_forward`; bit-identical to
+  `tk_linear_forward`. One instance per thread.
+- **x86-64 kernel parity** (authoritative numbers pending the new CI bench
+  step; Rosetta-indicative locally): two `__m256` FMA chains per row in
+  `tk__dot4_avx2` (f32 GEMV +23% indicative), and a runtime-dispatched
+  **AVX2+F16C fp16 kernel** so default portable builds get hardware fp16
+  conversion (6.7x indicative). 10-12 of 16 YMM, zero spills — depth-16
+  would spill, which is where x86 stops vs arm64's 32 registers.
+
+**Thread-pool & data-layout investigation (all-drop on kernel code)** — every
+candidate lost on the bench; recorded because a well-evidenced rejection is
+worth as much as a merge (full teardown in DESIGN.md's rejected list).
 
 **Added (tooling only)**
 - `bench/bench_scaling.c` (`make benchscale` / `benchscale-cross`) — GEMV scaling
@@ -39,9 +60,6 @@ bench. Recorded because a well-evidenced rejection is worth as much as a merge
 - DESIGN.md scaling curve: bf16 GEMV peaks at ~4 threads (cache-resident) to ~6
   (DRAM-bound) on the M4's 4P+6E cores, ~2.9–3.1× — bandwidth-bound, and static
   chunking regresses past the P-core count as E-core stragglers hold the barrier.
----
-
-## v0.1.13 — unreleased
 
 The optimizer step gets the kernel treatment: integer stochastic rounding and
 a NEON bf16 requantizing store. Seeded weight trajectories are bit-identical
