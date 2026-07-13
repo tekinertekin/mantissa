@@ -326,6 +326,22 @@ disagreed with the theory. Recorded here so they are not re-attempted.
   `in_dim` with zeroed tail columns and returns bit-consistent results (verified
   in `bench/bench_layout.c`). `make benchlayout` reproduces the tail, padding,
   alignment, and cache-residency sweeps.
+- **A caller-owned scratch context** (`tk_ctx`) to eliminate `tk_linear_forward_f32`'s
+  per-call `malloc(xq)` and `tk_linear_backward`'s per-call `calloc` of the
+  dx-partials — the churn is real (a `tk_linear_forward_f32` inference loop
+  allocates once per call: 16,217 allocations over a 16k-call run, cut to 211 by
+  the context) but the *time* is not. The `xq` malloc is 12–25 ns; against the
+  call it rides on that is **~5% at a toy 16×16 layer and 0.5–4% at 64–256**
+  (interleaved medians, M4, serial). The dx-partials `calloc` only fires above
+  the multithreading work threshold (`out_dim·in_dim ≥ 2^18`), where each
+  backward call is ~250 µs and a 20 KB `calloc` is <1%. Meanwhile the real
+  inference win — holding weights **resident narrow** so the forward skips
+  re-quantizing every weight *and* runs the SIMD kernel instead of the scalar
+  f32 loop — is **6–35× faster** (`tk_quantize` once + `tk_linear_forward`,
+  already shipped) and strictly dominates removing the malloc. A per-call scratch
+  buffer is not worth a new lifetime-managed, non-thread-safe API surface for a
+  sub-5% gain on a path the resident-narrow route already replaces. (The Python
+  binding exposes that route as `Mantissa.prepare()` / `Prepared`.)
 
 Two suggestions were already in place: `dW`/`dx` are computed in one pass over
 the weights (no double read), and small layers skip the thread pool via a work

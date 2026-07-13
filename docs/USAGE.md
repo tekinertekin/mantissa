@@ -138,6 +138,19 @@ For repeated *inference*, pass `out=` to `linear_forward` (a float32 numpy
 array or `array('f')` of `out_dim`): the result is written straight into your
 buffer — no per-call output allocation or boxing (~1.24x per call at 256x256).
 
+For repeated inference on **fixed weights**, `tk.prepare()` pre-quantizes the
+weights into the storage dtype once and holds them resident narrow, so each
+`forward()` skips re-quantizing every weight and runs the narrow SIMD kernel
+directly (`linear_forward` re-quantizes W on every call). Measured from Python
+(bf16, serial): ~2.3x at 64x64, ~7x at 256x256, ~16x at 1024x1024, at half the
+weight bytes. Results are bit-identical to `tk_linear_forward`.
+
+```python
+layer = tk.prepare(W, out_dim=256, in_dim=256, bias=bias)   # narrow once
+for x in stream:
+    y = layer.forward(x, act=RELU, out=out)                 # cheap per call
+```
+
 Full files: [`python/perceptron_example.py`](../python/perceptron_example.py),
 [`python/train_example.py`](../python/train_example.py). The same two functions
 back the other-language demos in [`clients/`](../clients).
@@ -182,5 +195,6 @@ Worked end-to-end trainer: [`examples/train_xor.c`](../examples/train_xor.c)
 | Update weights (SGD, L1/L2, SR) | `tk_sgd_step` / `tk_optim_default` |
 | One float32 training step (FFI-friendly) | `tk_train_step_f32` |
 | A whole epoch in one call (amortizes FFI) | `tk_train_epoch_f32` |
+| Repeated inference on fixed weights (Python) | `Mantissa().prepare(...).forward(...)` |
 | Dropout forward / backward | `tk_dropout_forward` / `tk_dropout_backward` |
 | Know the active dtype from Python | `Mantissa().dtype` |

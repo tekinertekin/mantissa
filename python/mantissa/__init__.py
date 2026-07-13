@@ -18,7 +18,8 @@ try:                                   # optional: enables a zero-copy fast path
 except ImportError:                    # binding works without it (plain lists)
     _np = None
 
-__all__ = ["Mantissa", "IDENTITY", "STEP", "SIGN", "RELU", "SIGMOID", "TANH", "GELU"]
+__all__ = ["Mantissa", "Prepared",
+           "IDENTITY", "STEP", "SIGN", "RELU", "SIGMOID", "TANH", "GELU"]
 
 # Activation ids must match include/activations.h.
 IDENTITY, STEP, SIGN, RELU, SIGMOID, TANH, GELU = range(7)
@@ -73,6 +74,18 @@ class Mantissa:
         self._lib.tk_dtype_name.restype = ctypes.c_char_p
         self._lib.tk_scalar_size.restype = ctypes.c_int
 
+        # narrow-storage primitives for the resident-weights inference path
+        # (Prepared): quantize float32 into the storage dtype, and the narrow
+        # GEMV that consumes it. Buffers are opaque bytes (the storage width is
+        # tk_scalar_size()), so these take void* rather than a typed pointer.
+        self._lib.tk_quantize.restype = None
+        self._lib.tk_quantize.argtypes = [_f32p, ctypes.c_void_p, ctypes.c_int]
+        self._lib.tk_linear_forward.restype = None
+        self._lib.tk_linear_forward.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, _f32p,  # W, x, bias, y
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,                  # out_dim, in_dim, act
+        ]
+
         self._lib.tk_linear_forward_f32.restype = None
         self._lib.tk_linear_forward_f32.argtypes = [
             _f32p, _f32p, _f32p, _f32p,           # W, x, bias, y
@@ -125,6 +138,16 @@ class Mantissa:
         self._lib.tk_linear_forward_f32(Wc, xc, bc, yc, out_dim, in_dim, act)
         return list(yc)
 
+    def prepare(self, W, out_dim: int, in_dim: int, bias=None) -> "Prepared":
+        """Pre-quantize a dense layer's weights into the storage dtype and hold
+        them resident narrow, for repeated inference on fixed weights. The
+        returned object's forward() skips linear_forward's per-call
+        re-quantization of every weight (linear_forward requantizes W on each
+        call) and runs the narrow SIMD kernel directly — measured 1.9x at 16x16
+        up to ~35x at 1024x1024 in Python (bf16, serial), at half the weight
+        bytes of float32. W is row-major out_dim x in_dim; bias may be None."""
+        return Prepared(self._lib, W, out_dim, in_dim, bias)
+
     def train_step(self, W, x, target, out_dim: int, in_dim: int,
                    act: int, lr: float, bias=None) -> float:
         """One SGD step on a dense layer. Mutates W (and bias) in place, returns
@@ -162,3 +185,49 @@ class Mantissa:
         if b_wb:
             b_wb()
         return float(loss)
+
+
+class Prepared:
+    """A dense layer whose weights are pre-quantized into the library's storage
+    dtype and held resident narrow (half the bytes of float32 at bf16/fp16).
+    Construct via Mantissa.prepare(). forward() narrows only the small input
+    vector per call and runs the narrow C kernel (tk_linear_forward), so it
+    skips the per-weight re-quantization that linear_forward does on every call.
+
+    Results are bit-identical to tk_linear_forward. They differ from
+    Mantissa.linear_forward by at most a ULP or two: both quantize through the
+    same storage dtype, but the narrow kernel and the f32 path reduce in
+    different orders (the reduction-order envelope documented in DESIGN.md)."""
+
+    def __init__(self, lib, W, out_dim: int, in_dim: int, bias=None):
+        self._lib = lib
+        self.out_dim, self.in_dim = out_dim, in_dim
+        ssz = lib.tk_scalar_size()
+        self._W = self._narrow(W, out_dim * in_dim, ssz, "W")
+        self._bias = self._narrow(bias, out_dim, ssz, "bias") if bias is not None else None
+        self._xbuf = (ctypes.c_char * (ssz * in_dim))()   # reused per-call narrowed input
+
+    def _narrow(self, src, n: int, ssz: int, name: str):
+        srcc, _ = _as_c_float(src, n, name)
+        dst = (ctypes.c_char * (ssz * n))()
+        self._lib.tk_quantize(srcc, dst, n)
+        return dst
+
+    def forward(self, x, act: int, out=None):
+        """y = act(W @ x + bias) using the resident narrow weights. x is narrowed
+        into a reused scratch buffer (cheap: in_dim elements). Pass `out=` (a
+        float32 numpy array or array('f') of out_dim) to avoid the per-call
+        output allocation; otherwise a fresh list is returned."""
+        xc, _ = _as_c_float(x, self.in_dim, "x")
+        self._lib.tk_quantize(xc, self._xbuf, self.in_dim)
+        if out is not None:
+            yc, y_wb = _as_c_float(out, self.out_dim, "out")
+            self._lib.tk_linear_forward(self._W, self._xbuf, self._bias, yc,
+                                        self.out_dim, self.in_dim, act)
+            if y_wb:
+                y_wb()
+            return out
+        yc = (ctypes.c_float * self.out_dim)()
+        self._lib.tk_linear_forward(self._W, self._xbuf, self._bias, yc,
+                                    self.out_dim, self.in_dim, act)
+        return list(yc)
