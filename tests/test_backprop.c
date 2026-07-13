@@ -144,12 +144,16 @@ static void test_dropout(void) {
     /* Dropout: rate 0 = identity, rate 1 = all-zero without NaN, backward
      * mirrors the forward mask, and a seed fully determines the mask. */
     enum { N = 64 };
-    float y[N], y2[N], dy[N]; uint8_t m[N], m2[N];
+    float y[N], y2[N], dy[N], want0[N]; uint8_t m[N], m2[N];
     tk_rng r = tk_rng_seed(11);
-    for (int i = 0; i < N; i++) y[i] = 1.0f + 0.01f * (float)i;
+    /* Compute the expected values ONCE and compare against the stored copies:
+     * writing the same expression twice lets the compiler FMA-contract one
+     * instance and not the other (a 1-ULP mismatch under -ffp-contract=fast,
+     * seen with ASAN codegen on arm64). */
+    for (int i = 0; i < N; i++) { want0[i] = 1.0f + 0.01f * (float)i; y[i] = want0[i]; }
     tk_dropout_forward(y, m, N, 0.0f, &r);
     int ok = 1;
-    for (int i = 0; i < N; i++) ok &= (m[i] == 1) && (y[i] == 1.0f + 0.01f * (float)i);
+    for (int i = 0; i < N; i++) ok &= (m[i] == 1) && (y[i] == want0[i]);
     check_ok(ok, "dropout rate=0 is the identity");
 
     for (int i = 0; i < N; i++) y[i] = 1.0f;

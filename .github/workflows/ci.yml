@@ -39,10 +39,9 @@ jobs:
 
   # AddressSanitizer + UndefinedBehaviorSanitizer so memory/UB bugs regress
   # loudly. One storage format (DTYPE=2) plus the backprop check is enough.
-  # Flags mirror the Makefile except -ffp-contract=fast is dropped: a sanitizer
-  # build targets memory/UB, not FP numerics, and fast contraction reorders
-  # multiply-adds enough to trip the exact-equality dropout assertion under
-  # ASAN codegen (a 1-ULP false alarm, not a real defect).
+  # Flags mirror the Makefile exactly, -ffp-contract=fast included (the dropout
+  # test that was 1-ULP fragile under contraction now stores its expected
+  # values once instead of recomputing the expression).
   sanitizer:
     runs-on: ubuntu-latest
     steps:
@@ -50,7 +49,7 @@ jobs:
       - name: ASAN + UBSAN (forward, DTYPE=2)
         run: |
           mkdir -p build
-          cc -O3 -funroll-loops -Wall -Wextra -std=c11 \
+          cc -O3 -funroll-loops -ffp-contract=fast -Wall -Wextra -std=c11 \
              -Iinclude -DTK_DTYPE=2 -fvisibility=hidden -pthread \
              -fsanitize=address,undefined -fno-omit-frame-pointer -g \
              -o build/test_dtypes_san \
@@ -59,7 +58,7 @@ jobs:
           ./build/test_dtypes_san
       - name: ASAN + UBSAN (back-propagation)
         run: |
-          cc -O3 -funroll-loops -Wall -Wextra -std=c11 \
+          cc -O3 -funroll-loops -ffp-contract=fast -Wall -Wextra -std=c11 \
              -Iinclude -DTK_DTYPE=0 -pthread \
              -fsanitize=address,undefined -fno-omit-frame-pointer -g \
              -o build/test_backprop_san \
