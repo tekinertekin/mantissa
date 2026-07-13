@@ -18,7 +18,7 @@ try:                                   # optional: enables a zero-copy fast path
 except ImportError:                    # binding works without it (plain lists)
     _np = None
 
-__all__ = ["Mantissa", "Prepared", "Trainer",
+__all__ = ["Mantissa", "Prepared", "Trainer", "Session",
            "IDENTITY", "STEP", "SIGN", "RELU", "SIGMOID", "TANH", "GELU"]
 
 # Activation ids must match include/activations.h.
@@ -501,6 +501,138 @@ class Mantissa:
         self._lib.tk_sgd_update_f32(Wc, dWc, n, lr)
         if W_wb:
             W_wb()
+
+    def session(self) -> "Session":
+        """An identity-memoized view of the CNN-primitive methods for
+        training loops over fixed buffers — see Session."""
+        return Session(self)
+
+
+class Session:
+    """The CNN-primitive methods with identity-memoized pointers: same
+    signatures, same semantics, but each distinct array's ctypes pointer is
+    derived once and reused for as long as the same object keeps arriving
+    (a memo hit is a dict lookup plus an `is` check, not a numpy `.ctypes`
+    walk — the walk costs ~1.3 µs and the Trainer work showed it dominating
+    small-op calls).
+
+    Built for the mantissa-cnn training-loop shape: parameters, scratch and
+    staging buffers are allocated once per fit and refilled in place, so
+    after the first batch every call here is pure FFI. Measured on the
+    LeNet-5/MNIST fit (M4): pointer conversion was ~12% of wall time
+    (16.8k conversions); a Session removes almost all of it.
+
+    The memo holds a strong reference to every array it has seen — that is
+    exactly what keeps the `id()` keys valid — so create one Session per
+    model, not a process-global one. Buffers must be C-contiguous numpy
+    arrays (float32; int32 for argmax/labels): the zero-copy requirement is
+    the point, so anything else raises instead of silently copying."""
+
+    def __init__(self, tk: "Mantissa"):
+        self._tk = tk
+        self._lib = tk._lib
+        self._fmemo = {}
+        self._imemo = {}
+
+    def _fp(self, arr, n: int, name: str):
+        hit = self._fmemo.get(id(arr))
+        if hit is not None and hit[0] is arr:
+            return hit[1]
+        p = _bind_c_float(arr, n, name)
+        self._fmemo[id(arr)] = (arr, p)
+        return p
+
+    def _ip(self, arr, n: int, name: str):
+        hit = self._imemo.get(id(arr))
+        if hit is not None and hit[0] is arr:
+            return hit[1]
+        if not (_np is not None and isinstance(arr, _np.ndarray)
+                and arr.dtype == _np.int32 and arr.flags["C_CONTIGUOUS"]):
+            raise TypeError(f"{name}: Session needs a C-contiguous int32 "
+                            f"numpy array")
+        if arr.size != n:
+            raise ValueError(f"{name}: expected {n} int32 values, got {arr.size}")
+        p = arr.ctypes.data_as(_i32p)
+        self._imemo[id(arr)] = (arr, p)
+        return p
+
+    def conv2d_out_dim(self, in_dim: int, k: int, stride: int, pad: int) -> int:
+        return self._tk.conv2d_out_dim(in_dim, k, stride, pad)
+
+    def conv2d_forward(self, X, K, bias, Z, Y, n, in_c, in_h, in_w,
+                       out_c, kh, kw, stride, pad, act):
+        oh = self.conv2d_out_dim(in_h, kh, stride, pad)
+        ow = self.conv2d_out_dim(in_w, kw, stride, pad)
+        ysz = n * out_c * oh * ow
+        self._lib.tk_conv2d_forward_f32(
+            self._fp(X, n * in_c * in_h * in_w, "X"),
+            self._fp(K, out_c * in_c * kh * kw, "K"),
+            self._fp(bias, out_c, "bias") if bias is not None else None,
+            self._fp(Z, ysz, "Z") if Z is not None else None,
+            self._fp(Y, ysz, "Y"),
+            n, in_c, in_h, in_w, out_c, kh, kw, stride, pad, act)
+        return Y
+
+    def conv2d_backward(self, X, K, Z, dY, dK, db, dX, n, in_c, in_h, in_w,
+                        out_c, kh, kw, stride, pad, act):
+        oh = self.conv2d_out_dim(in_h, kh, stride, pad)
+        ow = self.conv2d_out_dim(in_w, kw, stride, pad)
+        ysz = n * out_c * oh * ow
+        xsz = n * in_c * in_h * in_w
+        ksz = out_c * in_c * kh * kw
+        self._lib.tk_conv2d_backward_f32(
+            self._fp(X, xsz, "X"), self._fp(K, ksz, "K"),
+            self._fp(Z, ysz, "Z"), self._fp(dY, ysz, "dY"),
+            self._fp(dK, ksz, "dK"),
+            self._fp(db, out_c, "db") if db is not None else None,
+            self._fp(dX, xsz, "dX") if dX is not None else None,
+            n, in_c, in_h, in_w, out_c, kh, kw, stride, pad, act)
+
+    def maxpool2d(self, X, Y, argmax, n, c, in_h, in_w, pool, stride):
+        oh = self.conv2d_out_dim(in_h, pool, stride, 0)
+        ow = self.conv2d_out_dim(in_w, pool, stride, 0)
+        ysz = n * c * oh * ow
+        self._lib.tk_maxpool2d_f32(
+            self._fp(X, n * c * in_h * in_w, "X"), self._fp(Y, ysz, "Y"),
+            self._ip(argmax, ysz, "argmax"), n, c, in_h, in_w, pool, stride)
+        return Y
+
+    def maxpool2d_backward(self, dY, argmax, dX, n, c, in_h, in_w,
+                           out_h, out_w):
+        ysz = n * c * out_h * out_w
+        self._lib.tk_maxpool2d_backward_f32(
+            self._fp(dY, ysz, "dY"), self._ip(argmax, ysz, "argmax"),
+            self._fp(dX, n * c * in_h * in_w, "dX"),
+            n, c, in_h, in_w, out_h, out_w)
+
+    def linear_forward_batch(self, W, X, bias, Z, Y, n, out_dim, in_dim, act):
+        self._lib.tk_linear_forward_batch_f32(
+            self._fp(W, out_dim * in_dim, "W"), self._fp(X, n * in_dim, "X"),
+            self._fp(bias, out_dim, "bias") if bias is not None else None,
+            self._fp(Z, n * out_dim, "Z") if Z is not None else None,
+            self._fp(Y, n * out_dim, "Y"), n, out_dim, in_dim, act)
+        return Y
+
+    def linear_backward_batch(self, W, X, Z, dY, dW, db, dX, n,
+                              out_dim, in_dim, act):
+        self._lib.tk_linear_backward_batch_f32(
+            self._fp(W, out_dim * in_dim, "W"), self._fp(X, n * in_dim, "X"),
+            self._fp(Z, n * out_dim, "Z"), self._fp(dY, n * out_dim, "dY"),
+            self._fp(dW, out_dim * in_dim, "dW"),
+            self._fp(db, out_dim, "db") if db is not None else None,
+            self._fp(dX, n * in_dim, "dX") if dX is not None else None,
+            n, out_dim, in_dim, act)
+
+    def softmax_xent(self, logits, labels, dlogits, n, classes) -> float:
+        loss = self._lib.tk_softmax_xent_f32(
+            self._fp(logits, n * classes, "logits"),
+            self._ip(labels, n, "labels"),
+            self._fp(dlogits, n * classes, "dlogits"), n, classes)
+        return float(loss)
+
+    def sgd_update(self, W, dW, n, lr):
+        self._lib.tk_sgd_update_f32(self._fp(W, n, "W"),
+                                    self._fp(dW, n, "dW"), n, lr)
 
 
 class Trainer:

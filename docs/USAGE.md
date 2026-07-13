@@ -183,6 +183,14 @@ for epoch in range(100):
         break
 ```
 
+The CNN-primitive family has the same pattern one level up: `tk.session()`
+returns a view with identical method signatures whose pointer conversions are
+memoized by array identity — built for training loops where parameters and
+scratch are allocated once and refilled in place (the mantissa-cnn shape).
+Measured on a LeNet-5/MNIST fit (M4): pointer conversion was ~12% of wall
+time; the session removes it (268 → 234 ms end to end). One session per
+model — the memo pins its arrays alive.
+
 For repeated *inference*, pass `out=` to `linear_forward` (a float32 numpy
 array or `array('f')` of `out_dim`): the result is written straight into your
 buffer — no per-call output allocation or boxing (~1.24x per call at 256x256).
