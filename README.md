@@ -198,7 +198,9 @@ work threshold) so the pool never hurts the millions-of-small-calls case; set
 | tekin8   | 3.04 |  4.14 |  321 |
 
 **Activation dispatch** (4M elements): a per-element `switch` beats a resolved
-function pointer ~7× for `relu` and ~1.5× for `sigmoid`. The inline `switch`
+function pointer ~7× for `relu` and ~1.5× for `sigmoid` on Apple Silicon —
+on the x86 CI runner the gap shrinks to ≤1.2× (parity on some cases), so the
+win is real but platform-dependent. The inline `switch`
 vectorizes (`relu` compiles to a single `fmax` per lane); an indirect call per
 element does not. So `tk_activate` keeps the `switch`, and the function-pointer
 API (`tk_act_resolve`) is reserved for genuinely pluggable dispatch. The

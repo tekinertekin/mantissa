@@ -156,7 +156,11 @@ four `__m256` accumulators; bfloat16 widened with `_mm256_cvtepu16_epi32` +
 `__attribute__((target("avx2,fma")))` and dispatched at runtime with
 `__builtin_cpu_supports`, so a single portable binary uses AVX2 where the CPU
 has it and falls back to the scalar loop on older chips — no build flags, no
-separate binaries. `tekin8`'s E4M3 unpack does not map to a single widening
+separate binaries. Authoritative CI numbers (GitHub ubuntu runner, medians of 5): f32 GEMV
+45.8 GFLOP/s, bf16 50.8, fp16 63.2 with the runtime-dispatched AVX2+F16C
+kernel — fp16 is the fastest storage dtype on that machine, and its batch
+GEMM hits 119 GFLOP/s vs bf16's 72 (`VCVTPH2PS` widens cheaper than the
+bf16 zext+shift sequence there). `tekin8`'s E4M3 unpack does not map to a single widening
 instruction, so it stays on the portable path on both architectures.
 
 **Multithreading.** A dense layer's output rows are independent, so
@@ -227,7 +231,9 @@ rejected list below.
 
 Intuition says an indirect `function pointer` avoids the cost of a `switch`.
 The benchmark says otherwise: applying an activation element-wise, the inline
-`switch` runs ~7× faster than a resolved pointer for `relu`. Reason — the
+`switch` runs ~7× faster than a resolved pointer for `relu` on Apple Silicon
+(the x86 CI runner shows ≤1.2× — the branch-predictor/vectorization economics
+are platform-dependent). Reason — the
 `switch` body inlines and the loop **vectorizes**; an indirect call per element
 is opaque to the vectorizer and pays call overhead each iteration. So
 `tk_activate` uses the `switch`, and `tk_act_resolve()` (the pointer table) is

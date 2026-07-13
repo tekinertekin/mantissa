@@ -23,12 +23,16 @@ from here on.
   narrow only x per call, run the SIMD kernel. 2.3x at 64x64, 7x at
   256x256, 16-35x at 1024x1024 over `linear_forward`; bit-identical to
   `tk_linear_forward`. One instance per thread.
-- **x86-64 kernel parity** (authoritative numbers pending the new CI bench
-  step; Rosetta-indicative locally): two `__m256` FMA chains per row in
-  `tk__dot4_avx2` (f32 GEMV +23% indicative), and a runtime-dispatched
-  **AVX2+F16C fp16 kernel** so default portable builds get hardware fp16
-  conversion (6.7x indicative). 10-12 of 16 YMM, zero spills — depth-16
-  would spill, which is where x86 stops vs arm64's 32 registers.
+- **x86-64 kernel parity**, now with authoritative CI numbers (GitHub
+  ubuntu runner, medians of 5): two `__m256` FMA chains per row in
+  `tk__dot4_avx2`, and a runtime-dispatched **AVX2+F16C fp16 kernel** so
+  default portable builds get hardware fp16 conversion. Measured on real
+  x86: f32 GEMV 45.8 GFLOP/s, bf16 50.8, **fp16 63.2 — the fastest
+  storage dtype on that machine** (fp16 batch GEMM: 119 GFLOP/s vs bf16's
+  72; VCVTPH2PS beats the bf16 zext+shift widen there). 10-12 of 16 YMM,
+  zero spills — depth-16 would spill, which is where x86 stops vs
+  arm64's 32 registers. The before/after deltas (+23% f32, 6.7x fp16)
+  remain Rosetta-indicative — the old kernels never ran on CI.
 
 **Thread-pool & data-layout investigation (all-drop on kernel code)** — every
 candidate lost on the bench; recorded because a well-evidenced rejection is
