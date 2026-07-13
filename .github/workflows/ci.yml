@@ -50,12 +50,17 @@ jobs:
       # logged per dtype to read a median from, not a single run.
       - name: GEMV/GEMM bench (x86, informational)
         if: matrix.os == 'ubuntu-latest'
+        # Mirrored into the public step summary so the numbers are readable
+        # without authenticated log access.
         run: |
-          for d in 0 1 2; do
-            echo "==== DTYPE=$d (5 interleaved repeats) ===="
-            make DTYPE=$d bench || true                 # builds build/benchmark + repeat 1
-            for r in 2 3 4 5; do ./build/benchmark || true; done
-          done
+          {
+            for d in 0 1 2; do
+              echo "==== DTYPE=$d (5 interleaved repeats) ===="
+              make DTYPE=$d bench || true               # builds build/benchmark + repeat 1
+              for r in 2 3 4 5; do ./build/benchmark || true; done
+            done
+          } | tee bench_out.txt
+          { echo '## x86 GEMV/GEMM bench'; echo '```'; cat bench_out.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
   # AddressSanitizer + UndefinedBehaviorSanitizer so memory/UB bugs regress
   # loudly. One storage format (DTYPE=2) plus the backprop check is enough.
