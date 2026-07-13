@@ -34,6 +34,7 @@ SOURCES = [
     "src/loss.c",
     "src/backprop.c",
     "src/pool.c",
+    "src/conv.c",
 ]
 
 DTYPE = os.environ.get("MANTISSA_DTYPE", "2")   # 2 = bfloat16 (Makefile default)

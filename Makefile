@@ -17,7 +17,7 @@ CFLAGS  := -O3 -funroll-loops -ffp-contract=fast -Wall -Wextra -std=c11 \
            -Iinclude -DTK_DTYPE=$(DTYPE) -fvisibility=hidden -pthread
 LDFLAGS := -lm -pthread
 
-SRC     := src/dtypes.c src/activations.c src/ops.c src/loss.c src/backprop.c src/pool.c
+SRC     := src/dtypes.c src/activations.c src/ops.c src/loss.c src/backprop.c src/pool.c src/conv.c
 BUILD   := build
 
 UNAME_S := $(shell uname -s)
