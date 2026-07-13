@@ -281,6 +281,30 @@ disagreed with the theory. Recorded here so they are not re-attempted.
   hand-written NEON/AVX2 kernel rather than the auto-vectorizer. Fix shipped:
   the pristine serial loop lives in its own pool-free function and a thin
   wrapper dispatches — isolation wins over elegance.
+- **Non-temporal (streaming) stores for `dW`** in the backward pass — the
+  theory says a write-only 16 MB gradient stream should bypass the cache; the
+  consumer analysis says the opposite: in the real training loop `tk_sgd_step`
+  reads `dW` immediately after `tk_linear_backward`, so evicting it buys a DRAM
+  round-trip. Measured (arm64 `stnp` via inline asm — clang silently drops
+  `__builtin_nontemporal_store`'s hint on a single q register — against a
+  shape-identical `stp` control, interleaved medians): **38% slower** on the
+  backward alone (M4's LLC absorbs the write stream that NT forces out) and no
+  better chained with the SGD consumer. A cautionary footnote: the first cold,
+  non-interleaved run showed NT "faster" — DVFS lying exactly as the benchmark
+  header warns.
+- **Software-pipelining `tk_train_step_f32`** (fusing row *o*'s SGD update with
+  row *o+1*'s forward dot so the store and load streams overlap) — **+6% measured
+  (0.994 → 0.935 ms/pass), rejected on numerics**. The W-traffic theory was
+  already void: a 8 KB row is L1-resident between its dot and its update, so
+  DRAM traffic is 1R+1W either way and the win is only ILP overlap. The
+  disqualifier: per-row *source* order can be preserved exactly, but the
+  baseline's rounding on this path is not a function of source order —
+  `-O3 -funroll-loops -ffp-contract=fast` contracts the same `s += w*x` into
+  `fmla` in the 4-wide loop, *unfused* `fmul`+`fadd` in the 16-wide unrolled
+  block, and `fmadd` in the scalar tail, and the fused loop shifts which
+  variant runs for which `in_dim` (observed: 1-ULP `dz` divergence at
+  `in_dim % 4 == 3`, bit-identical at 1024/2048). Any restructuring of this
+  function moves weight trajectories at *some* shape; +6% does not buy that.
 - **Spin-wait in the thread pool** instead of the condvar barrier — declined:
   it would burn CPU on idle workers, which directly contradicts the
   low-footprint / millions-of-small-calls goal (small layers stay serial and the
@@ -399,11 +423,34 @@ matching the forward pass.
 of `w - lr·g` discards any update below the type's ULP, so with a small learning
 rate training silently stalls. SR rounds to the neighbouring grid point with
 probability equal to the fractional distance, so an update of ⅓ ULP moves the
-weight ⅓ of the time — correct in expectation. `tk_sr_from_float` derives the
-ULP from the value's binade and `TK_MANT_BITS`, rounds onto the grid, and the
-final `TK_FROM_FLOAT` is then exact. This is what lets `make train` learn XOR in
-bfloat16 without an fp32 master weight copy; on float32/tekin32 it is a no-op.
-It is the same mechanism used for FP8 weight updates on Hopper/Blackwell.
+weight ⅓ of the time — correct in expectation. `tk_sr_from_float` does this in
+pure bit arithmetic: the storage grid is exactly the float32 patterns whose low
+`k = 23 − TK_MANT_BITS` bits are zero, so adding a uniform random k-bit tail to
+the f32 pattern and truncating rounds up with probability equal to the
+fractional distance — a mantissa carry lands exactly on the next binade's first
+grid point, so the algebra (and the exact unbiasedness proof, in the source
+comment) holds across binade boundaries; the final `TK_FROM_FLOAT` is exact.
+No fdiv/floorf per weight, and the random tail is sign-adjusted so the up/down
+decision — and therefore every seeded weight trajectory — is bit-identical to
+the earlier floor-based implementation (verified exhaustively per exponent for
+all 7 dtypes). Exact unbiasedness is pinned by the ±SR-mean test in
+`tests/test_dtypes.c` across all 7 dtypes. This is what lets `make train` learn
+XOR in bfloat16 without an fp32 master weight copy; on float32/tekin32 it is a
+no-op. It is the same mechanism used for FP8 weight updates on
+Hopper/Blackwell. Two codegen lessons live in the source: the 0/tiny/inf/nan
+guard is one range test routed through a `noinline` helper, because a guard
+that tail-merges into the hot path's `TK_FROM_FLOAT` call gets if-converted and
+parks a csel (the RNG rollback) on the xorshift loop-carried chain — measured
+−12% on bf16, whose SR loop is bound by exactly that chain.
+
+The **plain (non-SR) bf16 update** has a NEON fast path on arm64: the scalar
+loop pays a `tk_float_to_bf16` call per weight — the requantizing store, not
+the FMA, dominates. The kernel widens with a shift, updates with a fused
+`vfmsq` (the same single-rounding `w − lr·g` the scalar `fmsub` computes), and
+narrows in-register with the identical RNE+NaN bit recipe (verified against
+the scalar converter over all 2^32 patterns): 1.34 → 6.1 G weights/s (4.55×,
+interleaved medians), trajectories bit-identical. L1/L2/SR fall back to the
+scalar loop.
 
 `make benchbp` quantifies it on the XOR run (4000 epochs, final loss): in the
 1-byte tekin8, round-to-nearest stalls at 0.249 (never learns) while stochastic

@@ -216,19 +216,23 @@ static void test_batch_forward(void) {
 static void test_sr_unbiased(void) {
     /* Stochastic rounding is unbiased (Gupta et al., 2015): the mean of many
      * independent SR write-backs equals the true value, not the nearest grid
-     * point. w = 1.0 (exact in every format), one SGD step to 1.2. */
-    printf("\nstochastic rounding unbiasedness (1.0 -> 1.2):\n");
+     * point. w = ±1.0 (exact in every format), one SGD step to ±1.2; the
+     * negative mirror exercises SR's sign-magnitude rounding direction. */
+    printf("\nstochastic rounding unbiasedness (+/-1.0 -> +/-1.2):\n");
     enum { TRIALS = 40000 };
     tk_optim opt = { 1.0f, 0.0f, 0.0f, 1 };
     tk_rng r = tk_rng_seed(2024);
-    float g = -0.2f;
-    double acc = 0.0;
-    for (int k = 0; k < TRIALS; k++) {
-        tk_scalar_t w = TK_FROM_FLOAT(1.0f);
-        tk_sgd_step(&w, &g, 1, &opt, &r);
-        acc += (double)TK_TO_FLOAT(w);
+    for (int sign = 1; sign >= -1; sign -= 2) {
+        double acc = 0.0;
+        for (int k = 0; k < TRIALS; k++) {
+            tk_scalar_t w = TK_FROM_FLOAT(sign * 1.0f);
+            float g = sign * -0.2f;
+            tk_sgd_step(&w, &g, 1, &opt, &r);
+            acc += (double)TK_TO_FLOAT(w);
+        }
+        check(sign > 0 ? "SR mean of 40k" : "SR mean of 40k (neg)",
+              (float)(acc / TRIALS), sign * 1.2f, 0.0f, 5e-3f);
     }
-    check("SR mean of 40k", (float)(acc / TRIALS), 1.2f, 0.0f, 5e-3f);
 }
 
 int main(void) {

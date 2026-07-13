@@ -39,6 +39,41 @@ bench. Recorded because a well-evidenced rejection is worth as much as a merge
 - DESIGN.md scaling curve: bf16 GEMV peaks at ~4 threads (cache-resident) to ~6
   (DRAM-bound) on the M4's 4P+6E cores, ~2.9–3.1× — bandwidth-bound, and static
   chunking regresses past the P-core count as E-core stragglers hold the barrier.
+---
+
+## v0.1.13 — unreleased
+
+The optimizer step gets the kernel treatment: integer stochastic rounding and
+a NEON bf16 requantizing store. Seeded weight trajectories are bit-identical
+to v0.1.12 everywhere — SR included.
+
+**Changed**
+- `tk_sr_from_float` — stochastic rounding in pure bit arithmetic: add a
+  random k-bit tail below the storage type's mantissa width to the f32
+  pattern, truncate onto the grid (Gupta et al., 2015). Replaces the
+  fdiv/floorf/compare per weight; exact unbiasedness is argued algebraically
+  in the source comment and pinned by the ±SR-mean test across all 7 dtypes.
+  The tail is sign-adjusted so every up/down decision — and the consumed RNG
+  stream — matches the old implementation bit-for-bit (verified over a dense
+  sweep of every exponent, all 7 dtypes): seeded SR runs reproduce exactly.
+  SR `[sgd_step]`, interleaved medians, 2048×2048: fp16 328 → 359, bf16
+  578 → 584, tekin8/E4M3 259 → 284, fp4 169 → 258 M weights/s
+  (+9%/+1%/+10%/+53% — the narrower the type, the more the removed float ops
+  were the bottleneck; bf16's SR loop is xorshift-latency-bound, see
+  DESIGN.md for the csel-on-the-RNG-chain war story).
+- `tk_sgd_step` (plain SGD, bf16, arm64) — NEON fast path: widen by shift,
+  fused `vfmsq` update, in-register RNE narrowing store (bit-identical to
+  `tk_float_to_bf16` over all 2^32 patterns, exhaustively verified). Kills
+  the per-weight converter call: **1.34 → 6.1 G weights/s (4.55×)**. L1/L2/SR
+  use the scalar loop.
+
+**Measured and rejected** (recorded in DESIGN.md):
+- Non-temporal `stnp` stores for `dW`: 38% slower on backward alone, no gain
+  chained with the `tk_sgd_step` consumer that re-reads `dW` immediately.
+- Software-pipelining `tk_train_step_f32` (update row o fused with dot of row
+  o+1): +6%, but clang's contraction choices already vary per unroll variant
+  on this path, so any restructuring moves some trajectories by 1 ULP at some
+  shapes — rejected to keep f32 training bit-stable.
 
 ---
 
