@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <math.h>
+#include <string.h>
 #include "ops.h"
 #include "loss.h"
 #include "backprop.h"
@@ -201,6 +202,141 @@ static void test_train_epoch_matches_step(void) {
           "train_epoch == per-sample train_step (mean loss %.4f)", mean);
 }
 
+static void test_train_epoch_order(void) {
+    /* tk_train_epoch_order_f32: (a) NULL order/mistakes reproduces
+     * tk_train_epoch_f32 bitwise; (b) an order array is bit-identical to
+     * materializing permuted copies of X/targets (the pattern it replaces);
+     * (c) the mistake probe changes the count output, never the trajectory.
+     * ID=7 (in_dim%4==3) is the unroll-variant shape DESIGN.md flags. */
+    enum { NS = 9, OD = 2, ID = 7 };
+    const int32_t order[NS] = { 4, 7, 0, 8, 2, 6, 1, 5, 3 };
+    float X[NS * ID], T[NS * OD], Xp[NS * ID], Tp[NS * OD];
+    float W0[OD * ID], b0[OD];
+    for (int i = 0; i < OD * ID; i++) W0[i] = 0.05f * (float)(i % 7 - 3);
+    for (int i = 0; i < OD; i++)      b0[i] = 0.01f * (float)i;
+    for (int i = 0; i < NS * ID; i++) X[i] = 0.1f * (float)(i % 11 - 5);
+    for (int i = 0; i < NS * OD; i++) T[i] = 0.2f * (float)(i % 3 - 1);
+    for (int s = 0; s < NS; s++) {              /* copy-based permutation */
+        memcpy(Xp + s * ID, X + order[s] * ID, ID * sizeof(float));
+        memcpy(Tp + s * OD, T + order[s] * OD, OD * sizeof(float));
+    }
+
+    float Wa[OD * ID], Wb[OD * ID], ba[OD], bb[OD];
+    memcpy(Wa, W0, sizeof Wa); memcpy(ba, b0, sizeof ba);
+    memcpy(Wb, W0, sizeof Wb); memcpy(bb, b0, sizeof bb);
+    float la = tk_train_epoch_f32(Wa, ba, X, T, NS, OD, ID, TK_ACT_TANH, 0.05f);
+    float lb = tk_train_epoch_order_f32(Wb, bb, X, T, NS, OD, ID,
+                                        TK_ACT_TANH, 0.05f, NULL, NULL);
+    check_ok(memcmp(Wa, Wb, sizeof Wa) == 0 && memcmp(ba, bb, sizeof ba) == 0
+          && la == lb, "epoch_order NULL order == train_epoch (loss %.4f)", lb);
+
+    memcpy(Wa, W0, sizeof Wa); memcpy(ba, b0, sizeof ba);
+    memcpy(Wb, W0, sizeof Wb); memcpy(bb, b0, sizeof bb);
+    la = tk_train_epoch_f32(Wa, ba, Xp, Tp, NS, OD, ID, TK_ACT_TANH, 0.05f);
+    lb = tk_train_epoch_order_f32(Wb, bb, X, T, NS, OD, ID,
+                                  TK_ACT_TANH, 0.05f, order, NULL);
+    check_ok(memcmp(Wa, Wb, sizeof Wa) == 0 && memcmp(ba, bb, sizeof ba) == 0
+          && la == lb, "epoch_order == copy-permuted epoch, bitwise");
+
+    /* (c) mistake probe: identical trajectory and loss, count matches a
+     * scripted pre-update sign count using a naive dot. */
+    int m = -1, mref = 0;
+    memcpy(Wa, Wb, sizeof Wa); memcpy(ba, bb, sizeof ba);   /* post-epoch state */
+    for (int s = 0; s < NS; s++) {              /* reference: probe then step */
+        const float *x = X + order[s] * ID, *t = T + order[s] * OD;
+        for (int o = 0; o < OD; o++) {
+            float z = ba[o];
+            for (int i = 0; i < ID; i++) z += Wa[o * ID + i] * x[i];
+            if (t[o] * z <= 0.0f) mref++;
+        }
+        tk_train_step_f32(Wa, ba, x, t, OD, ID, TK_ACT_TANH, 0.05f);
+    }
+    float lc = tk_train_epoch_order_f32(Wb, bb, X, T, NS, OD, ID,
+                                        TK_ACT_TANH, 0.05f, order, &m);
+    check_ok(memcmp(Wa, Wb, sizeof Wa) == 0 && memcmp(ba, bb, sizeof ba) == 0
+          && isfinite(lc) && m == mref,
+          "mistake probe: trajectory untouched, count %d == scripted %d", m, mref);
+}
+
+/* Scripted C port of the Python reference loop (mantissa-perceptron
+ * perceptron.py, rule="perceptron"): naive single-accumulator dot, mistake on
+ * target*z <= 0 (zero margin counts), update w += lr*t*x, b += lr*t. */
+static int ref_perceptron_epoch(float *W, float *b, const float *X,
+                                const float *T, int n, int od, int id,
+                                float lr, const int32_t *order) {
+    int mist = 0;
+    for (int s = 0; s < n; s++) {
+        const int k = order ? (int)order[s] : s;
+        for (int o = 0; o < od; o++) {
+            float z = b ? b[o] : 0.0f;
+            for (int i = 0; i < id; i++) z += W[o * id + i] * X[k * id + i];
+            if (T[k * od + o] * z <= 0.0f) {
+                const float a = lr * T[k * od + o];
+                for (int i = 0; i < id; i++) W[o * id + i] += a * X[k * id + i];
+                if (b) b[o] += a;
+                mist++;
+            }
+        }
+    }
+    return mist;
+}
+
+static void test_perceptron_epoch(void) {
+    /* Rosenblatt rule vs the scripted Python-reference port: bit-identical
+     * weight/bias trajectories and equal mistake counts across epochs, with a
+     * shuffled order, from the zero init the Python code uses (first sample
+     * hits z == 0 exactly -- the tie-counts-as-mistake case). ID=5 leaves a
+     * forward tail; a second shape covers ID%4==0 and out_dim>1. */
+    enum { NS = 64, ID = 5, OD = 1, EPOCHS = 4 };
+    float X[NS * ID], T[NS * OD];
+    int32_t order[NS], rev[NS];
+    tk_rng rng = tk_rng_seed(19);
+    for (int i = 0; i < NS * ID; i++) X[i] = tk_rng_f01(&rng) - 0.5f;
+    for (int i = 0; i < NS * OD; i++) T[i] = (tk_rng_u64(&rng) & 1) ? 1.0f : -1.0f;
+    for (int i = 0; i < NS; i++) { order[i] = (int32_t)((i * 29 + 7) % NS); rev[i] = NS - 1 - i; }
+
+    float W[OD * ID] = { 0 }, b[OD] = { 0 }, Wr[OD * ID] = { 0 }, br[OD] = { 0 };
+    int ok = 1, m = -1, mr = -2;
+    for (int e = 0; e < EPOCHS; e++) {
+        const int32_t *ord = (e == 0) ? NULL : (e == 1) ? rev : order;
+        m  = tk_perceptron_epoch_f32(W, b, X, T, NS, OD, ID, 0.1f, ord);
+        mr = ref_perceptron_epoch(Wr, br, X, T, NS, OD, ID, 0.1f, ord);
+        ok &= (m == mr) && memcmp(W, Wr, sizeof W) == 0
+                        && memcmp(b, br, sizeof b) == 0;
+    }
+    check_ok(ok && m > 0, "perceptron epoch == scripted reference "
+             "(last epoch %d mistakes, bitwise weights)", m);
+
+    /* general dense form: OD2 independent rows, no bias */
+    enum { NS2 = 16, ID2 = 8, OD2 = 3 };
+    float X2[NS2 * ID2], T2[NS2 * OD2];
+    for (int i = 0; i < NS2 * ID2; i++) X2[i] = tk_rng_f01(&rng) - 0.5f;
+    for (int i = 0; i < NS2 * OD2; i++) T2[i] = (tk_rng_u64(&rng) & 1) ? 1.0f : -1.0f;
+    float W2[OD2 * ID2] = { 0 }, W2r[OD2 * ID2] = { 0 };
+    int m2  = tk_perceptron_epoch_f32(W2, NULL, X2, T2, NS2, OD2, ID2, 0.5f, order);
+    int m2r = ref_perceptron_epoch(W2r, NULL, X2, T2, NS2, OD2, ID2, 0.5f, order);
+    check_ok(m2 == m2r && memcmp(W2, W2r, sizeof W2) == 0,
+             "perceptron epoch out_dim=%d, NULL bias == reference (%d mistakes)",
+             OD2, m2);
+
+    /* Novikoff sanity: separable data must reach a zero-mistake epoch */
+    enum { NS3 = 32, ID3 = 2 };
+    float X3[NS3 * ID3], T3[NS3];
+    for (int s = 0; s < NS3; s++) {
+        X3[s * 2 + 0] = tk_rng_f01(&rng) - 0.5f;
+        X3[s * 2 + 1] = tk_rng_f01(&rng) - 0.5f;
+        float margin = X3[s * 2] + X3[s * 2 + 1];
+        T3[s] = (margin > 0.0f) ? 1.0f : -1.0f;
+        X3[s * 2 + 0] += (margin > 0.0f) ? 0.1f : -0.1f;    /* enforce a gap */
+        X3[s * 2 + 1] += (margin > 0.0f) ? 0.1f : -0.1f;
+    }
+    float W3[ID3] = { 0 }, b3[1] = { 0 };
+    int m3 = -1;
+    for (int e = 0; e < 200 && m3 != 0; e++)
+        m3 = tk_perceptron_epoch_f32(W3, b3, X3, T3, NS3, 1, ID3, 1.0f, NULL);
+    check_ok(m3 == 0, "perceptron converges on separable data (Novikoff)");
+}
+
 static void test_l1l2(void) {
     /* L1/L2 regularization path of tk_sgd_step (float32 build: write-back is
      * exact, so the update can be checked against the closed form). */
@@ -227,6 +363,8 @@ int main(void) {
     test_bce();
     test_dropout();
     test_train_epoch_matches_step();
+    test_train_epoch_order();
+    test_perceptron_epoch();
     test_l1l2();
 
     printf("\n%s\n", failures ? "FAILED" : "ALL PASSED");

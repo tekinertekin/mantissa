@@ -88,4 +88,40 @@ TK_API float tk_train_epoch_f32(float *W, float *bias,
                                 int n_samples, int out_dim, int in_dim,
                                 tk_activation_t act, float lr);
 
+/* tk_train_epoch_f32 with an optional visit order and in-epoch mistake count
+ * (either may be NULL, which recovers tk_train_epoch_f32 exactly):
+ *   order    : a permutation of [0, n_samples) giving the visit sequence. A
+ *              shuffling caller passes its index array (n int32) instead of
+ *              materializing permuted copies of X and targets every epoch;
+ *              the weight trajectory is bit-identical to running
+ *              tk_train_epoch_f32 on rows permuted by the same sequence.
+ *   mistakes : if non-NULL, set to the number of (sample, output row) pairs
+ *              whose pre-activation disagreed with the target's sign
+ *              (target*z <= 0), evaluated PRE-update as each sample is
+ *              visited -- the signal is free, z is already computed. Note it
+ *              is an in-epoch count: a separate post-epoch pass with the
+ *              final weights generally gives a different number. Counting
+ *              does not change the weight trajectory. */
+TK_API float tk_train_epoch_order_f32(float *W, float *bias,
+                                      const float *X, const float *targets,
+                                      int n_samples, int out_dim, int in_dim,
+                                      tk_activation_t act, float lr,
+                                      const int32_t *order, int *mistakes);
+
+/* One epoch of the mistake-driven perceptron rule (Rosenblatt, 1958) over the
+ * dataset, targets in {-1, +1}: per visited sample and output row,
+ * z = w.x + b; on a mistake -- target*z <= 0, a zero margin counts --
+ * w += lr*target*x, b += lr*target, and correct rows are left untouched (so
+ * from zero-initialized weights the decision boundary is invariant to lr).
+ * out_dim=1 is the classic perceptron; rows train independently otherwise.
+ * `order` as in tk_train_epoch_order_f32 (NULL = natural order). Plain float32
+ * end to end, no storage-dtype quantization, one FFI crossing per epoch.
+ * Returns the number of mistakes (row updates) this epoch; 0 means the data
+ * was separated this pass (Novikoff, 1962, bounds the total on separable
+ * data). */
+TK_API int tk_perceptron_epoch_f32(float *W, float *bias,
+                                   const float *X, const float *targets,
+                                   int n_samples, int out_dim, int in_dim,
+                                   float lr, const int32_t *order);
+
 #endif /* MANTISSA_BACKPROP_H */

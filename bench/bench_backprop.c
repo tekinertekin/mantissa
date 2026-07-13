@@ -1,12 +1,16 @@
 /* Back-propagation benchmarks for the compiled storage dtype:
  *   1. dense backward (tk_linear_backward) throughput,
  *   2. SGD weight-update throughput,
- *   3. stochastic rounding vs round-to-nearest on a real training run.
+ *   3. stochastic rounding vs round-to-nearest on a real training run,
+ *   4. dataset-epoch primitives (perceptron rule; delta with order vs the
+ *      copy-permute pattern it replaces) -- interleaved medians.
  *
  * Run per dtype:  make DTYPE=2 benchbp  (SR effect is only visible on narrow
- * types; on float32 both round modes are exact). */
+ * types; on float32 both round modes are exact; section 4 is the f32 family,
+ * dtype-independent). */
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 #include "ops.h"
 #include "loss.h"
@@ -56,6 +60,86 @@ static float train_xor(int stochastic, int epochs) {
         }
     }
     return loss/4.0f;
+}
+
+static int cmp_double(const void *a, const void *b) {
+    const double x = *(const double *)a, y = *(const double *)b;
+    return (x > y) - (x < y);
+}
+static double median_of(double *v, int n) {
+    qsort(v, n, sizeof *v, cmp_double);
+    return (n & 1) ? v[n / 2] : 0.5 * (v[n / 2 - 1] + v[n / 2]);
+}
+
+/* Dataset-epoch primitives at one (n_samples x in_dim, out_dim=1) shape.
+ * Variants are timed round-robin (A,B,C,D per rep) so DVFS/thermal drift hits
+ * all equally; weights reset before every timed sample so each measures the
+ * same work. `epochs` scales tiny shapes up to a timeable sample. The copy
+ * variant is the caller pattern `order` replaces: materialize row-permuted
+ * X/targets, then run the classic epoch. */
+static void bench_epochs(int n, int in_dim, int epochs, int reps) {
+    enum { V = 4 };
+    const float lr = 1.0f / (float)(in_dim * 8);   /* LMS-stable at both shapes */
+    float *W  = malloc((size_t)in_dim * sizeof(float)), b[1];
+    float *X  = malloc((size_t)n * in_dim * sizeof(float));
+    float *T  = malloc((size_t)n * sizeof(float));
+    float *Xp = malloc((size_t)n * in_dim * sizeof(float));
+    float *Tp = malloc((size_t)n * sizeof(float));
+    int32_t *order = malloc((size_t)n * sizeof(int32_t));
+    double t[V][64];
+    if (!W || !X || !T || !Xp || !Tp || !order || reps > 64) { printf("[epochs] alloc failed\n"); goto out; }
+    tk_rng rng = tk_rng_seed(23);
+    for (size_t i = 0; i < (size_t)n * in_dim; i++) X[i] = tk_rng_f01(&rng) - 0.5f;
+    for (int i = 0; i < n; i++) T[i] = (tk_rng_u64(&rng) & 1) ? 1.0f : -1.0f;
+    for (int i = 0; i < n; i++) order[i] = (int32_t)(((long)i * 2654435761u) % n);
+
+    for (int r = 0; r < reps; r++) {
+        double t0;
+        int mist = 0;
+        /* A: perceptron rule, order-driven */
+        memset(W, 0, (size_t)in_dim * sizeof(float)); b[0] = 0.0f;
+        t0 = now_s();
+        for (int e = 0; e < epochs; e++)
+            mist += tk_perceptron_epoch_f32(W, b, X, T, n, 1, in_dim, 0.01f, order);
+        t[0][r] = (now_s() - t0) / epochs;
+        g_sink += (float)mist + W[0];
+        /* B: delta epoch, order-driven */
+        memset(W, 0, (size_t)in_dim * sizeof(float)); b[0] = 0.0f;
+        t0 = now_s();
+        for (int e = 0; e < epochs; e++)
+            g_sink += tk_train_epoch_order_f32(W, b, X, T, n, 1, in_dim,
+                                               TK_ACT_IDENTITY, lr, order, NULL);
+        t[1][r] = (now_s() - t0) / epochs;
+        /* C: delta epoch, order + in-epoch mistake count */
+        memset(W, 0, (size_t)in_dim * sizeof(float)); b[0] = 0.0f;
+        t0 = now_s();
+        for (int e = 0; e < epochs; e++)
+            g_sink += tk_train_epoch_order_f32(W, b, X, T, n, 1, in_dim,
+                                               TK_ACT_IDENTITY, lr, order, &mist);
+        t[2][r] = (now_s() - t0) / epochs;
+        g_sink += (float)mist;
+        /* D: delta epoch, copy-permute rows then classic epoch (the old pattern) */
+        memset(W, 0, (size_t)in_dim * sizeof(float)); b[0] = 0.0f;
+        t0 = now_s();
+        for (int e = 0; e < epochs; e++) {
+            for (int s = 0; s < n; s++) {
+                memcpy(Xp + (size_t)s * in_dim, X + (size_t)order[s] * in_dim,
+                       (size_t)in_dim * sizeof(float));
+                Tp[s] = T[order[s]];
+            }
+            g_sink += tk_train_epoch_f32(W, b, Xp, Tp, n, 1, in_dim,
+                                         TK_ACT_IDENTITY, lr);
+        }
+        t[3][r] = (now_s() - t0) / epochs;
+    }
+    printf("\n[epochs %dx%d, out_dim=1, %d reps interleaved, median ms/epoch]\n",
+           n, in_dim, reps);
+    printf("  perceptron_epoch (order)        : %8.4f ms\n", median_of(t[0], reps) * 1e3);
+    printf("  train_epoch order=              : %8.4f ms\n", median_of(t[1], reps) * 1e3);
+    printf("  train_epoch order= + mistakes   : %8.4f ms\n", median_of(t[2], reps) * 1e3);
+    printf("  copy-permute + train_epoch      : %8.4f ms\n", median_of(t[3], reps) * 1e3);
+out:
+    free(W); free(X); free(T); free(Xp); free(Tp); free(order);
 }
 
 int main(int argc, char **argv) {
@@ -136,6 +220,10 @@ int main(int argc, char **argv) {
     printf("\n[stochastic rounding] XOR final loss after 4000 epochs:\n");
     printf("  round-to-nearest : %.5f%s\n", rn, rn > 0.05f ? "  (stalled)" : "");
     printf("  stochastic       : %.5f%s\n", sr, sr < 0.05f ? "  (converged)" : "");
+
+    /* --- 4. dataset-epoch primitives (f32 family, dtype-independent) --- */
+    bench_epochs(1029, 4, 200, 9);      /* banknote-shaped: n=1029, d=4 */
+    bench_epochs(2048, 2048, 1, 9);     /* wide: n=2048, d=2048 */
 
     free(W);
     free(x);

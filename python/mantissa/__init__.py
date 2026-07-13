@@ -25,6 +25,7 @@ __all__ = ["Mantissa", "Prepared",
 IDENTITY, STEP, SIGN, RELU, SIGMOID, TANH, GELU = range(7)
 
 _f32p = ctypes.POINTER(ctypes.c_float)
+_i32p = ctypes.POINTER(ctypes.c_int32)
 
 
 def _as_c_float(seq, n: int, name: str = "buffer"):
@@ -48,6 +49,20 @@ def _as_c_float(seq, n: int, name: str = "buffer"):
         return (ctypes.c_float * n).from_buffer(seq), None
     buf = (ctypes.c_float * n)(*seq)                # list/tuple/other: one copy
     return buf, (lambda: seq.__setitem__(slice(None), buf))
+
+
+def _as_c_int32(seq, n: int, name: str = "order"):
+    """Expose an index sequence (length n) to C as int32. Zero-copy for a
+    C-contiguous int32 numpy array; anything else (int64 permutation, list,
+    array('i')) is boxed into a small n*4-byte ctypes buffer -- still far
+    cheaper than copying the data rows it indexes."""
+    size = seq.size if _np is not None and isinstance(seq, _np.ndarray) else len(seq)
+    if size != n:
+        raise ValueError(f"{name}: expected {n} int32 indices, got {size}")
+    if _np is not None and isinstance(seq, _np.ndarray) \
+            and seq.dtype == _np.int32 and seq.flags["C_CONTIGUOUS"]:
+        return seq.ctypes.data_as(_i32p)
+    return (ctypes.c_int32 * n)(*(int(i) for i in seq))
 
 
 def _library_path() -> str:
@@ -109,6 +124,24 @@ class Mantissa:
             ctypes.c_int, ctypes.c_float,     # activation, lr
         ]
 
+        # epoch variant with an optional visit order (int32 permutation, no row
+        # copies) and an optional in-epoch pre-update mistake count
+        self._lib.tk_train_epoch_order_f32.restype = ctypes.c_float
+        self._lib.tk_train_epoch_order_f32.argtypes = [
+            _f32p, _f32p, _f32p, _f32p,           # W, bias, X, targets
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,  # n_samples, out_dim, in_dim
+            ctypes.c_int, ctypes.c_float,     # activation, lr
+            _i32p, ctypes.POINTER(ctypes.c_int),  # order (or NULL), mistakes (or NULL)
+        ]
+
+        # one epoch of the mistake-driven Rosenblatt rule; returns mistakes
+        self._lib.tk_perceptron_epoch_f32.restype = ctypes.c_int
+        self._lib.tk_perceptron_epoch_f32.argtypes = [
+            _f32p, _f32p, _f32p, _f32p,           # W, bias, X, targets
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,  # n_samples, out_dim, in_dim
+            ctypes.c_float, _i32p,            # lr, order (or NULL)
+        ]
+
     @property
     def dtype(self) -> str:
         """Storage type the loaded library was compiled for (e.g. 'bfloat16')."""
@@ -168,23 +201,69 @@ class Mantissa:
         return float(loss)
 
     def train_epoch(self, W, X, targets, n_samples: int, out_dim: int,
-                    in_dim: int, act: int, lr: float, bias=None) -> float:
+                    in_dim: int, act: int, lr: float, bias=None,
+                    order=None, mistakes: bool = False):
         """A full epoch of sequential SGD in ONE C call: X is n_samples rows of
         in_dim, targets n_samples rows of out_dim (both flat, row-major).
         Weight updates are numerically identical to calling train_step once per
         sample; the win is one FFI crossing per epoch instead of one per sample.
-        Mutates W (and bias) in place; returns the mean pre-update loss."""
+        Mutates W (and bias) in place; returns the mean pre-update loss.
+
+        order: optional visit sequence (a permutation of range(n_samples)).
+        Pass a C-contiguous int32 numpy array for zero-copy (e.g.
+        `rng.permutation(n).astype(np.int32)`) -- this replaces materializing
+        row-permuted copies of X/targets each epoch, with a bit-identical
+        weight trajectory for the same sequence.
+
+        mistakes=True additionally returns the in-epoch mistake count -- the
+        number of (sample, output-row) pairs whose PRE-update linear response
+        disagreed with the target's sign (target*z <= 0) as the epoch visited
+        them -- as a (loss, mistakes) tuple, at no extra pass over the data.
+        Note: an in-epoch pre-update count is not the same number as a
+        post-epoch pass over the data with the final weights."""
         Wc, W_wb = _as_c_float(W, out_dim * in_dim, "W")
         Xc, _ = _as_c_float(X, n_samples * in_dim, "X")
         tc, _ = _as_c_float(targets, n_samples * out_dim, "targets")
         bc, b_wb = _as_c_float(bias, out_dim, "bias") if bias is not None else (None, None)
-        loss = self._lib.tk_train_epoch_f32(Wc, bc, Xc, tc,
-                                            n_samples, out_dim, in_dim, act, lr)
+        if order is None and not mistakes:
+            loss = self._lib.tk_train_epoch_f32(Wc, bc, Xc, tc,
+                                                n_samples, out_dim, in_dim, act, lr)
+            m = None
+        else:
+            oc = _as_c_int32(order, n_samples) if order is not None else None
+            mc = ctypes.c_int(0) if mistakes else None
+            loss = self._lib.tk_train_epoch_order_f32(
+                Wc, bc, Xc, tc, n_samples, out_dim, in_dim, act, lr,
+                oc, ctypes.byref(mc) if mistakes else None)
+            m = mc.value if mistakes else None
         if W_wb:
             W_wb()
         if b_wb:
             b_wb()
-        return float(loss)
+        return (float(loss), m) if mistakes else float(loss)
+
+    def perceptron_epoch(self, W, X, targets, n_samples: int, out_dim: int,
+                         in_dim: int, lr: float, bias=None, order=None) -> int:
+        """One epoch of the mistake-driven perceptron rule (Rosenblatt, 1958)
+        in ONE C call, plain float32: targets are +-1 (n_samples rows of
+        out_dim); per visited sample and row, z = w.x + b, and on a mistake
+        (target*z <= 0 -- a zero margin counts) w += lr*target*x,
+        b += lr*target. Mutates W (and bias) in place; returns the number of
+        mistakes this epoch (0 = the data was separated this pass). `order` as
+        in train_epoch. Replaces a per-sample forward + numpy update loop with
+        one FFI crossing per epoch."""
+        Wc, W_wb = _as_c_float(W, out_dim * in_dim, "W")
+        Xc, _ = _as_c_float(X, n_samples * in_dim, "X")
+        tc, _ = _as_c_float(targets, n_samples * out_dim, "targets")
+        bc, b_wb = _as_c_float(bias, out_dim, "bias") if bias is not None else (None, None)
+        oc = _as_c_int32(order, n_samples) if order is not None else None
+        m = self._lib.tk_perceptron_epoch_f32(Wc, bc, Xc, tc,
+                                              n_samples, out_dim, in_dim, lr, oc)
+        if W_wb:
+            W_wb()
+        if b_wb:
+            b_wb()
+        return int(m)
 
 
 class Prepared:

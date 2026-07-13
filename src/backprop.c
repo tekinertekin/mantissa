@@ -240,16 +240,106 @@ float tk_train_step_f32(float *W, float *bias,
     return loss * inv;
 }
 
+/* tk_train_step_f32 plus a pre-update sign probe: counts output rows whose
+ * pre-activation z disagrees with the target's sign (target*z <= 0) before the
+ * row's update -- the in-epoch mistake signal, read off a z that is computed
+ * anyway. Kept a verbatim body copy of tk_train_step_f32 rather than a shared
+ * helper: DESIGN.md records that restructuring that function shifts which
+ * FMA-contraction variant the compiler picks and moves weight trajectories at
+ * some shapes. Bit-identity of the two is pinned by test_backprop.c. */
+static float tk__train_step_count_f32(float *W, float *bias,
+                                      const float *x, const float *target,
+                                      int out_dim, int in_dim,
+                                      tk_activation_t act, float lr,
+                                      int *mistakes) {
+    if (out_dim <= 0) return 0.0f;
+    const float inv = 1.0f / (float)out_dim;
+    float loss = 0.0f;
+    int mist = 0;
+    for (int o = 0; o < out_dim; o++) {
+        float *restrict wr = W + (size_t)o * in_dim;
+        float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+        int i = 0;
+        for (; i + 4 <= in_dim; i += 4) {
+            s0 += wr[i + 0] * x[i + 0];
+            s1 += wr[i + 1] * x[i + 1];
+            s2 += wr[i + 2] * x[i + 2];
+            s3 += wr[i + 3] * x[i + 3];
+        }
+        float z = (bias ? bias[o] : 0.0f) + ((s0 + s1) + (s2 + s3));
+        for (; i < in_dim; i++) z += wr[i] * x[i];   /* forward tail */
+        if (target[o] * z <= 0.0f) mist++;      /* pre-update linear margin */
+        float y = tk_act_scalar(z, act);
+        float d = y - target[o];
+        loss += d * d;
+        float dz = 2.0f * d * inv * tk_act_grad_scalar(z, act);
+        if (dz != 0.0f) {
+            for (int i = 0; i < in_dim; i++) wr[i] -= lr * dz * x[i];
+            if (bias) bias[o] -= lr * dz;
+        }
+    }
+    *mistakes += mist;
+    return loss * inv;
+}
+
+float tk_train_epoch_order_f32(float *W, float *bias,
+                               const float *X, const float *targets,
+                               int n_samples, int out_dim, int in_dim,
+                               tk_activation_t act, float lr,
+                               const int32_t *order, int *mistakes) {
+    if (mistakes) *mistakes = 0;
+    if (n_samples <= 0) return 0.0f;
+    double sum = 0.0;                           /* mean over n: f64 keeps it exact */
+    for (int s = 0; s < n_samples; s++) {
+        const size_t idx = (size_t)(order ? order[s] : s);
+        const float *x = X + idx * in_dim;
+        const float *t = targets + idx * out_dim;
+        /* mistakes==NULL takes the exact tk_train_step_f32 the copy-based epoch
+         * runs, so the order path cannot drift from it even in principle. */
+        sum += mistakes
+             ? tk__train_step_count_f32(W, bias, x, t, out_dim, in_dim, act, lr, mistakes)
+             : tk_train_step_f32(W, bias, x, t, out_dim, in_dim, act, lr);
+    }
+    return (float)(sum / n_samples);
+}
+
 float tk_train_epoch_f32(float *W, float *bias,
                          const float *X, const float *targets,
                          int n_samples, int out_dim, int in_dim,
                          tk_activation_t act, float lr) {
-    if (n_samples <= 0) return 0.0f;
-    double sum = 0.0;                           /* mean over n: f64 keeps it exact */
-    for (int s = 0; s < n_samples; s++)
-        sum += tk_train_step_f32(W, bias,
-                                 X + (size_t)s * in_dim,
-                                 targets + (size_t)s * out_dim,
-                                 out_dim, in_dim, act, lr);
-    return (float)(sum / n_samples);
+    return tk_train_epoch_order_f32(W, bias, X, targets, n_samples,
+                                    out_dim, in_dim, act, lr, NULL, NULL);
+}
+
+int tk_perceptron_epoch_f32(float *W, float *bias,
+                            const float *X, const float *targets,
+                            int n_samples, int out_dim, int in_dim,
+                            float lr, const int32_t *order) {
+    int mistakes = 0;
+    for (int s = 0; s < n_samples; s++) {
+        const size_t idx = (size_t)(order ? order[s] : s);
+        const float *restrict x = X + idx * in_dim;
+        const float *restrict t = targets + idx * out_dim;
+        for (int o = 0; o < out_dim; o++) {
+            float *restrict wr = W + (size_t)o * in_dim;
+            /* same four-accumulator forward dot as tk_train_step_f32 */
+            float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+            int i = 0;
+            for (; i + 4 <= in_dim; i += 4) {
+                s0 += wr[i + 0] * x[i + 0];
+                s1 += wr[i + 1] * x[i + 1];
+                s2 += wr[i + 2] * x[i + 2];
+                s3 += wr[i + 3] * x[i + 3];
+            }
+            float z = (bias ? bias[o] : 0.0f) + ((s0 + s1) + (s2 + s3));
+            for (; i < in_dim; i++) z += wr[i] * x[i];
+            if (t[o] * z <= 0.0f) {             /* mistake: zero margin counts */
+                const float a = lr * t[o];
+                for (int j = 0; j < in_dim; j++) wr[j] += a * x[j];
+                if (bias) bias[o] += a;
+                mistakes++;
+            }
+        }
+    }
+    return mistakes;
 }

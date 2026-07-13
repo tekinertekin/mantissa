@@ -134,6 +134,31 @@ loss = tk.train_epoch(W, X, targets, n_samples=1000, out_dim=1, in_dim=4,
                       act=IDENTITY, lr=0.01, bias=bias)   # mean loss
 ```
 
+A shuffling caller passes its permutation as `order=` (int32, zero-copy)
+instead of materializing row-permuted copies of `X`/`targets` every epoch —
+same sequence, bit-identical weights. `mistakes=True` additionally returns the
+in-epoch pre-update mistake count (rows where `target*z <= 0` as visited) as a
+`(loss, mistakes)` tuple, saving a separate full forward pass per epoch — note
+it is not the same number as a post-epoch pass with the final weights:
+
+```python
+order = rng.permutation(1000).astype(np.int32)
+loss, mistakes = tk.train_epoch(W, X, targets, 1000, 1, 4, IDENTITY, 0.01,
+                                bias=bias, order=order, mistakes=True)
+```
+
+The classic mistake-driven perceptron rule (Rosenblatt, 1958; targets ±1,
+update only on `target*z <= 0`) is its own one-call epoch,
+`tk.perceptron_epoch` (wrapping `tk_perceptron_epoch_f32`) — returns the
+epoch's mistake count, 0 meaning the data was separated this pass (measured
+~314x over the per-sample `linear_forward` + numpy-update loop at 1030x4x100
+epochs):
+
+```python
+mistakes = tk.perceptron_epoch(W, X, targets, n_samples=1000, out_dim=1,
+                               in_dim=4, lr=0.01, bias=bias, order=order)
+```
+
 For repeated *inference*, pass `out=` to `linear_forward` (a float32 numpy
 array or `array('f')` of `out_dim`): the result is written straight into your
 buffer — no per-call output allocation or boxing (~1.24x per call at 256x256).
@@ -195,6 +220,8 @@ Worked end-to-end trainer: [`examples/train_xor.c`](../examples/train_xor.c)
 | Update weights (SGD, L1/L2, SR) | `tk_sgd_step` / `tk_optim_default` |
 | One float32 training step (FFI-friendly) | `tk_train_step_f32` |
 | A whole epoch in one call (amortizes FFI) | `tk_train_epoch_f32` |
+| A shuffled epoch without copying rows, in-epoch mistake count | `tk_train_epoch_order_f32` |
+| An epoch of the Rosenblatt perceptron rule (returns mistakes) | `tk_perceptron_epoch_f32` |
 | Repeated inference on fixed weights (Python) | `Mantissa().prepare(...).forward(...)` |
 | Dropout forward / backward | `tk_dropout_forward` / `tk_dropout_backward` |
 | Know the active dtype from Python | `Mantissa().dtype` |
