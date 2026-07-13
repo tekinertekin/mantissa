@@ -223,3 +223,204 @@ void tk_conv2d_forward_f32(const float *X, const float *K, const float *bias,
     else       conv_fwd_worker(&c, 0, n, 0);
     free(cols);
 }
+
+/* One sample's backward: dKp/dbp are ACCUMULATED into (worker-private or the
+ * final buffers), dxs is written. cols/dz/dcol are per-worker scratch of
+ * npatch*kdim, out_c*npatch and kdim floats. */
+static void conv_bwd_sample(const float *restrict xs, const float *restrict K,
+                            const float *restrict zs, const float *restrict dys,
+                            float *restrict dKp, float *restrict dbp,
+                            float *restrict dxs,
+                            float *restrict cols, float *restrict dz,
+                            float *restrict dcol,
+                            int in_c, int in_h, int in_w, int out_c,
+                            int kh, int kw, int stride, int pad,
+                            int oh, int ow, tk_activation_t act) {
+    const int npatch = oh * ow, kdim = in_c * kh * kw;
+    im2col(xs, cols, in_c, in_h, in_w, kh, kw, stride, pad, oh, ow);
+
+    for (int oc = 0; oc < out_c; oc++) {          /* dz = dy * act'(z), db */
+        const float *restrict zr = zs + (size_t)oc * npatch;
+        const float *restrict dyr = dys + (size_t)oc * npatch;
+        float *restrict dzr = dz + (size_t)oc * npatch;
+        float bsum = 0.0f;
+        for (int p = 0; p < npatch; p++) {
+            const float g = dyr[p] * tk_act_grad_scalar(zr[p], act);
+            dzr[p] = g;
+            bsum += g;
+        }
+        if (dbp) dbp[oc] += bsum;
+    }
+
+    for (int oc = 0; oc < out_c; oc++) {          /* dK += dz . im2col rows */
+        const float *restrict dzr = dz + (size_t)oc * npatch;
+        float *restrict dkr = dKp + (size_t)oc * kdim;
+        for (int p = 0; p < npatch; p++) {
+            const float g = dzr[p];
+            if (g == 0.0f) continue;              /* dead relu patch */
+            const float *restrict cp = cols + (size_t)p * kdim;
+            for (int j = 0; j < kdim; j++) dkr[j] += g * cp[j];
+        }
+    }
+
+    if (!dxs) return;
+    memset(dxs, 0, (size_t)in_c * in_h * in_w * sizeof(float));
+    for (int p = 0; p < npatch; p++) {            /* dX: col2im scatter */
+        memset(dcol, 0, (size_t)kdim * sizeof(float));
+        int any = 0;
+        for (int oc = 0; oc < out_c; oc++) {      /* dcol = K^T dz[:, p] */
+            const float g = dz[(size_t)oc * npatch + p];
+            if (g == 0.0f) continue;
+            any = 1;
+            const float *restrict kr = K + (size_t)oc * kdim;
+            for (int j = 0; j < kdim; j++) dcol[j] += g * kr[j];
+        }
+        if (!any) continue;
+        const int oy = p / ow, ox = p % ow;
+        const int iy0 = oy * stride - pad, ix0 = ox * stride - pad;
+        const float *restrict d = dcol;
+        for (int c = 0; c < in_c; c++) {
+            float *restrict plane = dxs + (size_t)c * in_h * in_w;
+            for (int ky = 0; ky < kh; ky++) {
+                const int iy = iy0 + ky;
+                for (int kx = 0; kx < kw; kx++, d++) {
+                    const int ix = ix0 + kx;
+                    if (iy >= 0 && iy < in_h && ix >= 0 && ix < in_w)
+                        plane[(size_t)iy * in_w + ix] += *d;
+                }
+            }
+        }
+    }
+}
+
+/* Scratch-free backward fallback: bounds-checked direct loops, serial. */
+static void conv_bwd_direct(const float *restrict X, const float *restrict K,
+                            const float *restrict Z, const float *restrict dY,
+                            float *restrict dK, float *restrict db,
+                            float *restrict dX,
+                            int n, int in_c, int in_h, int in_w,
+                            int out_c, int kh, int kw, int stride, int pad,
+                            int oh, int ow, tk_activation_t act) {
+    const size_t in_sz = (size_t)in_c * in_h * in_w;
+    const size_t out_sz = (size_t)out_c * oh * ow;
+    const int kdim = in_c * kh * kw;
+    memset(dK, 0, (size_t)out_c * kdim * sizeof(float));
+    if (db) memset(db, 0, (size_t)out_c * sizeof(float));
+    if (dX) memset(dX, 0, (size_t)n * in_sz * sizeof(float));
+    for (int s = 0; s < n; s++) {
+        const float *restrict xs = X + (size_t)s * in_sz;
+        float *restrict dxs = dX ? dX + (size_t)s * in_sz : NULL;
+        for (int oc = 0; oc < out_c; oc++) {
+            const float *restrict kf = K + (size_t)oc * kdim;
+            float *restrict dkf = dK + (size_t)oc * kdim;
+            for (int oy = 0; oy < oh; oy++)
+                for (int ox = 0; ox < ow; ox++) {
+                    const size_t o = (size_t)s * out_sz
+                                   + ((size_t)oc * oh + oy) * ow + ox;
+                    const float g = dY[o] * tk_act_grad_scalar(Z[o], act);
+                    if (db) db[oc] += g;
+                    if (g == 0.0f) continue;
+                    const int iy0 = oy * stride - pad, ix0 = ox * stride - pad;
+                    for (int c = 0; c < in_c; c++)
+                        for (int ky = 0; ky < kh; ky++) {
+                            const int iy = iy0 + ky;
+                            if (iy < 0 || iy >= in_h) continue;
+                            for (int kx = 0; kx < kw; kx++) {
+                                const int ix = ix0 + kx;
+                                if (ix < 0 || ix >= in_w) continue;
+                                const size_t kidx = ((size_t)c * kh + ky) * kw + kx;
+                                const size_t xidx = ((size_t)c * in_h + iy) * in_w + ix;
+                                dkf[kidx] += g * xs[xidx];
+                                if (dxs) dxs[xidx] += g * kf[kidx];
+                            }
+                        }
+                }
+        }
+    }
+}
+
+typedef struct {
+    const float *X, *K, *Z, *dY;
+    float *dKp, *dbp, *dX;       /* dKp/dbp: one zeroed slice per worker */
+    float *cols, *dz, *dcol;     /* per-worker scratch */
+    int in_c, in_h, in_w, out_c, kh, kw, stride, pad, oh, ow;
+    tk_activation_t act;
+} tk_conv_bwd_ctx;
+
+static void conv_bwd_worker(void *p, int s0, int s1, int worker) {
+    const tk_conv_bwd_ctx *c = (const tk_conv_bwd_ctx *)p;
+    const int npatch = c->oh * c->ow, kdim = c->in_c * c->kh * c->kw;
+    const size_t in_sz = (size_t)c->in_c * c->in_h * c->in_w;
+    const size_t out_sz = (size_t)c->out_c * npatch;
+    float *dKp = c->dKp + (size_t)worker * c->out_c * kdim;
+    float *dbp = c->dbp ? c->dbp + (size_t)worker * c->out_c : NULL;
+    float *cols = c->cols + (size_t)worker * npatch * kdim;
+    float *dz = c->dz + (size_t)worker * out_sz;
+    float *dcol = c->dcol + (size_t)worker * kdim;
+    for (int s = s0; s < s1; s++)
+        conv_bwd_sample(c->X + (size_t)s * in_sz, c->K,
+                        c->Z + (size_t)s * out_sz, c->dY + (size_t)s * out_sz,
+                        dKp, dbp, c->dX ? c->dX + (size_t)s * in_sz : NULL,
+                        cols, dz, dcol,
+                        c->in_c, c->in_h, c->in_w, c->out_c,
+                        c->kh, c->kw, c->stride, c->pad, c->oh, c->ow, c->act);
+}
+
+void tk_conv2d_backward_f32(const float *X, const float *K, const float *Z,
+                            const float *dY,
+                            float *dK, float *db, float *dX,
+                            int n, int in_c, int in_h, int in_w,
+                            int out_c, int kh, int kw,
+                            int stride, int pad, int act) {
+    const int oh = tk_conv2d_out_dim(in_h, kh, stride, pad);
+    const int ow = tk_conv2d_out_dim(in_w, kw, stride, pad);
+    if (in_c <= 0 || out_c <= 0 || kh <= 0 || kw <= 0) return;
+    const int npatch = oh * ow, kdim = in_c * kh * kw;
+    if (n <= 0 || npatch <= 0) {                  /* empty batch: zero sums */
+        memset(dK, 0, (size_t)out_c * kdim * sizeof(float));
+        if (db) memset(db, 0, (size_t)out_c * sizeof(float));
+        if (dX && n > 0)
+            memset(dX, 0, (size_t)n * in_c * in_h * in_w * sizeof(float));
+        return;
+    }
+
+    const size_t work = (size_t)n * out_c * npatch * kdim;
+    const int T = (work >= TK_MT_MIN_WORK && n > 1) ? tk_num_threads() : 1;
+    /* Per-worker: im2col + dz + dcol scratch, and zeroed dK/db partials for
+     * the batch-summed reduction (same pattern as tk_linear_backward's dx). */
+    const size_t out_sz = (size_t)out_c * npatch;
+    float *cols = malloc((size_t)T * ((size_t)npatch * kdim + out_sz + kdim)
+                         * sizeof(float));
+    float *part = calloc((size_t)T * ((size_t)out_c * kdim + (db ? out_c : 0)),
+                         sizeof(float));
+    if (!cols || !part) {
+        free(cols); free(part);
+        conv_bwd_direct(X, K, Z, dY, dK, db, dX, n, in_c, in_h, in_w,
+                        out_c, kh, kw, stride, pad, oh, ow,
+                        (tk_activation_t)act);
+        return;
+    }
+    float *dz = cols + (size_t)T * npatch * kdim;
+    float *dcol = dz + (size_t)T * out_sz;
+    float *dbp = db ? part + (size_t)T * out_c * kdim : NULL;
+
+    tk_conv_bwd_ctx c = { X, K, Z, dY, part, dbp, dX, cols, dz, dcol,
+                          in_c, in_h, in_w, out_c, kh, kw, stride, pad,
+                          oh, ow, (tk_activation_t)act };
+    if (T > 1) tk_parallel_for(n, conv_bwd_worker, &c);
+    else       conv_bwd_worker(&c, 0, n, 0);
+
+    memcpy(dK, part, (size_t)out_c * kdim * sizeof(float));
+    for (int t = 1; t < T; t++) {                 /* reduce worker partials */
+        const float *pt = part + (size_t)t * out_c * kdim;
+        for (size_t j = 0; j < (size_t)out_c * kdim; j++) dK[j] += pt[j];
+    }
+    if (db) {
+        memcpy(db, dbp, (size_t)out_c * sizeof(float));
+        for (int t = 1; t < T; t++) {
+            const float *pt = dbp + (size_t)t * out_c;
+            for (int j = 0; j < out_c; j++) db[j] += pt[j];
+        }
+    }
+    free(cols); free(part);
+}

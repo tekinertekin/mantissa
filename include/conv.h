@@ -31,4 +31,18 @@ TK_API void tk_conv2d_forward_f32(const float *X, const float *K, const float *b
                                   int out_c, int kh, int kw,
                                   int stride, int pad, int act);
 
+/* Convolution backward, batched. Inputs as forward plus the saved
+ * pre-activation Z and the incoming gradient dY (n x out_c x oh x ow);
+ * dz = dy * act'(z), the tk_linear_backward convention. Outputs (written,
+ * not accumulated into):
+ *   dK : out_c x in_c x kh x kw, summed over the batch
+ *   db : out_c, summed, or NULL
+ *   dX : n x in_c x in_h x in_w, or NULL for the first layer */
+TK_API void tk_conv2d_backward_f32(const float *X, const float *K, const float *Z,
+                                   const float *dY,
+                                   float *dK, float *db, float *dX,
+                                   int n, int in_c, int in_h, int in_w,
+                                   int out_c, int kh, int kw,
+                                   int stride, int pad, int act);
+
 #endif /* MANTISSA_CONV_H */
