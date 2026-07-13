@@ -174,6 +174,228 @@ static void conv_fwd_direct(const float *restrict X, const float *restrict K,
     }
 }
 
+/* --- batched conv GEMM (large shapes) --------------------------------------
+ *
+ * The per-sample path above re-streams K (out_c x kdim) from L2 for every
+ * sample and re-reads the sample's im2col scratch once per 4-row filter
+ * block. For large shapes the whole batch is instead ONE GEMM,
+ *   C (out_c x n*oh*ow) = A (K, out_c x kdim) . B (im2col, kdim x n*oh*ow),
+ * blocked BLIS-style (Van Zee & van de Geijn, 2015, "BLIS: A Framework for
+ * Rapidly Instantiating BLAS Functionality"): A is packed once per call into
+ * MR-row micro-panels, B is packed panel-by-panel (NC columns at a time, a
+ * panel spans batch samples) into NR-column micro-panels, and an MR x NR
+ * register tile of C accumulates over the full kdim. The full-batch im2col
+ * matrix is never materialized (rejected in RELEASES v0.2.1: n x the
+ * footprint); per-worker footprint is one kdim x NC panel.
+ *
+ * kdim is NOT blocked: target shapes keep it small (<= 576 for a 64-channel
+ * 3x3 layer), so one A micro-panel (MR*kdim) plus one B micro-panel
+ * (kdim*NR) sit comfortably in the M4's 128 KB L1d and the register tile
+ * accumulates the whole dot in one pass -- no partial-C traffic, and bias +
+ * activation fold into the tile store. Threading is over column panels;
+ * every output element is accumulated in the same k-order by the same
+ * kernel, so the forward is bit-identical across thread counts. */
+
+#if defined(__aarch64__)
+enum { TK_CONV_MR = 8, TK_CONV_NR = 12 };
+#elif defined(__x86_64__)
+enum { TK_CONV_MR = 6, TK_CONV_NR = 16 };
+#else
+enum { TK_CONV_MR = 4, TK_CONV_NR = 4 };
+#endif
+
+/* Columns per packed B panel (the per-worker working set is kdim*NC floats).
+ * Swept 128/256/512 on M4 (see DESIGN.md); flat within noise, 256 kept. */
+#ifndef TK_CONV_NC
+#define TK_CONV_NC 256
+#endif
+
+/* MACs below this run the per-sample path: its scratch is smaller and the
+ * GEMM's pack/tile overhead only amortizes on real work. Swept on M4: the
+ * LeNet rows (2.8M/7.7M MACs) are faster on the per-sample path, the VGG
+ * rows (28M+) on the GEMM path; 2^24 splits them with margin. */
+#define TK_CONV_GEMM_MIN_MACS ((size_t)1 << 24)
+
+typedef struct {
+    int n, in_c, in_h, in_w, out_c, kh, kw, stride, pad, oh, ow;
+    int npatch, kdim;
+    size_t in_sz, out_sz;        /* per-sample X / Y sizes */
+    long ncols;                  /* n * npatch, the GEMM N dimension */
+} tk_conv_geom;
+
+static tk_conv_geom conv_geom(int n, int in_c, int in_h, int in_w, int out_c,
+                              int kh, int kw, int stride, int pad,
+                              int oh, int ow) {
+    tk_conv_geom g;
+    g.n = n; g.in_c = in_c; g.in_h = in_h; g.in_w = in_w; g.out_c = out_c;
+    g.kh = kh; g.kw = kw; g.stride = stride; g.pad = pad; g.oh = oh; g.ow = ow;
+    g.npatch = oh * ow; g.kdim = in_c * kh * kw;
+    g.in_sz = (size_t)in_c * in_h * in_w;
+    g.out_sz = (size_t)out_c * g.npatch;
+    g.ncols = (long)n * g.npatch;
+    return g;
+}
+
+/* Pack the filter matrix into MR-row micro-panels: Ap[panel][k][MR],
+ * k-major so the kernel loads MR contiguous A values per k step; rows past
+ * out_c are zero-filled so edge tiles run the same kernel. */
+static void convg_pack_A(const float *restrict K, float *restrict Ap,
+                         int out_c, int kdim) {
+    const int MR = TK_CONV_MR;
+    for (int oc0 = 0; oc0 < out_c; oc0 += MR) {
+        const int m = (out_c - oc0 < MR) ? out_c - oc0 : MR;
+        float *restrict dst = Ap + (size_t)(oc0 / MR) * kdim * MR;
+        for (int k = 0; k < kdim; k++)
+            for (int i = 0; i < MR; i++)
+                *dst++ = (i < m) ? K[(size_t)(oc0 + i) * kdim + k] : 0.0f;
+    }
+}
+
+/* Pack im2col columns [j0, j0+nc) into NR-column micro-panels:
+ * Bp[panel][k][NR]. Column j is output pixel (sample j/npatch, patch
+ * j%npatch); k walks (c, ky, kx), out-of-image taps zero-filled. k-outer /
+ * column-inner keeps the X reads contiguous at stride 1 (adjacent columns
+ * are adjacent ix). Columns past nc are zero-filled. */
+static void convg_pack_B(const float *restrict X, float *restrict Bp,
+                         const tk_conv_geom *g, long j0, int nc) {
+    const int NR = TK_CONV_NR;
+    const float *xb[TK_CONV_NR];
+    int iy0[TK_CONV_NR], ix0[TK_CONV_NR];
+    for (int jj = 0; jj < nc; jj += NR) {
+        const int jn = (nc - jj < NR) ? nc - jj : NR;
+        for (int t = 0; t < NR; t++) {
+            if (t < jn) {
+                const long j = j0 + jj + t;
+                const int s = (int)(j / g->npatch), p = (int)(j % g->npatch);
+                xb[t] = X + (size_t)s * g->in_sz;
+                iy0[t] = (p / g->ow) * g->stride - g->pad;
+                ix0[t] = (p % g->ow) * g->stride - g->pad;
+            } else { xb[t] = NULL; iy0[t] = 0; ix0[t] = 0; }
+        }
+        float *restrict dst = Bp + (size_t)(jj / NR) * g->kdim * NR;
+        for (int c = 0; c < g->in_c; c++) {
+            const size_t coff = (size_t)c * g->in_h * g->in_w;
+            for (int ky = 0; ky < g->kh; ky++)
+                for (int kx = 0; kx < g->kw; kx++)
+                    for (int t = 0; t < NR; t++) {
+                        const int iy = iy0[t] + ky, ix = ix0[t] + kx;
+                        *dst++ = (xb[t] && iy >= 0 && iy < g->in_h
+                                        && ix >= 0 && ix < g->in_w)
+                            ? xb[t][coff + (size_t)iy * g->in_w + ix] : 0.0f;
+                    }
+        }
+    }
+}
+
+/* MR x NR micro-kernel over packed panels: Ct[MR][NR] = sum_k A[k][:] outer
+ * B[k][:]. Portable C form; each accumulator is one register, fully
+ * unrolled by the compiler (the local array never escapes). */
+static void convg_kern(int kc, const float *restrict A,
+                       const float *restrict B, float *restrict Ct) {
+    float acc[TK_CONV_MR * TK_CONV_NR] = { 0 };
+    for (int k = 0; k < kc; k++) {
+        const float *restrict a = A + (size_t)k * TK_CONV_MR;
+        const float *restrict b = B + (size_t)k * TK_CONV_NR;
+        for (int i = 0; i < TK_CONV_MR; i++)
+            for (int j = 0; j < TK_CONV_NR; j++)
+                acc[i * TK_CONV_NR + j] += a[i] * b[j];
+    }
+    memcpy(Ct, acc, sizeof acc);
+}
+
+/* Store an m x nf tile of C into Z/Y with bias + activation. Y rows are
+ * contiguous per sample (stride npatch between filter rows); a tile whose
+ * columns cross a sample boundary is split at the boundary. */
+static void convg_store(const float *restrict Ct, float *Z, float *Y,
+                        const float *bias, const tk_conv_geom *g,
+                        tk_activation_t act, int oc0, int m,
+                        long j0, int nf) {
+    int done = 0;
+    while (done < nf) {
+        const long j = j0 + done;
+        const int s = (int)(j / g->npatch), p = (int)(j % g->npatch);
+        int chunk = g->npatch - p;
+        if (chunk > nf - done) chunk = nf - done;
+        const size_t base = (size_t)s * g->out_sz + p;
+        for (int i = 0; i < m; i++) {
+            const float b = bias ? bias[oc0 + i] : 0.0f;
+            const float *restrict src = Ct + (size_t)i * TK_CONV_NR + done;
+            float *restrict zr = Z ? Z + base + (size_t)(oc0 + i) * g->npatch
+                                   : NULL;
+            float *restrict yr = Y + base + (size_t)(oc0 + i) * g->npatch;
+            for (int t = 0; t < chunk; t++) {
+                const float z = src[t] + b;
+                if (zr) zr[t] = z;
+                yr[t] = tk_act_scalar(z, act);
+            }
+        }
+        done += chunk;
+    }
+}
+
+/* Per-worker packed-B slice size: micro-panels round columns up to NR. */
+static size_t conv_bp_stride(int kdim) {
+    return (size_t)((TK_CONV_NC + TK_CONV_NR - 1) / TK_CONV_NR)
+         * TK_CONV_NR * kdim;
+}
+
+typedef struct {
+    const float *X, *bias, *Ap;
+    float *Z, *Y, *Bp;           /* Bp: one conv_bp_stride slice per worker */
+    tk_conv_geom g;
+    tk_activation_t act;
+} tk_convg_fwd_ctx;
+
+/* Column panels [p0, p1): pack B for the panel, then sweep all filter
+ * micro-panels against each B micro-panel (B micro-panel stays L1-hot). */
+static void convg_fwd_worker(void *pv, int p0, int p1, int worker) {
+    const tk_convg_fwd_ctx *c = (const tk_convg_fwd_ctx *)pv;
+    const tk_conv_geom *g = &c->g;
+    const int MR = TK_CONV_MR, NR = TK_CONV_NR;
+    float *Bp = c->Bp + (size_t)worker * conv_bp_stride(g->kdim);
+    for (int pan = p0; pan < p1; pan++) {
+        const long j0 = (long)pan * TK_CONV_NC;
+        const int nc = (g->ncols - j0 < TK_CONV_NC) ? (int)(g->ncols - j0)
+                                                    : TK_CONV_NC;
+        convg_pack_B(c->X, Bp, g, j0, nc);
+        for (int jr = 0; jr < nc; jr += NR) {
+            const float *restrict Bmp = Bp + (size_t)(jr / NR) * g->kdim * NR;
+            const int nf = (nc - jr < NR) ? nc - jr : NR;
+            for (int oc0 = 0; oc0 < g->out_c; oc0 += MR) {
+                const int m = (g->out_c - oc0 < MR) ? g->out_c - oc0 : MR;
+                float Ct[TK_CONV_MR * TK_CONV_NR];
+                convg_kern(g->kdim, c->Ap + (size_t)(oc0 / MR) * g->kdim * MR,
+                           Bmp, Ct);
+                convg_store(Ct, c->Z, c->Y, c->bias, g, c->act,
+                            oc0, m, j0 + jr, nf);
+            }
+        }
+    }
+}
+
+/* Whole-batch GEMM forward. Returns 0 if scratch allocation failed (caller
+ * falls back to the per-sample path). */
+static int conv_fwd_gemm(const float *X, const float *K, const float *bias,
+                         float *Z, float *Y, const tk_conv_geom *g,
+                         tk_activation_t act, int T) {
+    const int mpanels = (g->out_c + TK_CONV_MR - 1) / TK_CONV_MR;
+    const int panels = (int)((g->ncols + TK_CONV_NC - 1) / TK_CONV_NC);
+    if (panels == 1) T = 1;
+    /* Worker ids span the whole pool (main thread takes the LAST id), so the
+     * per-worker B scratch is sized by pool width even if panels < T. */
+    const int Tw = (T > 1) ? tk_num_threads() : 1;
+    float *Ap = malloc((size_t)mpanels * TK_CONV_MR * g->kdim * sizeof(float));
+    float *Bp = malloc((size_t)Tw * conv_bp_stride(g->kdim) * sizeof(float));
+    if (!Ap || !Bp) { free(Ap); free(Bp); return 0; }
+    convg_pack_A(K, Ap, g->out_c, g->kdim);
+
+    tk_convg_fwd_ctx c = { X, bias, Ap, Z, Y, Bp, *g, act };
+    if (T > 1) tk_parallel_for(panels, convg_fwd_worker, &c);
+    else       convg_fwd_worker(&c, 0, panels, 0);
+    free(Ap); free(Bp);
+    return 1;
+}
+
 typedef struct {
     const float *X, *K, *bias;
     float *Z, *Y, *cols;         /* cols: one npatch*kdim slice per worker */
@@ -207,6 +429,14 @@ void tk_conv2d_forward_f32(const float *X, const float *K, const float *bias,
     if (n <= 0 || in_c <= 0 || out_c <= 0 || oh <= 0 || ow <= 0) return;
     const int npatch = oh * ow, kdim = in_c * kh * kw;
     const size_t work = (size_t)n * out_c * npatch * kdim;   /* MACs per call */
+
+    if (work >= TK_CONV_GEMM_MIN_MACS) {          /* big shapes: batch GEMM */
+        const tk_conv_geom g = conv_geom(n, in_c, in_h, in_w, out_c, kh, kw,
+                                         stride, pad, oh, ow);
+        const int Tg = (work >= TK_MT_MIN_WORK) ? tk_num_threads() : 1;
+        if (conv_fwd_gemm(X, K, bias, Z, Y, &g, (tk_activation_t)act, Tg))
+            return;                               /* else: alloc failed, fall through */
+    }
 
     const int T = (work >= TK_MT_MIN_WORK && n > 1) ? tk_num_threads() : 1;
     float *cols = malloc((size_t)T * npatch * kdim * sizeof(float));

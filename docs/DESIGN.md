@@ -227,6 +227,51 @@ The multithread work threshold (`TK_MT_MIN_WORK = 1<<18`) was swept per dtype
 against this barrier cost and kept as one conservative constant — see the
 rejected list below.
 
+### The conv path: the batch is one GEMM
+
+The first conv implementation was per-sample: im2col one sample's patch
+matrix, then run the 4-row `tk__dot4` GEMV kernel over it. That re-streams
+the filter matrix K (out_c x kdim) from L2 for **every sample**, and re-reads
+the sample's 2.3 MB im2col scratch once per 4-row filter block (16x for a
+64-filter layer) — measured 49 GFLOP/s single-thread on the VGG 64-channel
+block, ~28% of what the M4's FP units can do.
+
+Above a work threshold (`TK_CONV_GEMM_MIN_MACS`, 2^24 MACs) the whole batch
+is now treated as **one GEMM**, C (out_c x n·oh·ow) = K · im2col, blocked
+BLIS-style (Van Zee & van de Geijn, 2015):
+
+- **A (= K) is packed once per call** into MR-row micro-panels, k-major.
+- **B (= im2col patches) is packed panel-by-panel**: NC=256 columns at a
+  time (a panel spans batch samples), each panel into NR-column micro-panels.
+  The full-batch im2col matrix is never materialized — that stays rejected
+  (v0.2.1: n× the footprint); a worker's whole working set is one
+  kdim x NC panel (~590 KB at VGG shape).
+- An **MR x NR register tile of C** accumulates over the full kdim, then one
+  store applies bias + activation, splitting at sample boundaries (C rows are
+  only contiguous within a sample).
+- **kdim is deliberately not blocked** (no kc loop): target conv shapes keep
+  kdim small (576 for a 64-channel 3x3 layer), so one A micro-panel
+  (MR·kdim ≈ 18 KB) plus one B micro-panel (kdim·NR ≈ 27 KB) sit inside the
+  M4's 128 KB L1d and the register tile accumulates the entire dot product in
+  one pass — no partial-C read-modify-write traffic, and bias/activation fold
+  into the tile store. A kc loop would buy nothing at these shapes and cost a
+  second store variant; revisit only if someone runs 512-channel 7x7 filters
+  through this library.
+- **Threading is over column panels.** Every output element is accumulated in
+  the same k-order by the same kernel regardless of the split, so the conv
+  forward is **bit-identical across thread counts** (stronger than the dense
+  path's ULP envelope).
+- Small shapes (both LeNet layers, at 2.8M/7.7M MACs) stay on the per-sample
+  path: its scratch is smaller and the GEMM's pack/tile overhead only
+  amortizes on real work. The threshold was placed by measuring both paths at
+  the bench shapes — LeNet rows are flat or slower under the GEMM machinery,
+  VGG rows (28M+ MACs) are 1.3–2.2x faster.
+
+Measured (M4, VGG 64x32x32 → 64@3x3 batch 16, interleaved medians): forward
+24.5 → 17.9 ms single-thread (49 → 67 GFLOP/s), 8.2 → 3.8 ms at 10 threads
+(148 → 320 GFLOP/s) — with the portable C micro-kernel alone, before the
+explicit NEON kernel.
+
 ### Activation dispatch: switch beats a function pointer
 
 Intuition says an indirect `function pointer` avoids the cost of a `switch`.
@@ -372,6 +417,14 @@ disagreed with the theory. Recorded here so they are not re-attempted.
   buffer is not worth a new lifetime-managed, non-thread-safe API surface for a
   sub-5% gain on a path the resident-narrow route already replaces. (The Python
   binding exposes that route as `Mantissa.prepare()` / `Prepared`.)
+
+- **Conv B-panel width NC other than 256** — swept 128/256/512 on the VGG
+  64-channel block (M4, interleaved, two rounds). NC=512 is ~2% faster
+  single-thread (17.4 vs 17.7/17.9 ms) but 10–15% *slower* at 10 threads
+  (4.2–4.8 vs 3.7–3.8 ms): ten workers' 1.2 MB panels start fighting for the
+  shared L2. NC=128 loses ~10% single-thread (19.7–19.8 ms; A-panel sweeps
+  amortize the pack less) and matches 256 threaded. 256 is the only width
+  good at both thread counts.
 
 Two suggestions were already in place: `dW`/`dx` are computed in one pass over
 the weights (no double read), and small layers skip the thread pool via a work

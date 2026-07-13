@@ -179,6 +179,116 @@ static void test_conv_vs_naive(void) {
     free(Y);
 }
 
+/* Large shape (>= 2^24 MACs) so the batched-GEMM path dispatches; the small
+ * gradcheck shapes above all take the per-sample path. Forward and backward
+ * are cross-checked against independent naive direct loops (finite
+ * differences would need ~150k forward passes here). Tolerances are relative
+ * to the value scale: reduction order differs between the paths. */
+static void test_conv_gemm_path_vs_naive(void) {
+    enum { N = 4, IC = 32, IH = 24, IW = 24, OC = 48, KH = 3, KW = 3 };
+    const int stride = 1, pad = 1;
+    const int oh = tk_conv2d_out_dim(IH, KH, stride, pad);
+    const int ow = tk_conv2d_out_dim(IW, KW, stride, pad);
+    const int npatch = oh * ow, kdim = IC * KH * KW;
+    const size_t xsz = (size_t)N * IC * IH * IW;
+    const size_t ksz = (size_t)OC * kdim;
+    const size_t ysz = (size_t)N * OC * npatch;
+
+    float *X = malloc(xsz * sizeof(float)), *K = malloc(ksz * sizeof(float));
+    float *b = malloc(OC * sizeof(float));
+    float *Z = malloc(ysz * sizeof(float)), *Y = malloc(ysz * sizeof(float));
+    float *Zr = malloc(ysz * sizeof(float));
+    float *dY = malloc(ysz * sizeof(float));
+    float *dK = malloc(ksz * sizeof(float)), *db = malloc(OC * sizeof(float));
+    float *dX = malloc(xsz * sizeof(float));
+    float *dKr = malloc(ksz * sizeof(float)), *dbr = malloc(OC * sizeof(float));
+    float *dXr = malloc(xsz * sizeof(float));
+    if (!X || !K || !b || !Z || !Y || !Zr || !dY || !dK || !db || !dX
+        || !dKr || !dbr || !dXr) {
+        check_ok(0, "conv gemm path: alloc failed");
+        goto out;
+    }
+    tk_rng rng = tk_rng_seed(43);
+    fill_rand(X, xsz, &rng, 2.0f);
+    fill_rand(K, ksz, &rng, 0.5f);
+    fill_rand(b, OC, &rng, 0.5f);
+    fill_rand(dY, ysz, &rng, 1.0f);
+
+    tk_conv2d_forward_f32(X, K, b, Z, Y, N, IC, IH, IW, OC, KH, KW,
+                          stride, pad, TK_ACT_TANH);
+
+    /* naive direct forward reference -> Zr */
+    float zscale = 1e-6f;
+    for (int s = 0; s < N; s++)
+        for (int oc = 0; oc < OC; oc++)
+            for (int oy = 0; oy < oh; oy++)
+                for (int ox = 0; ox < ow; ox++) {
+                    float z = b[oc];
+                    for (int c = 0; c < IC; c++)
+                        for (int ky = 0; ky < KH; ky++)
+                            for (int kx = 0; kx < KW; kx++) {
+                                const int iy = oy * stride - pad + ky;
+                                const int ix = ox * stride - pad + kx;
+                                if (iy < 0 || iy >= IH || ix < 0 || ix >= IW)
+                                    continue;
+                                z += K[((size_t)(oc * IC + c) * KH + ky) * KW + kx]
+                                   * X[((size_t)(s * IC + c) * IH + iy) * IW + ix];
+                            }
+                    Zr[((size_t)(s * OC + oc) * oh + oy) * ow + ox] = z;
+                    if (fabsf(z) > zscale) zscale = fabsf(z);
+                }
+    float zerr = 0.0f, yerr = 0.0f;
+    for (size_t i = 0; i < ysz; i++) {
+        const float e = fabsf(Z[i] - Zr[i]);
+        if (e > zerr) zerr = e;
+        const float ey = fabsf(Y[i] - tanhf(Zr[i]));
+        if (ey > yerr) yerr = ey;
+    }
+    check_ok(zerr / zscale < 1e-5f && yerr < 1e-4f,
+             "conv gemm-path forward == naive (Z rel %.2e, Y abs %.2e)",
+             zerr / zscale, yerr);
+
+    tk_conv2d_backward_f32(X, K, Z, dY, dK, db, dX, N, IC, IH, IW,
+                           OC, KH, KW, stride, pad, TK_ACT_TANH);
+
+    /* naive backward reference: dz = dY * tanh'(Z), then direct scatter */
+    memset(dKr, 0, ksz * sizeof(float));
+    memset(dbr, 0, OC * sizeof(float));
+    memset(dXr, 0, xsz * sizeof(float));
+    for (int s = 0; s < N; s++)
+        for (int oc = 0; oc < OC; oc++)
+            for (int oy = 0; oy < oh; oy++)
+                for (int ox = 0; ox < ow; ox++) {
+                    const size_t o = ((size_t)(s * OC + oc) * oh + oy) * ow + ox;
+                    const float th = tanhf(Zr[o]);
+                    const float g = dY[o] * (1.0f - th * th);
+                    dbr[oc] += g;
+                    for (int c = 0; c < IC; c++)
+                        for (int ky = 0; ky < KH; ky++)
+                            for (int kx = 0; kx < KW; kx++) {
+                                const int iy = oy * stride - pad + ky;
+                                const int ix = ox * stride - pad + kx;
+                                if (iy < 0 || iy >= IH || ix < 0 || ix >= IW)
+                                    continue;
+                                const size_t ki = ((size_t)(oc * IC + c) * KH + ky) * KW + kx;
+                                const size_t xi = ((size_t)(s * IC + c) * IH + iy) * IW + ix;
+                                dKr[ki] += g * X[xi];
+                                dXr[xi] += g * K[ki];
+                            }
+                }
+    grad_stat sk = { 0.0f, 1e-6f }, sb = sk, sx = sk;
+    for (size_t i = 0; i < ksz; i++) stat_add(&sk, dK[i], dKr[i]);
+    for (int i = 0; i < OC; i++)     stat_add(&sb, db[i], dbr[i]);
+    for (size_t i = 0; i < xsz; i++) stat_add(&sx, dX[i], dXr[i]);
+    check_ok(stat_rel(&sk) < 1e-4f && stat_rel(&sb) < 1e-4f
+          && stat_rel(&sx) < 1e-4f,
+          "conv gemm-path backward == naive  dK %.2e  db %.2e  dX %.2e",
+          stat_rel(&sk), stat_rel(&sb), stat_rel(&sx));
+out:
+    free(X); free(K); free(b); free(Z); free(Y); free(Zr); free(dY);
+    free(dK); free(db); free(dX); free(dKr); free(dbr); free(dXr);
+}
+
 /* ---- maxpool: floor semantics, argmax scatter, FD through the pool ------- */
 static void test_maxpool(void) {
     enum { N = 2, C = 3, IH = 5, IW = 7 };            /* ragged both edges */
@@ -404,6 +514,7 @@ int main(void) {
     };
     for (size_t i = 0; i < sizeof cfgs / sizeof *cfgs; i++) check_conv(&cfgs[i]);
     test_conv_vs_naive();
+    test_conv_gemm_path_vs_naive();
 
     test_maxpool();
 
