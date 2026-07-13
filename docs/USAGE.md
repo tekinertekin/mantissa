@@ -159,6 +159,30 @@ mistakes = tk.perceptron_epoch(W, X, targets, n_samples=1000, out_dim=1,
                                in_dim=4, lr=0.01, bias=bias, order=order)
 ```
 
+When those epoch calls sit in a loop — the normal case — bind the session once
+with `tk.trainer()`. Measured (M4, 1030×4): a `perceptron_epoch` wrapper call
+costs ~9.8 µs of which only ~3 µs is the C epoch; the rest re-derives ctypes
+pointers for the same five unchanged buffers every epoch. `Trainer` derives
+them once (**~2.1x per epoch call**; ~1.4x on the heavier ordered SGD epoch),
+same C entry points, bit-identical weight trajectories. Buffers must be
+C-contiguous float32 and are mutated in place. `margins(out)` writes the
+no-bias linear responses `w·x_s` for every sample in one row-parallel GEMV
+(out_dim 1 only) — the post-epoch convergence count made cheap (~2x over
+`linear_forward` with per-call binding):
+
+```python
+trainer = tk.trainer(W, X, targets, n_samples=1000, out_dim=1, in_dim=4,
+                     bias=bias)                       # bind pointers once
+z = np.empty(1000, dtype=np.float32)
+for epoch in range(100):
+    order = rng.permutation(1000).astype(np.int32)
+    mistakes = trainer.perceptron_epoch(0.01, order=order)
+    # or: loss = trainer.train_epoch(IDENTITY, 0.01, order=order)
+    #     trainer.margins(z)   # z[s] = w . x_s  (add your bias scalar)
+    if mistakes == 0:
+        break
+```
+
 For repeated *inference*, pass `out=` to `linear_forward` (a float32 numpy
 array or `array('f')` of `out_dim`): the result is written straight into your
 buffer — no per-call output allocation or boxing (~1.24x per call at 256x256).
@@ -222,6 +246,7 @@ Worked end-to-end trainer: [`examples/train_xor.c`](../examples/train_xor.c)
 | A whole epoch in one call (amortizes FFI) | `tk_train_epoch_f32` |
 | A shuffled epoch without copying rows, in-epoch mistake count | `tk_train_epoch_order_f32` |
 | An epoch of the Rosenblatt perceptron rule (returns mistakes) | `tk_perceptron_epoch_f32` |
+| Epoch calls in a loop without per-call pointer rebinding (Python) | `Mantissa().trainer(...)` |
 | Repeated inference on fixed weights (Python) | `Mantissa().prepare(...).forward(...)` |
 | Dropout forward / backward | `tk_dropout_forward` / `tk_dropout_backward` |
 | Know the active dtype from Python | `Mantissa().dtype` |

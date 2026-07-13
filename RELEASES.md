@@ -6,6 +6,35 @@ dense layer (4.2M params) unless noted, and are indicative, not absolute.
 
 ---
 
+## v0.1.14 — 2026-07-13  (tag `v0.1.14`)
+
+The FFI-was-the-bottleneck release. Profiling the sister project's per-epoch
+loop (mantissa-perceptron, banknote 1030×4, M4) showed one `perceptron_epoch`
+binding call costs ~9.8 µs — of which only ~3 µs is the C epoch. The other
+~7 µs re-derived ctypes pointers for the same five unchanged buffers, every
+epoch. The C core needed nothing; the binding did.
+
+**Added**
+- **`Mantissa.trainer()` / `Trainer`** — a pre-bound training session for the
+  epoch-in-a-loop pattern: W/X/targets/bias pointers are derived once,
+  per-epoch calls pass only `lr` and the visit order. Same C entry points,
+  bit-identical weight trajectories (verified over shuffled epochs, both
+  rules). Measured per-epoch call (interleaved medians, banknote 1030×4):
+  `perceptron_epoch` 9.8 → 4.8 µs (**2.1×**), ordered SGD `train_epoch`
+  19.5 → 14.0 µs. `Trainer.margins()` computes the post-epoch linear
+  responses in one row-parallel GEMV, 11.8 → 5.8 µs over the equivalent
+  `linear_forward` call.
+
+**Measured and rejected** (same profiling pass, Python side)
+- Batching all epochs' shuffle orders with `rng.permuted` (11.3 µs/epoch) or
+  an in-place int32 shuffle (11.9 µs) — both LOSE to the naive per-epoch
+  `rng.permutation(n).astype(int32)` (6.4 µs at n=1030): numpy's index-
+  permutation fast path beats element shuffles, so the obvious form stays.
+- C-kernel work: the measured epoch is ~3 ns/sample at d=4 — the C core was
+  never the bottleneck here; no kernel change ships in this release.
+
+---
+
 ## v0.1.13 — 2026-07-13  (tag `v0.1.13`)
 
 The fridge-clearing release: five parallel investigation lanes closed —

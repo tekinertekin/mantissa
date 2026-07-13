@@ -18,7 +18,7 @@ try:                                   # optional: enables a zero-copy fast path
 except ImportError:                    # binding works without it (plain lists)
     _np = None
 
-__all__ = ["Mantissa", "Prepared",
+__all__ = ["Mantissa", "Prepared", "Trainer",
            "IDENTITY", "STEP", "SIGN", "RELU", "SIGMOID", "TANH", "GELU"]
 
 # Activation ids must match include/activations.h.
@@ -49,6 +49,26 @@ def _as_c_float(seq, n: int, name: str = "buffer"):
         return (ctypes.c_float * n).from_buffer(seq), None
     buf = (ctypes.c_float * n)(*seq)                # list/tuple/other: one copy
     return buf, (lambda: seq.__setitem__(slice(None), buf))
+
+
+def _bind_c_float(seq, n: int, name: str):
+    """Pre-bind `seq` (length n) as a float32 pointer for repeated C calls.
+    Zero-copy only: a C-contiguous float32 numpy array or an array('f') —
+    anything else raises, because a hidden copy would both cost time and break
+    the in-place mutation the caller relies on across calls."""
+    if _np is not None and isinstance(seq, _np.ndarray):
+        if seq.size != n:
+            raise ValueError(f"{name}: expected {n} float32 values, got {seq.size}")
+        if seq.dtype == _np.float32 and seq.flags["C_CONTIGUOUS"]:
+            return seq.ctypes.data_as(_f32p)
+        raise TypeError(f"{name}: need a C-contiguous float32 array for a "
+                        f"pre-bound pointer (got dtype={seq.dtype})")
+    if isinstance(seq, array) and seq.typecode == "f":
+        if len(seq) != n:
+            raise ValueError(f"{name}: expected {n} float32 values, got {len(seq)}")
+        return (ctypes.c_float * n).from_buffer(seq)
+    raise TypeError(f"{name}: need a C-contiguous float32 numpy array or "
+                    f"array('f') for a pre-bound pointer")
 
 
 def _as_c_int32(seq, n: int, name: str = "order"):
@@ -242,6 +262,18 @@ class Mantissa:
             b_wb()
         return (float(loss), m) if mistakes else float(loss)
 
+    def trainer(self, W, X, targets, n_samples: int, out_dim: int,
+                in_dim: int, bias=None) -> "Trainer":
+        """Pre-bind a training session over fixed buffers, for the
+        epoch-in-a-loop pattern. Measured (Apple M4, 1030x4 float32): one
+        perceptron_epoch wrapper call costs ~9.8 us of which only ~3 us is the
+        C epoch — the rest is re-deriving ctypes pointers for the same five
+        unchanged buffers every epoch. Trainer derives them once; per-epoch
+        calls then pass only lr and the visit order. All buffers must be
+        C-contiguous float32 (numpy or array('f')) — they are mutated in place
+        and must stay alive for the Trainer's lifetime."""
+        return Trainer(self._lib, W, X, targets, n_samples, out_dim, in_dim, bias)
+
     def perceptron_epoch(self, W, X, targets, n_samples: int, out_dim: int,
                          in_dim: int, lr: float, bias=None, order=None) -> int:
         """One epoch of the mistake-driven perceptron rule (Rosenblatt, 1958)
@@ -264,6 +296,69 @@ class Mantissa:
         if b_wb:
             b_wb()
         return int(m)
+
+
+class Trainer:
+    """A training session with pre-bound pointers: W (out_dim x in_dim), X
+    (n_samples x in_dim), targets (n_samples x out_dim) and optional bias are
+    converted to C pointers ONCE, so each epoch call crosses the FFI with no
+    per-buffer conversion work. Construct via Mantissa.trainer().
+
+    Semantics are identical to the corresponding Mantissa methods — same C
+    entry points, same buffers, bit-identical weight trajectories; only the
+    per-call Python overhead is gone. W and bias are mutated in place by the
+    epoch calls, exactly as with the un-bound methods.
+
+    The Trainer holds references to the arrays it binds, but the pointers are
+    to the arrays' CURRENT storage: do not resize or reassign them mid-session.
+    """
+
+    def __init__(self, lib, W, X, targets, n_samples: int, out_dim: int,
+                 in_dim: int, bias=None):
+        self._lib = lib
+        self.n_samples, self.out_dim, self.in_dim = n_samples, out_dim, in_dim
+        self._Wp = _bind_c_float(W, out_dim * in_dim, "W")
+        self._Xp = _bind_c_float(X, n_samples * in_dim, "X")
+        self._tp = _bind_c_float(targets, n_samples * out_dim, "targets")
+        self._bp = _bind_c_float(bias, out_dim, "bias") if bias is not None else None
+        self._refs = (W, X, targets, bias)            # keep the storage alive
+
+    def perceptron_epoch(self, lr: float, order=None) -> int:
+        """One mistake-driven epoch (see Mantissa.perceptron_epoch); returns
+        the mistake count. `order` as in train_epoch."""
+        oc = _as_c_int32(order, self.n_samples) if order is not None else None
+        return int(self._lib.tk_perceptron_epoch_f32(
+            self._Wp, self._bp, self._Xp, self._tp,
+            self.n_samples, self.out_dim, self.in_dim, lr, oc))
+
+    def train_epoch(self, act: int, lr: float, order=None, mistakes: bool = False):
+        """One epoch of sequential SGD (see Mantissa.train_epoch); returns the
+        mean pre-update loss, or (loss, in-epoch mistakes) with mistakes=True."""
+        if order is None and not mistakes:
+            return float(self._lib.tk_train_epoch_f32(
+                self._Wp, self._bp, self._Xp, self._tp,
+                self.n_samples, self.out_dim, self.in_dim, act, lr))
+        oc = _as_c_int32(order, self.n_samples) if order is not None else None
+        mc = ctypes.c_int(0) if mistakes else None
+        loss = self._lib.tk_train_epoch_order_f32(
+            self._Wp, self._bp, self._Xp, self._tp,
+            self.n_samples, self.out_dim, self.in_dim, act, lr,
+            oc, ctypes.byref(mc) if mistakes else None)
+        return (float(loss), mc.value) if mistakes else float(loss)
+
+    def margins(self, out):
+        """Linear responses z_s = w . x_s for every sample, WITHOUT bias, into
+        `out` (C-contiguous float32, length n_samples; returned). Single-output
+        layers only: with out_dim == 1 the whole batch is one row-parallel GEMV
+        (X as the weight matrix, w as the input). The caller adds its scalar
+        bias — one vectorized add — and keeps full control of the comparison
+        (the post-epoch convergence count this exists for)."""
+        if self.out_dim != 1:
+            raise ValueError(f"margins() needs out_dim == 1, got {self.out_dim}")
+        yp = _bind_c_float(out, self.n_samples, "out")
+        self._lib.tk_linear_forward_f32(self._Xp, self._Wp, None, yp,
+                                        self.n_samples, self.in_dim, IDENTITY)
+        return out
 
 
 class Prepared:

@@ -362,7 +362,10 @@ print(lib.tk_dtype_name().decode())                  # -> e.g. "bfloat16"
 Or use the ctypes wrapper in [`python/mantissa/`](python/mantissa) (point
 it at the downloaded file) — pass float32 `numpy` arrays (or `array('f')`) for
 a zero-copy, in-place training path, ~200× faster per step than plain lists
-(numpy optional). Runnable **forward + back-prop** examples for
+(numpy optional). For an epoch loop, `Mantissa.trainer()` binds the buffers'
+pointers once and roughly halves the per-epoch call cost again (measured
+9.8 → 4.8 µs at 1030×4 — the conversion, not the C, was the cost); see
+[docs/USAGE.md](docs/USAGE.md). Runnable **forward + back-prop** examples for
 Python, C++, C#, Java, JavaScript, and Rust live in
 [`clients/`](clients) — all calling the same C ABI. To build from source
 instead, see below.
