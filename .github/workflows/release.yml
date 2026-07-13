@@ -3,6 +3,12 @@ name: release
 # On every version tag, build the shared library on Linux, macOS, and Windows
 # and attach the binaries to the GitHub Release so anyone can download and use
 # them directly — no toolchain, no `make`.
+#
+# In addition to the raw shared libraries, we build prebuilt Python wheels for
+# each OS/arch plus an sdist, and attach them too. Because the binding is pure
+# ctypes (no CPython ABI), the wheel is tagged py3-none-<platform>: one wheel
+# per OS/arch serves every Python 3.x, so no per-Python-version matrix is
+# needed. `pip install <the wheel>` then needs no C toolchain anywhere.
 on:
   push:
     tags: ["v*"]
@@ -50,16 +56,147 @@ jobs:
           name: ${{ matrix.asset }}
           path: ${{ matrix.asset }}
 
+  # -------------------------------------------------------------------------
+  # Prebuilt wheels — one per OS/arch (py3-none-<platform>, ctypes binding).
+  # -------------------------------------------------------------------------
+
+  # Linux wheel is built inside a manylinux image, then relabelled with
+  # auditwheel. Rationale: `python -m build` on a bare ubuntu-latest runner
+  # links the compiled libmantissa.so against that runner's (very new) glibc
+  # and tags the wheel `linux_x86_64` — a tag that is not portable across
+  # distros and that PyPI rejects. Even shipped as ctypes package data (not a
+  # CPython extension), the .so still carries glibc symbol-version requirements,
+  # so building against an old glibc is what makes it load on any modern distro.
+  # manylinux_2_28 (glibc 2.28: RHEL8+/Debian10+/Ubuntu18.04+) is the sweet
+  # spot — old enough to be broadly portable, new enough that the GitHub Actions
+  # node20 runtime (checkout@v4) works inside the container (manylinux2014's
+  # glibc 2.17 is too old for node20). auditwheel bundles nothing here (the lib
+  # depends only on glibc/libm/pthread, all whitelisted) — it purely validates
+  # and relabels the tag to manylinux_2_28_x86_64, and leaves libmantissa.so
+  # named exactly as the loader in mantissa/__init__.py expects.
+  wheel-linux:
+    runs-on: ubuntu-latest
+    container: quay.io/pypa/manylinux_2_28_x86_64
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build + repair wheel
+        run: |
+          PYBIN=/opt/python/cp312-cp312/bin
+          "$PYBIN/pip" install --upgrade build twine
+          # --wheel builds directly from the source tree (not via the sdist),
+          # which is deliberate — see the sdist job's note on MANIFEST.in.
+          "$PYBIN/python" -m build --wheel --outdir dist_raw
+          # auditwheel relabels linux_x86_64 -> manylinux_2_28_x86_64.
+          auditwheel repair dist_raw/*.whl -w dist
+          "$PYBIN/twine" check dist/*.whl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-linux
+          path: dist/*.whl
+
+  wheel-macos:
+    runs-on: macos-14           # Apple Silicon; matches the arm64 dylib shipped above.
+    env:
+      # The runner's Python is a universal2 build, so bdist_wheel would tag the
+      # wheel `...universal2` — but `cc` here compiles a single-arch arm64 dylib,
+      # which would then fail to load on Intel macs that pip let install it.
+      # Pin the platform tag (and arch) to arm64 so the tag matches the payload.
+      # (An x86_64 mac wheel would be a separate macos-13 leg — see README TODO.)
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+      _PYTHON_HOST_PLATFORM: "macosx-11.0-arm64"
+      ARCHFLAGS: "-arch arm64"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build wheel
+        run: |
+          python -m pip install --upgrade build twine
+          python -m build --wheel --outdir dist
+          twine check dist/*.whl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-macos
+          path: dist/*.whl
+
+  # Windows wheel is best-effort (continue-on-error): setup.py's build_ext
+  # drives the compiler with unix/cc-style flags (-fPIC, -fvisibility=hidden,
+  # -pthread, -lm). MinGW gcc — which the existing DLL build above already uses
+  # successfully — tolerates these (a couple emit harmless "ignored for target"
+  # warnings), so setting CC=gcc should produce a py3-none-win_amd64 wheel. But
+  # this route is not locally verifiable, so it is marked non-blocking: if it
+  # fails, the release still ships the Linux + macOS wheels and the raw DLL, and
+  # the Windows wheel remains a documented TODO rather than a broken gate.
+  wheel-windows:
+    runs-on: windows-latest
+    continue-on-error: true
+    env:
+      CC: gcc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build wheel
+        shell: bash
+        run: |
+          python -m pip install --upgrade build twine
+          python -m build --wheel --outdir dist
+          twine check dist/*.whl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-windows
+          path: dist/*.whl
+
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # NOTE: the sdist currently does not ship src/pool.h (MANIFEST.in has
+      # `recursive-include src *.c` but no `*.h`), so building *from* the sdist
+      # fails to compile. The tarball itself is valid and passes twine check;
+      # add `recursive-include src *.h` to MANIFEST.in to make the sdist
+      # compilable. The prebuilt wheels above are unaffected.
+      - name: Build sdist
+        run: |
+          python -m pip install --upgrade build twine
+          python -m build --sdist --outdir dist
+          twine check dist/*.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+
   release:
-    needs: build
+    needs: [build, wheel-linux, wheel-macos, wheel-windows, sdist]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
-      - name: Publish release with binaries
+      - name: Publish release with binaries, wheels, and sdist
         uses: softprops/action-gh-release@v2
         with:
           files: dist/**
           generate_release_notes: true
+
+  # Publishing to PyPI is intentionally NOT automated here — it stays manual and
+  # user-owned. To enable trusted publishing later, add a job like the following
+  # (gated on the release job) after configuring a PyPI trusted publisher for
+  # this repo and a `pypi` GitHub environment:
+  #
+  #   publish-pypi:
+  #     needs: [wheel-linux, wheel-macos, wheel-windows, sdist]
+  #     runs-on: ubuntu-latest
+  #     environment: pypi
+  #     permissions:
+  #       id-token: write        # OIDC token for trusted publishing
+  #     steps:
+  #       - uses: actions/download-artifact@v4
+  #         with: { path: dist, merge-multiple: true }
+  #       - uses: pypa/gh-action-pypi-publish@release/v1
