@@ -61,4 +61,30 @@ TK_API void tk_maxpool2d_backward_f32(const float *dY, const int32_t *argmax,
                                       int n, int c, int in_h, int in_w,
                                       int out_h, int out_w);
 
+/* Dense layer forward, batched float32 (the CNN head): Y = act(X @ W^T + bias).
+ *   X : n x in_dim,  W : out_dim x in_dim (row-major),  Y/Z : n x out_dim.
+ * Z (pre-activation) may be NULL. */
+TK_API void tk_linear_forward_batch_f32(const float *W, const float *X,
+                                        const float *bias, float *Z, float *Y,
+                                        int n, int out_dim, int in_dim, int act);
+
+/* Dense layer backward, batched float32:
+ *   dW : out_dim x in_dim, summed over the batch
+ *   db : out_dim, summed, or NULL
+ *   dX : n x in_dim, or NULL */
+TK_API void tk_linear_backward_batch_f32(const float *W, const float *X,
+                                         const float *Z, const float *dY,
+                                         float *dW, float *db, float *dX,
+                                         int n, int out_dim, int in_dim, int act);
+
+/* Softmax + cross-entropy, fused and numerically stable (row-max
+ * subtraction): logits n x classes, labels n int32 class ids. Writes
+ * dlogits = (softmax - onehot)/n and returns the mean loss. */
+TK_API float tk_softmax_xent_f32(const float *logits, const int32_t *labels,
+                                 float *dlogits, int n, int classes);
+
+/* Plain SGD on a float32 buffer: W -= lr * dW, n elements. (tk_sgd_step is
+ * the narrow-storage update; the CNN family trains pure float32.) */
+TK_API void tk_sgd_update_f32(float *W, const float *dW, int n, float lr);
+
 #endif /* MANTISSA_CONV_H */

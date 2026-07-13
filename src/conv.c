@@ -469,3 +469,177 @@ void tk_maxpool2d_backward_f32(const float *dY, const int32_t *argmax,
         for (size_t i = 0; i < opix; i++) dxp[ap[i]] += dyp[i];
     }
 }
+
+/* --- batched float32 dense head ------------------------------------------ */
+
+/* Rows [o0, o1) against all samples; sample-inner keeps the 4-row W block hot
+ * in L1 across the batch, the gemm_range argument from ops.c. */
+static void linb_fwd_range(const float *restrict W, const float *restrict X,
+                           const float *restrict bias,
+                           float *restrict Z, float *restrict Y,
+                           int o0, int o1, int n, int out_dim, int in_dim,
+                           tk_activation_t act) {
+    int o = o0;
+    for (; o + 4 <= o1; o += 4) {
+        for (int s = 0; s < n; s++) {
+            float r[4];
+            tk__dot4_f32(W + (size_t)o * in_dim, in_dim,
+                         X + (size_t)s * in_dim, r);
+            for (int k = 0; k < 4; k++) {
+                const float z = r[k] + (bias ? bias[o + k] : 0.0f);
+                if (Z) Z[(size_t)s * out_dim + o + k] = z;
+                Y[(size_t)s * out_dim + o + k] = tk_act_scalar(z, act);
+            }
+        }
+    }
+    for (; o < o1; o++) {
+        const float *restrict wr = W + (size_t)o * in_dim;
+        const float b = bias ? bias[o] : 0.0f;
+        for (int s = 0; s < n; s++) {
+            const float z = b + tk__dot1_f32(wr, X + (size_t)s * in_dim, in_dim);
+            if (Z) Z[(size_t)s * out_dim + o] = z;
+            Y[(size_t)s * out_dim + o] = tk_act_scalar(z, act);
+        }
+    }
+}
+
+typedef struct {
+    const float *W, *X, *bias;
+    float *Z, *Y;
+    int n, out_dim, in_dim;
+    tk_activation_t act;
+} tk_linb_ctx;
+
+static void linb_fwd_worker(void *p, int o0, int o1, int worker) {
+    (void)worker;
+    const tk_linb_ctx *c = (const tk_linb_ctx *)p;
+    linb_fwd_range(c->W, c->X, c->bias, c->Z, c->Y, o0, o1,
+                   c->n, c->out_dim, c->in_dim, c->act);
+}
+
+void tk_linear_forward_batch_f32(const float *W, const float *X,
+                                 const float *bias, float *Z, float *Y,
+                                 int n, int out_dim, int in_dim, int act) {
+    if (n <= 0 || out_dim <= 0) return;
+    if ((size_t)n * out_dim * in_dim >= TK_MT_MIN_WORK && tk_num_threads() > 1) {
+        tk_linb_ctx c = { W, X, bias, Z, Y, n, out_dim, in_dim,
+                          (tk_activation_t)act };
+        tk_parallel_for(out_dim, linb_fwd_worker, &c);
+        return;
+    }
+    linb_fwd_range(W, X, bias, Z, Y, 0, out_dim, n, out_dim, in_dim,
+                   (tk_activation_t)act);
+}
+
+/* dW rows [o0, o1) + db, summed over the batch (rows disjoint, no locking). */
+static void linb_bwd_rows(const float *restrict X, const float *restrict Z,
+                          const float *restrict dY,
+                          float *restrict dW, float *restrict db,
+                          int o0, int o1, int n, int out_dim, int in_dim,
+                          tk_activation_t act) {
+    for (int o = o0; o < o1; o++) {
+        float *restrict dwr = dW + (size_t)o * in_dim;
+        memset(dwr, 0, (size_t)in_dim * sizeof(float));
+        float bsum = 0.0f;
+        for (int s = 0; s < n; s++) {
+            const float g = dY[(size_t)s * out_dim + o]
+                          * tk_act_grad_scalar(Z[(size_t)s * out_dim + o], act);
+            bsum += g;
+            if (g == 0.0f) continue;
+            const float *restrict xs = X + (size_t)s * in_dim;
+            for (int i = 0; i < in_dim; i++) dwr[i] += g * xs[i];
+        }
+        if (db) db[o] = bsum;
+    }
+}
+
+/* dX rows for samples [s0, s1) (samples disjoint; dz recomputed, cheap). */
+static void linb_bwd_dx(const float *restrict W, const float *restrict Z,
+                        const float *restrict dY, float *restrict dX,
+                        int s0, int s1, int out_dim, int in_dim,
+                        tk_activation_t act) {
+    for (int s = s0; s < s1; s++) {
+        float *restrict dxs = dX + (size_t)s * in_dim;
+        memset(dxs, 0, (size_t)in_dim * sizeof(float));
+        for (int o = 0; o < out_dim; o++) {
+            const float g = dY[(size_t)s * out_dim + o]
+                          * tk_act_grad_scalar(Z[(size_t)s * out_dim + o], act);
+            if (g == 0.0f) continue;
+            const float *restrict wr = W + (size_t)o * in_dim;
+            for (int i = 0; i < in_dim; i++) dxs[i] += g * wr[i];
+        }
+    }
+}
+
+typedef struct {
+    const float *W, *X, *Z, *dY;
+    float *dW, *db, *dX;
+    int n, out_dim, in_dim;
+    tk_activation_t act;
+} tk_linb_bwd_ctx;
+
+static void linb_bwd_rows_worker(void *p, int o0, int o1, int worker) {
+    (void)worker;
+    const tk_linb_bwd_ctx *c = (const tk_linb_bwd_ctx *)p;
+    linb_bwd_rows(c->X, c->Z, c->dY, c->dW, c->db, o0, o1,
+                  c->n, c->out_dim, c->in_dim, c->act);
+}
+
+static void linb_bwd_dx_worker(void *p, int s0, int s1, int worker) {
+    (void)worker;
+    const tk_linb_bwd_ctx *c = (const tk_linb_bwd_ctx *)p;
+    linb_bwd_dx(c->W, c->Z, c->dY, c->dX, s0, s1,
+                c->out_dim, c->in_dim, c->act);
+}
+
+void tk_linear_backward_batch_f32(const float *W, const float *X,
+                                  const float *Z, const float *dY,
+                                  float *dW, float *db, float *dX,
+                                  int n, int out_dim, int in_dim, int act) {
+    if (out_dim <= 0 || in_dim <= 0) return;
+    if (n <= 0) {                                 /* empty batch: zero sums */
+        memset(dW, 0, (size_t)out_dim * in_dim * sizeof(float));
+        if (db) memset(db, 0, (size_t)out_dim * sizeof(float));
+        return;
+    }
+    tk_linb_bwd_ctx c = { W, X, Z, dY, dW, db, dX, n, out_dim, in_dim,
+                          (tk_activation_t)act };
+    const int mt = (size_t)n * out_dim * in_dim >= TK_MT_MIN_WORK
+                 && tk_num_threads() > 1;
+    if (mt) tk_parallel_for(out_dim, linb_bwd_rows_worker, &c);
+    else    linb_bwd_rows(X, Z, dY, dW, db, 0, out_dim, n, out_dim, in_dim,
+                          (tk_activation_t)act);
+    if (dX) {
+        if (mt) tk_parallel_for(n, linb_bwd_dx_worker, &c);
+        else    linb_bwd_dx(W, Z, dY, dX, 0, n, out_dim, in_dim,
+                            (tk_activation_t)act);
+    }
+}
+
+float tk_softmax_xent_f32(const float *logits, const int32_t *labels,
+                          float *dlogits, int n, int classes) {
+    if (n <= 0 || classes <= 0) return 0.0f;
+    const float invn = 1.0f / (float)n;
+    double sum = 0.0;                             /* mean over n: f64 keeps it exact */
+    for (int s = 0; s < n; s++) {
+        const float *restrict row = logits + (size_t)s * classes;
+        float *restrict drow = dlogits + (size_t)s * classes;
+        float m = row[0];
+        for (int j = 1; j < classes; j++) if (row[j] > m) m = row[j];
+        float den = 0.0f;
+        for (int j = 0; j < classes; j++) {       /* stash exp(z - max) in drow */
+            drow[j] = expf(row[j] - m);
+            den += drow[j];
+        }
+        const int y = (int)labels[s];
+        const float inv_den = 1.0f / den;
+        for (int j = 0; j < classes; j++)
+            drow[j] = (drow[j] * inv_den - (j == y ? 1.0f : 0.0f)) * invn;
+        sum += (double)(logf(den) - (row[y] - m));
+    }
+    return (float)(sum / n);
+}
+
+void tk_sgd_update_f32(float *W, const float *dW, int n, float lr) {
+    for (int i = 0; i < n; i++) W[i] -= lr * dW[i];
+}
