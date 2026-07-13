@@ -6,6 +6,64 @@ dense layer (4.2M params) unless noted, and are indicative, not absolute.
 
 ---
 
+## v0.2.2 — 2026-07-13  (tag `v0.2.2`)
+
+The conv-GEMM release: the v0.2.1 primitives kept their exact ABI and got a
+real GEMM underneath. Plus a Session on the Python side. Downstream A/B
+(mantissa-cnn minivgg/CIFAR-10 fit, identical machine state, median of 5):
+**5.36 → 4.35 s (1.23×)**; LeNet-scale fits additionally −13% from Session.
+
+**perf(conv)** — three staged rewrites of the f32 conv path (`src/conv.c`),
+public signatures untouched:
+- **Batch-whole GEMM with panel packing**: K packed once per call into
+  MR-row micro-panels; im2col packed per 256-column panel *spanning
+  samples* (a full-batch im2col matrix is still never materialized — the
+  v0.2.1 rejection stands; panel packing gets the compute benefit at one
+  panel's footprint per worker). Bias + activation fold into the tile
+  store. Forward became bit-identical across thread counts.
+- **NEON 6×16 outer-product micro-kernel** (24 accumulators; AVX2 6×16
+  equivalent behind the ops.c-style runtime dispatch, portable-C tile
+  fallback). In-situ `sample` profile: ~86% of a core's f32 peak. The
+  flanking costs mattered as much as the kernel: per-element `if(Z)` +
+  activation switch hoisted out of the store, pack rewritten as clipped
+  contiguous runs.
+- **Backward through the same machinery**: dK = dZ·im2col^T over column
+  chunks with per-worker partials (bit-reproducible at fixed thread
+  counts, as before); dX by sample ownership with per-tile run-based
+  col2im scatter. Serial backward reaches ~78% of the new forward.
+
+Measured (M4, benchconv, 50 reps; baseline remeasured same-day):
+
+| shape (batch 16) | fwd 1T | fwd 10T | bwd 1T | bwd 10T |
+|---|---|---|---|---|
+| VGG 3→64@3×3 p1 | 2.28 → **0.85 ms** | 0.58 → **0.28** | 11.2 → **5.8** | 2.51 → **1.45** |
+| VGG 64→64@3×3 p1 | 24.5 → **12.6** (96 GF) | 8.17 → **3.3** (363 GF) | 53.9 → **31.6** | 15.0 → **8.5** (285 GF) |
+
+LeNet-scale shapes dispatch below a measured 2²⁴-MAC threshold to the
+byte-identical per-sample path — interleaved A/B put every LeNet row
+within ±2% (the small-shape wins that beat torch/TF downstream are
+untouched).
+
+**feat(python)** — **`Mantissa.session()` / `Session`**: the CNN-primitive
+methods with identity-memoized pointers (a hit is a dict lookup + `is`),
+for training loops whose buffers are allocated once and refilled in place.
+Measured: pointer conversion was ~12% of a LeNet-5/MNIST fit; downstream
+268 → 234 ms. One session per model; zero-copy is mandatory (raises rather
+than silently copying).
+
+**Measured and rejected** (recorded in DESIGN.md): NC=512 panels (+2% 1T,
+−10-15% 10T — L2 contention), NC=128 (−10% 1T); 8×12 NEON tile — the
+winner *flipped* with pack strategy (8×12 won pre-run-based packing, 6×16
+wins after; both numbers recorded, 8×12 kept buildable); k-unroll ×2 (no
+gain); JC sweep (flat).
+
+**Known-unmeasured**: the AVX2 6×16 kernel mirrors proven ops.c patterns
+but has not been executed on x86 hardware in this cycle; tile constants
+are per-arch and adapt via `TK_CONV_MR/NR` when x86 numbers arrive. ASan
+clean at 1/3/10 threads.
+
+---
+
 ## v0.2.1 — 2026-07-13  (tag `v0.2.1`)
 
 The CNN release — a minor-version bump because a whole primitive family
