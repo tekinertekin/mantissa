@@ -27,7 +27,7 @@ else
     LIBEXT := so
 endif
 
-.PHONY: test testbp lib dist example mlp train bench benchbp clean
+.PHONY: test testbp testconv lib dist example mlp train bench benchbp benchconv clean
 
 test: $(SRC) tests/test_dtypes.c
 	@mkdir -p $(BUILD)
@@ -68,6 +68,13 @@ testbp: $(SRC) tests/test_backprop.c
 	      -Iinclude -DTK_DTYPE=0 -o $(BUILD)/test_backprop $^ $(LDFLAGS)
 	@./$(BUILD)/test_backprop
 
+# Conv/pool/dense-batch/softmax gradient checks (float32, like testbp).
+testconv: $(SRC) tests/test_conv.c
+	@mkdir -p $(BUILD)
+	$(CC) -O3 -funroll-loops -ffp-contract=fast -Wall -Wextra -std=c11 \
+	      -Iinclude -DTK_DTYPE=0 -o $(BUILD)/test_conv $^ $(LDFLAGS)
+	@./$(BUILD)/test_conv
+
 bench: $(SRC) bench/benchmark.c
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $(BUILD)/benchmark $^ $(LDFLAGS)
@@ -77,6 +84,14 @@ benchbp: $(SRC) bench/bench_backprop.c
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $(BUILD)/bench_backprop $^ $(LDFLAGS)
 	@./$(BUILD)/bench_backprop
+
+# Conv bench: LeNet-5 + VGG-block shapes; run serial then threaded (the pool
+# reads MANTISSA_THREADS once at creation, so each mode is its own process).
+benchconv: $(SRC) bench/bench_conv.c
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -Isrc -o $(BUILD)/bench_conv $^ $(LDFLAGS)
+	@MANTISSA_THREADS=1 ./$(BUILD)/bench_conv
+	@./$(BUILD)/bench_conv
 
 # Data-layout / cache harness (SIMD tail, padding, alignment, residency).
 benchlayout: $(SRC) bench/bench_layout.c
