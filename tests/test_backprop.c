@@ -307,14 +307,18 @@ static void test_perceptron_epoch(void) {
     check_ok(ok && m > 0, "perceptron epoch == scripted reference "
              "(last epoch %d mistakes, bitwise weights)", m);
 
-    /* general dense form: OD2 independent rows, no bias */
+    /* general dense form: OD2 independent rows, no bias. `order` must be a
+     * permutation of THIS block's [0, NS2) — reusing the NS-sized one above
+     * indexed past X2/T2 (caught by ASAN). */
     enum { NS2 = 16, ID2 = 8, OD2 = 3 };
     float X2[NS2 * ID2], T2[NS2 * OD2];
+    int32_t order2[NS2];
     for (int i = 0; i < NS2 * ID2; i++) X2[i] = tk_rng_f01(&rng) - 0.5f;
     for (int i = 0; i < NS2 * OD2; i++) T2[i] = (tk_rng_u64(&rng) & 1) ? 1.0f : -1.0f;
+    for (int i = 0; i < NS2; i++) order2[i] = (int32_t)((i * 5 + 3) % NS2);
     float W2[OD2 * ID2] = { 0 }, W2r[OD2 * ID2] = { 0 };
-    int m2  = tk_perceptron_epoch_f32(W2, NULL, X2, T2, NS2, OD2, ID2, 0.5f, order);
-    int m2r = ref_perceptron_epoch(W2r, NULL, X2, T2, NS2, OD2, ID2, 0.5f, order);
+    int m2  = tk_perceptron_epoch_f32(W2, NULL, X2, T2, NS2, OD2, ID2, 0.5f, order2);
+    int m2r = ref_perceptron_epoch(W2r, NULL, X2, T2, NS2, OD2, ID2, 0.5f, order2);
     check_ok(m2 == m2r && memcmp(W2, W2r, sizeof W2) == 0,
              "perceptron epoch out_dim=%d, NULL bias == reference (%d mistakes)",
              OD2, m2);
