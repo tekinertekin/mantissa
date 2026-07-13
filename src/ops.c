@@ -95,7 +95,7 @@ static inline float32x4_t tk__fp16x4(const tk_fp16_t *p) {
 }
 #endif /* TK_DTYPE, within __aarch64__ */
 
-#elif defined(__x86_64__) && (TK_DTYPE == TK_DTYPE_FLOAT32 || TK_DTYPE == TK_DTYPE_BFLOAT16)
+#elif defined(__x86_64__) && (TK_DTYPE == TK_DTYPE_FLOAT32 || TK_DTYPE == TK_DTYPE_BFLOAT16 || TK_DTYPE == TK_DTYPE_FP16)
 #include <immintrin.h>
 #define TK_HAVE_AVX2 1
 
@@ -104,11 +104,29 @@ static inline float32x4_t tk__fp16x4(const tk_fp16_t *p) {
  * AVX2+FMA, so one portable binary is fast on modern x86 and correct on old
  * chips (and under emulators without AVX). NEON on arm64 needs none of this —
  * it is baseline. */
+#if TK_DTYPE != TK_DTYPE_FP16
 static int tk__cpu_has_avx2(void) {
     static int cached = -1;
     if (cached < 0) cached = (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma"));
     return cached;
 }
+#else
+/* F16C adds hardware fp16<->fp32 conversion (VCVTPH2PS). It predates AVX2 (Ivy
+ * Bridge / AMD Piledriver) and is present on every AVX2 CPU, but gate on it
+ * explicitly so the fp16 kernel is entered only when the convert is guaranteed
+ * -- same cached-check pattern as tk__cpu_has_avx2. This is what gives DEFAULT
+ * portable x86 builds (no -march / no -mf16c) hardware fp16 conversion; the
+ * scalar tk_fp16_to_float software path in dtypes.h stays the fallback on
+ * pre-F16C chips. __builtin_cpu_supports is clang/gcc; both are the supported
+ * x86 toolchains (MSVC is unsupported, see tk_export.h). */
+static int tk__cpu_has_f16c(void) {
+    static int cached = -1;
+    if (cached < 0) cached = (__builtin_cpu_supports("f16c")
+                              && __builtin_cpu_supports("avx2")
+                              && __builtin_cpu_supports("fma"));
+    return cached;
+}
+#endif
 
 __attribute__((target("avx2,fma")))
 static float tk__hsum256(__m256 v) {
@@ -125,38 +143,69 @@ static __m256 tk__bf16x8(const tk_bf16_t *p) {
     __m256i w = _mm256_slli_epi32(_mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i *)p)), 16);
     return _mm256_castsi256_ps(w);
 }
+#define TK__LD8(p) tk__bf16x8(p)
+#elif TK_DTYPE == TK_DTYPE_FLOAT32
+#define TK__LD8(p) _mm256_loadu_ps(p)
 #endif
 
-/* Four dot products, 8-wide AVX2 FMA accumulators (one per weight row). */
+/* Four dot products, four weight rows x TWO __m256 FMA accumulator chains
+ * (depth-2 per row = 8 chains, 16 elements/iteration). A single chain per row
+ * serializes on FMA *latency* (~4 cyc Skylake, ~5 cyc Haswell/Zen; Agner Fog,
+ * uops.info) while the two FMA ports (p0/p1) retire 2 FMA/cyc, so a lone chain
+ * reaches at most 1/latency of peak. Eight independent chains cover the latency
+ * x throughput product (8 Skylake, 10 Haswell/Zen) and keep both ports fed --
+ * the exact argument behind the arm64 NEON depth-8 kernel. Weight loads fold
+ * into the FMA memory operand (f32), so the eight accumulators + two x-vectors
+ * sit well inside the 16 YMM registers. A residual 8-block then a scalar tail. */
+#define TK__DOT4_AVX2_BODY(LOAD8)                                             \
+    const tk_scalar_t *w0 = W, *w1 = W + in, *w2 = W + 2 * in, *w3 = W + 3 * in; \
+    __m256 a0 = _mm256_setzero_ps(), a1 = a0, a2 = a0, a3 = a0;               \
+    __m256 b0 = a0, b1 = a0, b2 = a0, b3 = a0;                                \
+    int i = 0;                                                                \
+    for (; i + 16 <= in; i += 16) {                                          \
+        __m256 x0 = LOAD8(x + i), x1 = LOAD8(x + i + 8);                      \
+        a0 = _mm256_fmadd_ps(LOAD8(w0 + i), x0, a0); b0 = _mm256_fmadd_ps(LOAD8(w0 + i + 8), x1, b0); \
+        a1 = _mm256_fmadd_ps(LOAD8(w1 + i), x0, a1); b1 = _mm256_fmadd_ps(LOAD8(w1 + i + 8), x1, b1); \
+        a2 = _mm256_fmadd_ps(LOAD8(w2 + i), x0, a2); b2 = _mm256_fmadd_ps(LOAD8(w2 + i + 8), x1, b2); \
+        a3 = _mm256_fmadd_ps(LOAD8(w3 + i), x0, a3); b3 = _mm256_fmadd_ps(LOAD8(w3 + i + 8), x1, b3); \
+    }                                                                         \
+    a0 = _mm256_add_ps(a0, b0); a1 = _mm256_add_ps(a1, b1);                   \
+    a2 = _mm256_add_ps(a2, b2); a3 = _mm256_add_ps(a3, b3);                   \
+    for (; i + 8 <= in; i += 8) {                                            \
+        __m256 xv = LOAD8(x + i);                                            \
+        a0 = _mm256_fmadd_ps(LOAD8(w0 + i), xv, a0); a1 = _mm256_fmadd_ps(LOAD8(w1 + i), xv, a1); \
+        a2 = _mm256_fmadd_ps(LOAD8(w2 + i), xv, a2); a3 = _mm256_fmadd_ps(LOAD8(w3 + i), xv, a3); \
+    }                                                                         \
+    float s0 = tk__hsum256(a0), s1 = tk__hsum256(a1);                         \
+    float s2 = tk__hsum256(a2), s3 = tk__hsum256(a3);                         \
+    for (; i < in; i++) {                                                     \
+        float xi = TK_TO_FLOAT(x[i]);                                         \
+        s0 += TK_TO_FLOAT(w0[i]) * xi; s1 += TK_TO_FLOAT(w1[i]) * xi;         \
+        s2 += TK_TO_FLOAT(w2[i]) * xi; s3 += TK_TO_FLOAT(w3[i]) * xi;         \
+    }                                                                         \
+    out[0] = s0; out[1] = s1; out[2] = s2; out[3] = s3;
+
+#if TK_DTYPE == TK_DTYPE_FP16
+/* Load 8 fp16 as float32 with one VCVTPH2PS (F16C) -- IEEE-exact incl.
+ * subnormals, the hardware analogue of the scalar tk_fp16_to_float read. */
+__attribute__((target("f16c,avx2,fma")))
+static __m256 tk__fp16x8(const tk_fp16_t *p) {
+    return _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)p));
+}
+
+/* fp16 GEMV kernel: identical 4-row x 2-chain shape, F16C hardware load. */
+__attribute__((target("f16c,avx2,fma")))
+static void tk__dot4_avx2_fp16(const tk_scalar_t *W, int in, const tk_scalar_t *x, float *out) {
+    TK__DOT4_AVX2_BODY(tk__fp16x8)
+}
+#else
 __attribute__((target("avx2,fma")))
 static void tk__dot4_avx2(const tk_scalar_t *W, int in, const tk_scalar_t *x, float *out) {
-    const tk_scalar_t *w0 = W, *w1 = W + in, *w2 = W + 2 * in, *w3 = W + 3 * in;
-    __m256 a0 = _mm256_setzero_ps(), a1 = a0, a2 = a0, a3 = a0;
-    int i = 0;
-    for (; i + 8 <= in; i += 8) {
-#if TK_DTYPE == TK_DTYPE_FLOAT32
-        __m256 xv = _mm256_loadu_ps(x + i);
-        a0 = _mm256_fmadd_ps(_mm256_loadu_ps(w0 + i), xv, a0);
-        a1 = _mm256_fmadd_ps(_mm256_loadu_ps(w1 + i), xv, a1);
-        a2 = _mm256_fmadd_ps(_mm256_loadu_ps(w2 + i), xv, a2);
-        a3 = _mm256_fmadd_ps(_mm256_loadu_ps(w3 + i), xv, a3);
-#else
-        __m256 xv = tk__bf16x8(x + i);
-        a0 = _mm256_fmadd_ps(tk__bf16x8(w0 + i), xv, a0);
-        a1 = _mm256_fmadd_ps(tk__bf16x8(w1 + i), xv, a1);
-        a2 = _mm256_fmadd_ps(tk__bf16x8(w2 + i), xv, a2);
-        a3 = _mm256_fmadd_ps(tk__bf16x8(w3 + i), xv, a3);
-#endif
-    }
-    float s0 = tk__hsum256(a0), s1 = tk__hsum256(a1);
-    float s2 = tk__hsum256(a2), s3 = tk__hsum256(a3);
-    for (; i < in; i++) {
-        float xi = TK_TO_FLOAT(x[i]);
-        s0 += TK_TO_FLOAT(w0[i]) * xi; s1 += TK_TO_FLOAT(w1[i]) * xi;
-        s2 += TK_TO_FLOAT(w2[i]) * xi; s3 += TK_TO_FLOAT(w3[i]) * xi;
-    }
-    out[0] = s0; out[1] = s1; out[2] = s2; out[3] = s3;
+    TK__DOT4_AVX2_BODY(TK__LD8)
 }
+#undef TK__LD8
+#endif
+#undef TK__DOT4_AVX2_BODY
 #endif /* arch dispatch */
 
 float tk_dot(const tk_scalar_t *restrict a, const tk_scalar_t *restrict b, int n) {
@@ -183,7 +232,8 @@ float tk_dot(const tk_scalar_t *restrict a, const tk_scalar_t *restrict b, int n
  * a single-row loop can do neither. On arm64, float32/bfloat16/fp16 use
  * explicit NEON kernels with two accumulator chains per row (depth-8); bf16
  * additionally dispatches to a BFMLALB/T kernel on FEAT_BF16 CPUs. x86-64
- * runtime-dispatches AVX2+FMA for float32/bfloat16. */
+ * runtime-dispatches AVX2+FMA for float32/bfloat16, and AVX2+F16C for fp16
+ * (hardware VCVTPH2PS read) -- all three with two __m256 chains per row. */
 static inline void tk__dot4(const tk_scalar_t *restrict W, int in,
                             const tk_scalar_t *restrict x,
                             float *restrict out) {
@@ -217,7 +267,11 @@ static inline void tk__dot4(const tk_scalar_t *restrict W, int in,
     s0 = vaddvq_f32(vaddq_f32(a0, b0)); s1 = vaddvq_f32(vaddq_f32(a1, b1));
     s2 = vaddvq_f32(vaddq_f32(a2, b2)); s3 = vaddvq_f32(vaddq_f32(a3, b3));
 #elif defined(TK_HAVE_AVX2)
+  #if TK_DTYPE == TK_DTYPE_FP16
+    if (tk__cpu_has_f16c()) { tk__dot4_avx2_fp16(W, in, x, out); return; }  /* else portable below */
+  #else
     if (tk__cpu_has_avx2()) { tk__dot4_avx2(W, in, x, out); return; }  /* else portable below */
+  #endif
 #endif
     for (; i < in; i++) {
         float xi = TK_TO_FLOAT(x[i]);

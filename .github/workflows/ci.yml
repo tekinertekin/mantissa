@@ -27,15 +27,35 @@ jobs:
       - name: Shared library build
         run: make lib
       # Warnings can't fail the normal build, so recompile everything with the
-      # Makefile's exact flags plus -Werror to gate on a clean compile.
+      # Makefile's exact flags plus -Werror to gate on a clean compile. Cover
+      # the three SIMD-dispatched float dtypes (f32/fp16/bf16) so each AVX2 /
+      # F16C code path is warning-gated -- the fp16 path in particular selects a
+      # different cpuid helper, and a build that leaves the other one unused
+      # must not trip -Wunused-function.
       - name: Warnings check (-Werror)
         run: |
           mkdir -p build
-          cc -O3 -funroll-loops -ffp-contract=fast -Wall -Wextra -std=c11 \
-             -Iinclude -DTK_DTYPE=2 -fvisibility=hidden -pthread -Werror \
-             -o build/test_dtypes_werror \
-             src/dtypes.c src/activations.c src/ops.c src/loss.c src/backprop.c src/pool.c \
-             tests/test_dtypes.c -lm -pthread
+          for d in 0 1 2; do
+            cc -O3 -funroll-loops -ffp-contract=fast -Wall -Wextra -std=c11 \
+               -Iinclude -DTK_DTYPE=$d -fvisibility=hidden -pthread -Werror \
+               -o build/test_dtypes_werror \
+               src/dtypes.c src/activations.c src/ops.c src/loss.c src/backprop.c src/pool.c \
+               tests/test_dtypes.c -lm -pthread
+          done
+      # AUTHORITATIVE x86 SIMD numbers. macOS-arm64 devs can only build the AVX2
+      # /F16C kernels under Rosetta, which reports no AVX2/FMA/F16C (SSE4.2 max)
+      # and so runs the scalar fallback -- these kernels genuinely execute only
+      # on this real-x86 runner. Informational (|| true): perf must never fail
+      # CI, and shared runners are DVFS-noisy, so five interleaved repeats are
+      # logged per dtype to read a median from, not a single run.
+      - name: GEMV/GEMM bench (x86, informational)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          for d in 0 1 2; do
+            echo "==== DTYPE=$d (5 interleaved repeats) ===="
+            make DTYPE=$d bench || true                 # builds build/benchmark + repeat 1
+            for r in 2 3 4 5; do ./build/benchmark || true; done
+          done
 
   # AddressSanitizer + UndefinedBehaviorSanitizer so memory/UB bugs regress
   # loudly. One storage format (DTYPE=2) plus the backprop check is enough.

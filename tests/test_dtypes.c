@@ -79,9 +79,12 @@ static void test_and_perceptron(void) {
 static void test_simd_kernel(void) {
     /* Exercise the register-blocked SIMD kernel (out>=4, in>=8 hits tk__dot4's
      * 4-row NEON/AVX2 path) against a scalar reference. This is what validates
-     * the vectorized kernels — e.g. the AVX2 path when CI runs on x86. */
+     * the vectorized kernels — e.g. the AVX2 path when CI runs on x86. I=44
+     * covers every sub-loop of the two-chain AVX2 kernel: the 16-wide main loop
+     * twice (chain accumulation across iterations), the 8-wide residual, and
+     * the scalar tail — so a bug in any of the three is caught on real x86. */
     printf("\nlinear layer vs scalar reference (SIMD kernel check):\n");
-    enum { O = 8, I = 20 };
+    enum { O = 8, I = 44 };
     tk_scalar_t Wl[O * I], xl[I], bl[O];
     for (int k = 0; k < O * I; k++) Wl[k] = TK_FROM_FLOAT(((k % 9) - 4) * 0.1f);
     for (int k = 0; k < I; k++)     xl[k] = TK_FROM_FLOAT(((k % 5) - 2) * 0.2f);
