@@ -66,6 +66,12 @@ backward one-pass zeroing (~20% of a small op), inference forward that
 skips the Z store entirely, `tk_delta_fit`, and the verified negatives
 (Prepared adoption would regress; perceptron's seam is already right).
 
+**Downstream adoption (same day)**: mantissa-autoencoder v0.1.1 switched
+its `Upsample2D` layer onto the new primitive (feature-detected via
+`hasattr(backend, "upsample2d")`; the numpy oracle path stays the
+fallback) — the measured numbers live in that repo's CHANGELOG and
+benchmark README.
+
 ---
 
 ## v0.2.2 — 2026-07-13  (tag `v0.2.2`)
