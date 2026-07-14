@@ -504,13 +504,21 @@ int main(void) {
     printf("Conv/pool/dense-batch gradient check (float32, central differences):\n");
 
     /* stride 1/2, pad 0/1/2, kh != kw, non-square inputs, three activations.
-     * relu inputs get a bias nudge so no z sits on the z==0 kink (checked). */
+     * relu inputs get a bias nudge so no z sits on the z==0 kink (checked).
+     * The lower block adds the degenerate shapes the three downstream CNN
+     * consumers actually construct: single-channel edges, a 1x1 kernel with
+     * padding (border outputs are bias-only), a whole-image kernel that
+     * collapses to a 1x1 output, and stride > kernel with kh != kw. */
     const conv_cfg cfgs[] = {
         { 2, 2, 5, 6, 3, 3, 2, 1, 0, TK_ACT_TANH,     "s1 p0 3x2 tanh" },
         { 1, 1, 7, 5, 2, 3, 3, 2, 1, TK_ACT_IDENTITY, "s2 p1 3x3 ident" },
         { 2, 2, 6, 4, 2, 2, 3, 2, 2, TK_ACT_TANH,     "s2 p2 2x3 tanh" },
         { 2, 3, 4, 5, 4, 3, 3, 1, 1, TK_ACT_RELU,     "s1 p1 3x3 relu" },
         { 1, 2, 5, 5, 3, 1, 1, 1, 0, TK_ACT_TANH,     "s1 p0 1x1 tanh" },
+        { 2, 1, 5, 5, 1, 3, 3, 1, 1, TK_ACT_TANH,     "in_c=1 out_c=1 s1 p1" },
+        { 2, 3, 4, 4, 2, 1, 1, 1, 1, TK_ACT_IDENTITY, "1x1 kernel pad1 ident" },
+        { 2, 2, 5, 5, 3, 5, 5, 1, 0, TK_ACT_TANH,     "output 1x1 (k==in)" },
+        { 1, 2, 7, 6, 2, 3, 2, 3, 1, TK_ACT_TANH,     "s3 p1 3x2 kh!=kw" },
     };
     for (size_t i = 0; i < sizeof cfgs / sizeof *cfgs; i++) check_conv(&cfgs[i]);
     test_conv_vs_naive();
