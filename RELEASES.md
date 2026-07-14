@@ -6,6 +6,68 @@ dense layer (4.2M params) unless noted, and are indicative, not absolute.
 
 ---
 
+## v0.2.3 — 2026-07-14  (tag `v0.2.3`)
+
+The audit release. Six independent read-only analysis lenses (training loop,
+RAM, FFI seam, inference, numpy idioms, cross-repo architecture) were run
+over the downstream family (perceptron / cnn / auto-encoder); everything
+core-fixable landed here, the downstream items and verified-negatives are
+recorded (agent notes, 2026-07-14). Plus two dedicated test passes.
+
+**Fixed**
+- **Session pointer memo now references arrays weakly.** The strong-ref
+  design retained every array a Session ever saw — three lenses hit it
+  independently (fresh inference chunk slices, per-batch noise arrays,
+  reshape views): ~100 KB pinned per predict call, 1.8 GB over a 10-epoch
+  denoise fit, unbounded. Two subtleties: numpy's `data_as()` embeds a
+  strong backref inside the pointer it returns (memoized pointers are now
+  built from the raw address; the caller's reference covers each call), and
+  dead entries bulk-sweep past a threshold. Volatile arrays: all
+  collectable; memo bounded (~5 entries after 4k fresh arrays); stable-
+  buffer hit 186 ns; bit-identical results.
+- **maxpool2d rejects non-int32 argmax** instead of writing the winners to
+  a discarded boxed temp (found by the new binding contract tests — a
+  later backward through that argmax would have scattered garbage).
+
+**Added**
+- **`tk_upsample2d_nearest_f32` / `_backward_f32`** — the upsample+conv
+  decoder op (Odena, Dumoulin & Olah, 2016). The numpy forms measured far
+  under copy speed at autoencoder shapes (fwd broadcast 4 vs 74 GB/s; bwd
+  fused-sum 9×): C measures fwd 200→41 / 416→37 µs, bwd 739→21 /
+  1415→30 µs (**up to 47×**; a denoise-decoder batch's upsample work drops
+  2.77 → 0.13 ms). Oracle-verified at k=2,3,4; threaded over planes.
+- **`tk_sgd_update_list_f32`** — one crossing updates a parameter LIST,
+  bit-identical to per-tensor calls (measured downstream: 3,780 → 315
+  crossings/fit; a 16-float bias costs more to cross than to compute).
+  The Session variant memoizes pointer arrays per-list and re-verifies
+  every tensor's identity on hits.
+- **`conv2d_out_dim` computed in Python** — the four-int formula was 50% of
+  ALL FFI crossings in a downstream fit (2 per conv/pool call). Mirrors C
+  BIT-EXACTLY including truncate-toward-zero division in the degenerate
+  band `-stride < in+2p-k < 0` (a 152-case grid cross-check caught floor
+  vs trunc; the binding must agree with the kernel's internal oh/ow math).
+  369 → 133 ns and no crossing.
+- **`Z=None` documented for ANY activation** on the forward/inference path
+  (the C guards always allowed it; verified bit-identical Y) — one
+  output-sized store elided per layer when no backward follows.
+- **`mse_loss` binding over `tk_loss`** — API completeness; the docstring
+  is honest that a well-formed numpy MSE is not slower.
+- **Tests**: degenerate conv shapes join the gradcheck table; new
+  `make testedge` C contract suite (out_dim table, 1×1-conv ≡ dense-head
+  cross-validation bit-for-bit, softmax ±1e4 stability, whole-input pool,
+  fixed-thread determinism); new `python/test_binding.py` (50 checks:
+  marshalling writebacks, Trainer/Session error contracts verbatim,
+  Prepared's ULP-envelope promise, the weakref leak contract).
+
+**Recorded, not shipped**: downstream adoption backlog (staging-buffer
+inference, lazy dX scratch, cifar loader single-pass, float64 metric
+temporaries, in-place noise; each sized in the audit notes), maxpool
+backward one-pass zeroing (~20% of a small op), inference forward that
+skips the Z store entirely, `tk_delta_fit`, and the verified negatives
+(Prepared adoption would regress; perceptron's seam is already right).
+
+---
+
 ## v0.2.2 — 2026-07-13  (tag `v0.2.2`)
 
 The conv-GEMM release: the v0.2.1 primitives kept their exact ABI and got a

@@ -315,6 +315,8 @@ Runnable cross-check: [`python/test_conv_binding.py`](../python/test_conv_bindin
 | A shuffled epoch without copying rows, in-epoch mistake count | `tk_train_epoch_order_f32` |
 | An epoch of the Rosenblatt perceptron rule (returns mistakes) | `tk_perceptron_epoch_f32` |
 | Epoch calls in a loop without per-call pointer rebinding (Python) | `Mantissa().trainer(...)` |
+| Nearest-neighbor upsample (decoder side), fwd/bwd | `tk_upsample2d_nearest_f32` / `_backward_f32` |
+| Update a whole parameter list in one crossing | `tk_sgd_update_list_f32` |
 | Repeated inference on fixed weights (Python) | `Mantissa().prepare(...).forward(...)` |
 | Dropout forward / backward | `tk_dropout_forward` / `tk_dropout_backward` |
 | Conv layer forward, batched float32 (NCHW) | `tk_conv2d_forward_f32` |
