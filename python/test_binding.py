@@ -249,14 +249,13 @@ def test_session(tk):
     s.sgd_update(W, dW, 4, 0.5)               # second call: memo hit
     check(np.array_equal(W, np.arange(4, dtype=np.float32) - 1.0),
           "Session sgd_update: two calls on the same buffers, correct result")
-    check(s._fp(W, 4, "W") is s._fp(W, 4, "W") and len(s._fmemo) == 2,
-          "identity memo: same array object -> the cached pointer, one entry each")
+    check(s._fp(W, 4, "W") is s._fp(W, 4, "W"),
+          "identity memo: same array object -> the cached pointer is reused")
 
     # A REPLACED array object must rebind — results land in the new storage.
     W2 = np.arange(4, dtype=np.float32)
     s.sgd_update(W2, dW, 4, 0.5)
-    check(np.array_equal(W2, np.arange(4, dtype=np.float32) - 0.5)
-          and len(s._fmemo) == 3,
+    check(np.array_equal(W2, np.arange(4, dtype=np.float32) - 0.5),
           "replaced array object: fresh bind, mutation lands in the new array")
 
     expect(TypeError, "W: need a C-contiguous float32 array for a pre-bound "
@@ -285,6 +284,55 @@ def test_session(tk):
     expect(ValueError, "labels: expected 2 int32 values, got 3",
            lambda: s.softmax_xent(lg, np.zeros(3, np.int32), dl, 2, 4),
            "Session wrong-size labels")
+
+
+def test_session_gc(tk):
+    """Weakref-memo contract: the Session must not keep dead arrays alive nor
+    grow unboundedly across fresh-array-per-call patterns. Regression guard
+    for two ways this was broken before: the original memo held strong
+    references (every fresh inference slice retained for the model's
+    lifetime), and a first weakref version stored `arr.ctypes.data_as(...)`
+    pointers, whose `._arr` backref (numpy's use-after-free guard) re-pinned
+    every array through the weakref anyway. The memo must hold neither."""
+    import gc
+    import weakref
+
+    s = tk.session()
+    dW = np.ones(4, dtype=np.float32)
+    W = np.arange(4, dtype=np.float32)
+    s.sgd_update(W, dW, 4, 0.5)
+    wr = weakref.ref(W)
+    del W
+    gc.collect()
+    check(wr() is None,
+          "Session does not keep a deleted float32 array alive")
+
+    lg = np.zeros(2 * 2, dtype=np.float32)
+    dl = np.zeros(2 * 2, dtype=np.float32)
+    lb = np.zeros(2, dtype=np.int32)
+    s.softmax_xent(lg, lb, dl, 2, 2)
+    wi = weakref.ref(lb)
+    del lb
+    gc.collect()
+    check(wi() is None,
+          "Session does not keep a deleted int32 array alive")
+
+    sweep = getattr(type(s), "_SWEEP_AT", 4096)
+    s2 = tk.session()                         # fresh session: exact counts
+    for _ in range(sweep + 64):               # fresh array per call, all dead
+        s2.sgd_update(np.zeros(4, dtype=np.float32), dW, 4, 0.1)
+    gc.collect()
+    check(len(s2._fmemo) <= sweep,
+          f"memo stays bounded by the sweep ({len(s2._fmemo)} entries after "
+          f"{sweep + 64} fresh arrays, purge threshold {sweep})")
+
+    # array('f') buffers are accepted by Session (bindable) but are not
+    # weakrefable — the documented contract is: correct, just unmemoized.
+    Wa = array("f", [0.0, 1.0, 2.0, 3.0])
+    s.sgd_update(Wa, dW, 4, 0.5)
+    check(np.array_equal(np.frombuffer(Wa, np.float32),
+                         np.arange(4, dtype=np.float32) - 0.5),
+          "Session accepts array('f') (unmemoized), mutation lands")
 
 
 def test_session_matches_unbound(tk):
@@ -412,6 +460,7 @@ def main():
     test_trainer_margins(tk)
     test_order_paths(tk)
     test_session(tk)
+    test_session_gc(tk)
     test_session_matches_unbound(tk)
     test_prepared(tk)
     test_cnn_edges(tk)
