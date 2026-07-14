@@ -27,7 +27,7 @@ else
     LIBEXT := so
 endif
 
-.PHONY: test testbp testconv lib dist example mlp train bench benchbp benchconv clean
+.PHONY: test testbp testconv testedge lib dist example mlp train bench benchbp benchconv clean
 
 test: $(SRC) tests/test_dtypes.c
 	@mkdir -p $(BUILD)
@@ -74,6 +74,15 @@ testconv: $(SRC) tests/test_conv.c
 	$(CC) -O3 -funroll-loops -ffp-contract=fast -Wall -Wextra -std=c11 \
 	      -Iinclude -DTK_DTYPE=0 -o $(BUILD)/test_conv $^ $(LDFLAGS)
 	@./$(BUILD)/test_conv
+
+# CNN primitive contract / edge cases: out_dim table, 1x1-conv==dense,
+# softmax-xent corners, degenerate dense shapes, whole-input pool, fixed-thread
+# determinism (float32, like testconv).
+testedge: $(SRC) tests/test_edges.c
+	@mkdir -p $(BUILD)
+	$(CC) -O3 -funroll-loops -ffp-contract=fast -Wall -Wextra -std=c11 \
+	      -Iinclude -Isrc -DTK_DTYPE=0 -o $(BUILD)/test_edges $^ $(LDFLAGS)
+	@./$(BUILD)/test_edges
 
 bench: $(SRC) bench/benchmark.c
 	@mkdir -p $(BUILD)
