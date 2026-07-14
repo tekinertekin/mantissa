@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ctypes
 import sys
+import weakref as _weakref
 from array import array
 from pathlib import Path
 
@@ -357,8 +358,23 @@ class Mantissa:
 
     def conv2d_out_dim(self, in_dim: int, k: int, stride: int, pad: int) -> int:
         """Conv/pool output spatial size: (in + 2*pad - k)//stride + 1,
-        clamped to >= 0 (0 on degenerate arguments)."""
-        return int(self._lib.tk_conv2d_out_dim(in_dim, k, stride, pad))
+        clamped to >= 0 (0 on degenerate arguments).
+
+        Computed in Python, mirroring tk_conv2d_out_dim BIT-EXACTLY — including
+        C's truncate-toward-zero division, which for the degenerate band
+        -stride < in+2p-k < 0 yields 1, not 0 (Python floor-div would differ;
+        a 152-case grid cross-check against the C export caught exactly that).
+        The kernel computes oh/ow with the same C function internally, so the
+        binding MUST agree or buffer sizes go wrong. The C export stays the
+        ABI source of truth (tests/test_edges.c pins its table); the FFI
+        round-trip for this pure integer formula measured 50% of ALL crossings
+        in a downstream CNN fit (2 per conv/pool call)."""
+        if in_dim <= 0 or k <= 0 or stride <= 0 or pad < 0:
+            return 0
+        span = in_dim + 2 * pad - k
+        q = span // stride if span >= 0 else -((-span) // stride)  # C trunc div
+        out = q + 1
+        return out if out > 0 else 0
 
     def conv2d_forward(self, X, K, bias, Z, Y, n: int, in_c: int, in_h: int,
                        in_w: int, out_c: int, kh: int, kw: int,
@@ -522,11 +538,19 @@ class Session:
     LeNet-5/MNIST fit (M4): pointer conversion was ~12% of wall time
     (16.8k conversions); a Session removes almost all of it.
 
-    The memo holds a strong reference to every array it has seen — that is
-    exactly what keeps the `id()` keys valid — so create one Session per
-    model, not a process-global one. Buffers must be C-contiguous numpy
-    arrays (float32; int32 for argmax/labels): the zero-copy requirement is
-    the point, so anything else raises instead of silently copying."""
+    The memo references its arrays WEAKLY: a cached entry is used only while
+    the exact same object is still alive (checked by identity on every hit),
+    and arrays the caller drops are not kept alive by the Session. The first
+    version held strong references — measured downstream, that retained every
+    fresh inference slice and per-batch noise array for the model's lifetime
+    (~100 KB per predict call / per denoise batch, unbounded). Buffers must
+    be C-contiguous numpy arrays (float32; int32 for argmax/labels): the
+    zero-copy requirement is the point, so anything else raises instead of
+    silently copying. Volatile arrays (a fresh object per call) still work —
+    they simply pay the one-time pointer walk each call; reuse a staging
+    buffer to get memo hits."""
+
+    _SWEEP_AT = 4096   # purge dead weakref entries when the memo grows past this
 
     def __init__(self, tk: "Mantissa"):
         self._tk = tk
@@ -534,27 +558,55 @@ class Session:
         self._fmemo = {}
         self._imemo = {}
 
-    def _fp(self, arr, n: int, name: str):
-        hit = self._fmemo.get(id(arr))
-        if hit is not None and hit[0] is arr:
+    @staticmethod
+    def _memo_get(memo, arr):
+        hit = memo.get(id(arr))
+        if hit is not None and hit[0]() is arr:
             return hit[1]
-        p = _bind_c_float(arr, n, name)
-        self._fmemo[id(arr)] = (arr, p)
+        return None
+
+    def _memo_put(self, memo, arr, p):
+        # id() keys stay valid only while the object lives; the identity check
+        # in _memo_get makes a recycled id at worst a rebind, never a stale
+        # pointer. Dead entries are swept in bulk so the dict stays bounded
+        # even under a fresh-array-per-call pattern.
+        if len(memo) >= self._SWEEP_AT:
+            for k in [k for k, v in memo.items() if v[0]() is None]:
+                del memo[k]
+        try:
+            memo[id(arr)] = (_weakref.ref(arr), p)
+        except TypeError:                     # non-weakrefable (array('f'))
+            pass                              # correct, just unmemoized
         return p
 
+    def _fp(self, arr, n: int, name: str):
+        p = self._memo_get(self._fmemo, arr)
+        if p is not None:
+            return p
+        _bind_c_float(arr, n, name)           # validation (raises on misuse)
+        if not isinstance(arr, _np.ndarray):  # array('f'): valid but unmemoized
+            return _bind_c_float(arr, n, name)
+        # Pointer built from the raw address, NOT data_as(): numpy's data_as
+        # embeds a strong reference to the array inside the pointer object
+        # (its use-after-free guard), which would re-pin every array through
+        # the weakref memo — measured: 50 volatile slices stayed alive. The
+        # caller's own reference keeps the array valid for the duration of
+        # each C call; between calls the weakref identity check protects us.
+        return self._memo_put(self._fmemo, arr,
+                              ctypes.cast(arr.ctypes.data, _f32p))
+
     def _ip(self, arr, n: int, name: str):
-        hit = self._imemo.get(id(arr))
-        if hit is not None and hit[0] is arr:
-            return hit[1]
+        p = self._memo_get(self._imemo, arr)
+        if p is not None:
+            return p
         if not (_np is not None and isinstance(arr, _np.ndarray)
                 and arr.dtype == _np.int32 and arr.flags["C_CONTIGUOUS"]):
             raise TypeError(f"{name}: Session needs a C-contiguous int32 "
                             f"numpy array")
         if arr.size != n:
             raise ValueError(f"{name}: expected {n} int32 values, got {arr.size}")
-        p = arr.ctypes.data_as(_i32p)
-        self._imemo[id(arr)] = (arr, p)
-        return p
+        return self._memo_put(self._imemo, arr,
+                              ctypes.cast(arr.ctypes.data, _i32p))
 
     def conv2d_out_dim(self, in_dim: int, k: int, stride: int, pad: int) -> int:
         return self._tk.conv2d_out_dim(in_dim, k, stride, pad)
