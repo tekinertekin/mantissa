@@ -155,6 +155,23 @@ class Mantissa:
             _i32p, ctypes.POINTER(ctypes.c_int),  # order (or NULL), mistakes (or NULL)
         ]
 
+        self._lib.tk_sgd_update_list_f32.restype = None
+        self._lib.tk_sgd_update_list_f32.argtypes = [
+            ctypes.POINTER(_f32p), ctypes.POINTER(_f32p),
+            ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_float,
+        ]
+        self._lib.tk_upsample2d_nearest_f32.restype = None
+        self._lib.tk_upsample2d_nearest_f32.argtypes = [
+            _f32p, _f32p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ]
+        self._lib.tk_upsample2d_nearest_backward_f32.restype = None
+        self._lib.tk_upsample2d_nearest_backward_f32.argtypes = \
+            self._lib.tk_upsample2d_nearest_f32.argtypes
+        self._lib.tk_loss.restype = ctypes.c_float
+        self._lib.tk_loss.argtypes = [_f32p, _f32p, _f32p,
+                                      ctypes.c_int, ctypes.c_int]
+
         # one epoch of the mistake-driven Rosenblatt rule; returns mistakes
         self._lib.tk_perceptron_epoch_f32.restype = ctypes.c_int
         self._lib.tk_perceptron_epoch_f32.argtypes = [
@@ -381,8 +398,11 @@ class Mantissa:
                        stride: int, pad: int, act: int):
         """Batched conv2d forward: Y = act(conv(X, K) + bias), NCHW.
         X: n*in_c*in_h*in_w, K: out_c*in_c*kh*kw, bias: out_c or None,
-        Z (pre-activation, needed by backward): n*out_c*oh*ow or None
-        (identity only), Y: same shape as Z. Returns Y. im2col + GEMM in C,
+        Z (pre-activation): n*out_c*oh*ow, or None for ANY activation when
+        no backward pass will follow — inference then skips a full
+        output-sized store per layer (backward still requires the saved Z
+        for non-identity activations; for identity, Y works: Z == Y there).
+        Y: same shape as Z. Returns Y. im2col + GEMM in C,
         one sample's patch matrix at a time, threaded over the batch.
         Measured (M4, VGG 64x32x32->64@3x3 pad 1, batch 16): 24.8 ms serial /
         5.97 ms threaded, 202 GFLOP/s."""
@@ -440,6 +460,14 @@ class Mantissa:
         ysz = n * c * oh * ow
         Xc, _ = _as_c_float(X, n * c * in_h * in_w, "X")
         Yc, Y_wb = _as_c_float(Y, ysz, "Y")
+        # argmax is an OUTPUT: _as_c_int32's boxed fallback for non-int32
+        # input would be written by C and silently discarded (no writeback)
+        # — a later maxpool2d_backward through it would scatter garbage.
+        # Found by the binding contract tests; require zero-copy here.
+        if _np is not None and isinstance(argmax, _np.ndarray) \
+                and argmax.dtype != _np.int32:
+            raise TypeError(f"argmax: needs an int32 numpy array (it is "
+                            f"written by C); got dtype={argmax.dtype}")
         ac = _as_c_int32(argmax, ysz, "argmax")
         self._lib.tk_maxpool2d_f32(Xc, Yc, ac, n, c, in_h, in_w, pool, stride)
         if Y_wb:
@@ -518,6 +546,68 @@ class Mantissa:
         if W_wb:
             W_wb()
 
+    def upsample2d(self, X, Y, n: int, c: int, in_h: int, in_w: int, k: int):
+        """Nearest-neighbor upsample by integer factor k (NCHW): X
+        n*c*in_h*in_w -> Y n*c*(in_h*k)*(in_w*k). Returns Y. The decoder op
+        of upsample+conv architectures (Odena, Dumoulin & Olah, 2016).
+        Measured vs the numpy broadcast-assign at autoencoder shapes
+        (batch 32): 200 -> 41 us and 416 -> 37 us."""
+        Xc, _ = _as_c_float(X, n * c * in_h * in_w, "X")
+        Yc, Y_wb = _as_c_float(Y, n * c * in_h * k * in_w * k, "Y")
+        self._lib.tk_upsample2d_nearest_f32(Xc, Yc, n, c, in_h, in_w, k)
+        if Y_wb:
+            Y_wb()
+        return Y
+
+    def upsample2d_backward(self, dY, dX, n: int, c: int, in_h: int,
+                            in_w: int, k: int):
+        """Exact adjoint of upsample2d: dX = k x k block-sum of dY
+        (dY n*c*(in_h*k)*(in_w*k) -> dX n*c*in_h*in_w). Measured vs numpy's
+        fused np.sum(axis=(3,5)): 739 -> 21 us and 1415 -> 30 us (35-47x —
+        the reduction iterator degenerates on interleaved length-k axes)."""
+        dYc, _ = _as_c_float(dY, n * c * in_h * k * in_w * k, "dY")
+        dXc, dX_wb = _as_c_float(dX, n * c * in_h * in_w, "dX")
+        self._lib.tk_upsample2d_nearest_backward_f32(dYc, dXc, n, c,
+                                                     in_h, in_w, k)
+        if dX_wb:
+            dX_wb()
+        return dX
+
+    def sgd_update_list(self, Ws, dWs, lr: float):
+        """SGD over a LIST of parameter tensors in ONE crossing:
+        Ws[i] -= lr * dWs[i], elementwise, C-contiguous float32 numpy arrays
+        only (in-place mutation is the point). Bit-identical to calling
+        sgd_update per tensor; a 16-float bias update costs more to cross
+        than to compute, and a small model updates 8-12 tensors per batch."""
+        count = len(Ws)
+        if len(dWs) != count:
+            raise ValueError(f"Ws has {count} tensors but dWs has {len(dWs)}")
+        wp = (_f32p * count)()
+        dp = (_f32p * count)()
+        ns = (ctypes.c_int * count)()
+        for i, (w, d) in enumerate(zip(Ws, dWs)):
+            if d.size != w.size:
+                raise ValueError(f"tensor {i}: W has {w.size} elements, "
+                                 f"dW has {d.size}")
+            wp[i] = _bind_c_float(w, w.size, f"Ws[{i}]")
+            dp[i] = _bind_c_float(d, d.size, f"dWs[{i}]")
+            ns[i] = w.size
+        self._lib.tk_sgd_update_list_f32(wp, dp, ns, count, lr)
+
+    def mse_loss(self, Y, T, dY, n: int) -> float:
+        """Fused MSE loss + seed gradient over flat length-n float32 buffers
+        (tk_loss, TK_LOSS_MSE): writes dY = 2*(Y-T)/n, returns mean((Y-T)^2).
+        Exposed for API completeness — the C loop is scalar and memory-bound,
+        so a well-formed numpy expression is not slower; use whichever keeps
+        your loop's buffers stable."""
+        Yc, _ = _as_c_float(Y, n, "Y")
+        Tc, _ = _as_c_float(T, n, "T")
+        dc, d_wb = _as_c_float(dY, n, "dY")
+        loss = self._lib.tk_loss(Yc, Tc, dc, n, 0)
+        if d_wb:
+            d_wb()
+        return float(loss)
+
     def session(self) -> "Session":
         """An identity-memoized view of the CNN-primitive methods for
         training loops over fixed buffers — see Session."""
@@ -557,6 +647,7 @@ class Session:
         self._lib = tk._lib
         self._fmemo = {}
         self._imemo = {}
+        self._lmemo = {}   # sgd_update_list pointer-array memo
 
     @staticmethod
     def _memo_get(memo, arr):
@@ -685,6 +776,58 @@ class Session:
     def sgd_update(self, W, dW, n, lr):
         self._lib.tk_sgd_update_f32(self._fp(W, n, "W"),
                                     self._fp(dW, n, "dW"), n, lr)
+
+    def upsample2d(self, X, Y, n, c, in_h, in_w, k):
+        self._lib.tk_upsample2d_nearest_f32(
+            self._fp(X, n * c * in_h * in_w, "X"),
+            self._fp(Y, n * c * in_h * k * in_w * k, "Y"),
+            n, c, in_h, in_w, k)
+        return Y
+
+    def upsample2d_backward(self, dY, dX, n, c, in_h, in_w, k):
+        self._lib.tk_upsample2d_nearest_backward_f32(
+            self._fp(dY, n * c * in_h * k * in_w * k, "dY"),
+            self._fp(dX, n * c * in_h * in_w, "dX"),
+            n, c, in_h, in_w, k)
+        return dX
+
+    def sgd_update_list(self, Ws, dWs, lr):
+        """One crossing for the whole parameter list. The pointer arrays are
+        memoized per Ws-list identity, and a hit re-verifies the identity of
+        EVERY tensor (weakref + `is`, ~60 ns each) — replacing a tensor in
+        the list triggers a clean rebuild, never a stale pointer."""
+        hit = self._lmemo.get(id(Ws))
+        if hit is not None:
+            refs, args = hit
+            if len(refs) == len(Ws) + len(dWs) and all(
+                    r() is t for r, t in zip(refs, Ws)) and all(
+                    r() is t for r, t in zip(refs[len(Ws):], dWs)):
+                self._lib.tk_sgd_update_list_f32(*args, lr)
+                return
+        count = len(Ws)
+        if len(dWs) != count:
+            raise ValueError(f"Ws has {count} tensors but dWs has {len(dWs)}")
+        wp = (_f32p * count)()
+        dp = (_f32p * count)()
+        ns = (ctypes.c_int * count)()
+        for i, (w, d) in enumerate(zip(Ws, dWs)):
+            if d.size != w.size:
+                raise ValueError(f"tensor {i}: W has {w.size} elements, "
+                                 f"dW has {d.size}")
+            wp[i] = ctypes.cast(self._fp(w, w.size, f"Ws[{i}]"), _f32p)
+            dp[i] = ctypes.cast(self._fp(d, d.size, f"dWs[{i}]"), _f32p)
+            ns[i] = w.size
+        try:
+            refs = tuple(_weakref.ref(t) for t in list(Ws) + list(dWs))
+            self._lmemo[id(Ws)] = (refs, (wp, dp, ns, count))
+        except TypeError:
+            pass
+        self._lib.tk_sgd_update_list_f32(wp, dp, ns, count, lr)
+
+    def mse_loss(self, Y, T, dY, n) -> float:
+        return float(self._lib.tk_loss(self._fp(Y, n, "Y"),
+                                       self._fp(T, n, "T"),
+                                       self._fp(dY, n, "dY"), n, 0))
 
 
 class Trainer:

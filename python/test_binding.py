@@ -420,16 +420,20 @@ def test_cnn_edges(tk):
     check(np.array_equal(Y1, Y2),
           "conv2d_forward Z=None with relu: Y identical to the Z-passed call")
 
-    # SUSPICIOUS (pinned, flagged, not fixed): maxpool2d's argmax is an
-    # OUTPUT, but _as_c_int32 has no writeback — any argmax that is not a
-    # C-contiguous int32 numpy array is boxed and the winners written to the
-    # discarded temp. int64 argmax comes back UNTOUCHED, with no error.
+    # FIXED (was pinned as suspicious): maxpool2d's argmax is an OUTPUT, and
+    # _as_c_int32's boxed fallback has no writeback — a non-int32 argmax used
+    # to be written to a discarded temp with no error. The binding now raises
+    # instead of silently losing the winners.
     Xp = rng.standard_normal(1 * 1 * 4 * 4).astype(np.float32)
     Yp = np.empty(4, np.float32)
     am64 = np.full(4, -7, dtype=np.int64)
-    tk.maxpool2d(Xp, Yp, am64, 1, 1, 4, 4, 2, 2)
-    check(np.all(am64 == -7),
-          "maxpool2d int64 argmax: silently discarded (current behavior, flagged)")
+    try:
+        tk.maxpool2d(Xp, Yp, am64, 1, 1, 4, 4, 2, 2)
+        check(False, "maxpool2d int64 argmax: should raise")
+    except TypeError as e:
+        check("int32" in str(e) and "written by C" in str(e),
+              "maxpool2d int64 argmax: rejected with a clear TypeError")
+    tk.maxpool2d(Xp, Yp, np.empty(4, np.int32), 1, 1, 4, 4, 2, 2)  # int32 fine
     am32 = np.full(4, -7, dtype=np.int32)
     Yq = np.empty(4, np.float32)
     tk.maxpool2d(Xp, Yq, am32, 1, 1, 4, 4, 2, 2)
