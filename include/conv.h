@@ -87,4 +87,25 @@ TK_API float tk_softmax_xent_f32(const float *logits, const int32_t *labels,
  * the narrow-storage update; the CNN family trains pure float32.) */
 TK_API void tk_sgd_update_f32(float *W, const float *dW, int n, float lr);
 
+/* SGD over a LIST of parameter tensors in one call: Ws[i] -= lr * dWs[i]
+ * over ns[i] elements, for i in [0, count). One FFI crossing replaces one
+ * per tensor — a bias update of 16 floats costs more to cross than to
+ * compute (measured downstream: 3,780 -> 315 crossings per fit). */
+TK_API void tk_sgd_update_list_f32(float *const *Ws, const float *const *dWs,
+                                   const int *ns, int count, float lr);
+
+/* Nearest-neighbor 2-D upsample by integer factor k (NCHW):
+ *   X : n x c x h x w   ->   Y : n x c x (h*k) x (w*k)
+ * Backward is the exact adjoint: dX = k x k block-sum of dY.
+ * The decoder-side op of upsample+conv architectures (Odena, Dumoulin &
+ * Olah, 2016 — the checkerboard-free alternative to transposed conv).
+ * Pure data movement; exists because the numpy expressions measured 9x
+ * (backward fused-sum) and ~18x (forward broadcast, 4 vs 74 GB/s) below
+ * copy speed at CNN-autoencoder shapes. */
+TK_API void tk_upsample2d_nearest_f32(const float *X, float *Y,
+                                      int n, int c, int h, int w, int k);
+TK_API void tk_upsample2d_nearest_backward_f32(const float *dY, float *dX,
+                                               int n, int c, int h, int w,
+                                               int k);
+
 #endif /* MANTISSA_CONV_H */

@@ -1476,3 +1476,111 @@ float tk_softmax_xent_f32(const float *logits, const int32_t *labels,
 void tk_sgd_update_f32(float *W, const float *dW, int n, float lr) {
     for (int i = 0; i < n; i++) W[i] -= lr * dW[i];
 }
+
+void tk_sgd_update_list_f32(float *const *Ws, const float *const *dWs,
+                            const int *ns, int count, float lr) {
+    for (int i = 0; i < count; i++)
+        tk_sgd_update_f32(Ws[i], dWs[i], ns[i], lr);
+}
+
+/* --- nearest-neighbor upsample ------------------------------------------- */
+
+/* Forward: build each output row once by repeating every input value k
+ * times, then memcpy it to the other k-1 rows of the block. The k==2 inner
+ * loop is a pure interleave — clang vectorizes it; general k falls to a
+ * small scalar loop. numpy's broadcast-assign form of this op measured
+ * 4 GB/s against 74 GB/s contiguous copies (its 0-stride length-k axes sit
+ * innermost and kill vectorization) — that gap is why this is C. */
+static void ups_fwd_plane(const float *restrict x, float *restrict y,
+                          int h, int w, int k) {
+    const size_t ow = (size_t)w * k;
+    for (int i = 0; i < h; i++) {
+        const float *restrict xr = x + (size_t)i * w;
+        float *restrict yr = y + (size_t)i * k * ow;
+        if (k == 2) {
+            for (int j = 0; j < w; j++) {
+                const float v = xr[j];
+                yr[2 * j] = v; yr[2 * j + 1] = v;
+            }
+        } else {
+            for (int j = 0; j < w; j++) {
+                const float v = xr[j];
+                for (int a = 0; a < k; a++) yr[(size_t)j * k + a] = v;
+            }
+        }
+        for (int r = 1; r < k; r++)
+            memcpy(yr + (size_t)r * ow, yr, ow * sizeof(float));
+    }
+}
+
+/* Backward (exact adjoint): dX[i][j] = sum of dY's k x k block. Sequential
+ * loads, one store per input cell. numpy's fused np.sum(axis=(3,5)) form
+ * measured 9x slower at these shapes (the length-k reduced axes interleave
+ * with kept axes and degenerate its reduction iterator). */
+static void ups_bwd_plane(const float *restrict dy, float *restrict dx,
+                          int h, int w, int k) {
+    const size_t ow = (size_t)w * k;
+    for (int i = 0; i < h; i++) {
+        float *restrict dr = dx + (size_t)i * w;
+        const float *restrict base = dy + (size_t)i * k * ow;
+        if (k == 2) {
+            const float *restrict r0 = base, *restrict r1 = base + ow;
+            for (int j = 0; j < w; j++)
+                dr[j] = (r0[2 * j] + r0[2 * j + 1])
+                      + (r1[2 * j] + r1[2 * j + 1]);
+        } else {
+            for (int j = 0; j < w; j++) {
+                float s = 0.0f;
+                for (int r = 0; r < k; r++) {
+                    const float *restrict rr =
+                        base + (size_t)r * ow + (size_t)j * k;
+                    for (int a = 0; a < k; a++) s += rr[a];
+                }
+                dr[j] = s;
+            }
+        }
+    }
+}
+
+typedef struct {
+    const float *src;
+    float *dst;
+    int h, w, k, bwd;
+} tk_ups_ctx;
+
+static void ups_worker(void *p, int p0, int p1, int worker) {
+    (void)worker;
+    const tk_ups_ctx *c = (const tk_ups_ctx *)p;
+    const size_t in_sz = (size_t)c->h * c->w;
+    const size_t out_sz = in_sz * (size_t)c->k * c->k;
+    for (int pl = p0; pl < p1; pl++) {
+        if (c->bwd)
+            ups_bwd_plane(c->src + (size_t)pl * out_sz,
+                          c->dst + (size_t)pl * in_sz, c->h, c->w, c->k);
+        else
+            ups_fwd_plane(c->src + (size_t)pl * in_sz,
+                          c->dst + (size_t)pl * out_sz, c->h, c->w, c->k);
+    }
+}
+
+static void tk__upsample_run(const float *src, float *dst, int n, int c,
+                             int h, int w, int k, int bwd) {
+    if (n <= 0 || c <= 0 || h <= 0 || w <= 0 || k <= 0) return;
+    const int planes = n * c;
+    tk_ups_ctx ctx = { src, dst, h, w, k, bwd };
+    const size_t work = (size_t)planes * h * w * (size_t)k * k;
+    if (work >= TK_MT_MIN_WORK && tk_num_threads() > 1)
+        tk_parallel_for(planes, ups_worker, &ctx);
+    else
+        ups_worker(&ctx, 0, planes, 0);
+}
+
+void tk_upsample2d_nearest_f32(const float *X, float *Y,
+                               int n, int c, int h, int w, int k) {
+    tk__upsample_run(X, Y, n, c, h, w, k, 0);
+}
+
+void tk_upsample2d_nearest_backward_f32(const float *dY, float *dX,
+                                        int n, int c, int h, int w, int k) {
+    tk__upsample_run(dY, dX, n, c, h, w, k, 1);
+}
