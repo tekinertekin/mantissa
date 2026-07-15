@@ -8,10 +8,7 @@
 
 **A fast, memory-lean neural-network core in C, with a Python binding.**
 
-`mantissa` runs neural-network layers — forward *and* backward — spending as
-little time and memory per parameter as it can. That is the goal: an engine
-small enough to fit big models in RAM/VRAM and fast enough to run them at scale.
-A tight C core does the compute; a thin Python layer drives it.
+`mantissa` is an ultra-lightweight, high-performance neural network engine designed to execute forward and backward passes with minimal time and memory overhead per parameter. By pairing a bare-metal, highly optimized C compute core with a thin Python interface, *mantissa* enables the training and deployment of large-scale models directly within tightly constrained RAM/VRAM environments.
 
 > Started by Tekin Ertekin (2024); later refactored with Claude Code — see
 > [AUTHORS.md](AUTHORS.md).
