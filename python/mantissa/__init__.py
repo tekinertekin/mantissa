@@ -371,7 +371,7 @@ class Mantissa:
     # ---- CNN primitives (pure float32, NCHW, batch outermost) --------------
     # All buffers are flat, C-contiguous float32 (argmax/labels: int32) numpy
     # arrays for zero-copy; outputs are mutated in place. Feature-detect with
-    # hasattr(tk, "conv2d_forward") (needs mantissa-nn >= 0.2.1).
+    # hasattr(tk, "conv2d_forward") (needs mantissa-core >= 0.2.1).
 
     def conv2d_out_dim(self, in_dim: int, k: int, stride: int, pad: int) -> int:
         """Conv/pool output spatial size: (in + 2*pad - k)//stride + 1,

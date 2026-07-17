@@ -6,6 +6,19 @@ dense layer (4.2M params) unless noted, and are indicative, not absolute.
 
 ---
 
+## v0.2.4 — 2026-07-17  (tag `v0.2.4`)
+
+The naming release, ahead of the first PyPI publish: the distribution is
+renamed **`mantissa-nn` → `mantissa-core`** (the bare `mantissa` is taken on
+PyPI by an unrelated project; `mantissa-core` says what it is — the C engine).
+The **import name is unchanged — still `import mantissa`**; only the install
+command becomes `pip install mantissa-core`. No code or ABI change: this is a
+packaging-metadata release so the first published wheels carry the intended
+name. The sibling projects' install instructions and engine-resolution
+messages were updated to match in lockstep.
+
+---
+
 ## v0.2.3 — 2026-07-14  (tag `v0.2.3`)
 
 The audit release. Six independent read-only analysis lenses (training loop,

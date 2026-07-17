@@ -81,7 +81,7 @@ Full file: [`examples/perceptron_example.c`](../examples/perceptron_example.c)
 
 ## Python API
 
-Install from PyPI — `pip install mantissa-nn` (import name stays `mantissa`; the
+Install from PyPI — `pip install mantissa-core` (import name stays `mantissa`; the
 wheel bundles a prebuilt library, no toolchain needed; add `[numpy]` for the
 zero-copy path). Or, from a checkout, `pip install .` (compiles the C core) or
 just `make dist` (any dtype — the binding is dtype-agnostic). Then:

@@ -312,11 +312,11 @@ make DTYPE=4 test     # switch storage to tekin8
 ## Install
 
 ```sh
-pip install mantissa-nn        # import name stays `mantissa`
+pip install mantissa-core       # import name stays `mantissa`
 ```
 
 The wheel ships a **prebuilt** `libmantissa` (default bfloat16) — no compiler or
-`make` needed. numpy is optional; install `mantissa-nn[numpy]` for the zero-copy
+`make` needed. numpy is optional; install `mantissa-core[numpy]` for the zero-copy
 training path. Then:
 
 ```python
@@ -325,8 +325,9 @@ tk = Mantissa()
 print(tk.dtype)                # 'bfloat16'
 ```
 
-> The distribution is named **`mantissa-nn`** on PyPI (the bare `mantissa` name
-> is taken by an unrelated project); the Python import name is still `mantissa`.
+> The distribution is named **`mantissa-core`** on PyPI (the bare `mantissa`
+> name is taken by an unrelated project); the Python import name is still
+> `mantissa`.
 
 Installing from an **sdist** (or `pip install .` from a checkout) compiles the C
 core on your machine, so a C toolchain (`cc`, `make`-grade compiler) is required
