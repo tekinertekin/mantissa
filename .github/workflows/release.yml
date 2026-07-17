@@ -185,18 +185,31 @@ jobs:
           files: dist/**
           generate_release_notes: true
 
-  # Publishing to PyPI is intentionally NOT automated here — it stays manual and
-  # user-owned. To enable trusted publishing later, add a job like the following
-  # (gated on the release job) after configuring a PyPI trusted publisher for
-  # this repo and a `pypi` GitHub environment:
+  # PyPI publish via Trusted Publishing (OIDC) — no API token stored anywhere.
+  # Authenticated by PyPI's trusted-publisher config for this repo, which must
+  # match exactly: project `mantissa-core`, owner `tekinertekin`, repository
+  # `mantissa`, workflow `release.yml`, environment `pypi`.
   #
-  #   publish-pypi:
-  #     needs: [wheel-linux, wheel-macos, wheel-windows, sdist]
-  #     runs-on: ubuntu-latest
-  #     environment: pypi
-  #     permissions:
-  #       id-token: write        # OIDC token for trusted publishing
-  #     steps:
-  #       - uses: actions/download-artifact@v4
-  #         with: { path: dist, merge-multiple: true }
-  #       - uses: pypa/gh-action-pypi-publish@release/v1
+  # Collects ONLY the wheels and the sdist — never the raw libmantissa-*
+  # shared libraries the `build` job produces (PyPI rejects non-package files),
+  # which is why this downloads by artifact name rather than merging all.
+  publish-pypi:
+    needs: [wheel-linux, wheel-macos, wheel-windows, sdist]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write        # OIDC token for trusted publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*    # wheel-linux / wheel-macos / wheel-windows
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # Non-fatal if a version was already published (safe tag re-runs).
+          skip-existing: true
