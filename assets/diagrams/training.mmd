@@ -1,0 +1,14 @@
+flowchart LR
+    X["input x"]:::io --> F["forward pass<br/>y = act(W·x + b)"]:::fwd
+    F --> P["prediction"]:::io
+    P --> L["loss<br/>tk_loss · MSE / BCE"]:::loss
+    G["target"]:::io --> L
+    L -->|"dL/dy"| B["backward pass<br/>tk_linear_backward"]:::bwd
+    B -->|"dW, db"| U["update weights<br/>tk_sgd_step · SR · L1/L2"]:::upd
+    U -.->|"repeat"| F
+
+    classDef io   fill:#e2e8f0,stroke:#94a3b8,stroke-width:1px,color:#0f172a
+    classDef fwd  fill:#dcfce7,stroke:#22c55e,stroke-width:1px,color:#14532d
+    classDef loss fill:#ede9fe,stroke:#8b5cf6,stroke-width:1px,color:#4c1d95
+    classDef bwd  fill:#ffe4e6,stroke:#fb7185,stroke-width:1px,color:#881337
+    classDef upd  fill:#fef3c7,stroke:#f59e0b,stroke-width:1px,color:#78350f

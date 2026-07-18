@@ -24,42 +24,7 @@ call C — Python (via ctypes), C/C++, Rust, Go — drives the same engine. The
 caller passes ordinary **float32** arrays in and gets float32 back; inside,
 weights are kept in a narrow type to save memory.
 
-```mermaid
-flowchart TB
-    subgraph callers["Caller — your program"]
-        PY["Python (ctypes)"]:::caller
-        CPP["C / C++"]:::caller
-        OTH["any language with a C FFI"]:::caller
-    end
-    callers ==>|"float32 in: weights, inputs, targets"| ABI
-
-    subgraph lib["libmantissa  (.so / .dylib / .dll)"]
-        ABI["C ABI entry points"]:::abi
-        ABI --> Q["Build — quantize / load weights<br/>float32 to narrow storage"]:::build
-        ABI --> FWD["Forward pass — tk_linear_forward<br/>y = act(W·x + b)"]:::fwd
-        ABI --> BWD["Train — backward + update<br/>tk_linear_backward then tk_sgd_step"]:::bwd
-        Q --> CORE
-        FWD --> CORE
-        BWD --> CORE
-        subgraph CORE["compute core"]
-            DOT["dot product · float32 accumulate"]:::core
-            ACT["activations"]:::core
-            DT["dtypes · narrow to/from float32"]:::core
-        end
-    end
-    CORE ==>|"float32 out: predictions / gradients"| callers
-
-    classDef caller fill:#e0e7ff,stroke:#6366f1,stroke-width:1px,color:#1e1b4b
-    classDef abi   fill:#1e293b,stroke:#0f172a,stroke-width:1px,color:#f8fafc
-    classDef build fill:#fef3c7,stroke:#f59e0b,stroke-width:1px,color:#78350f
-    classDef fwd   fill:#dcfce7,stroke:#22c55e,stroke-width:1px,color:#14532d
-    classDef bwd   fill:#ffe4e6,stroke:#fb7185,stroke-width:1px,color:#881337
-    classDef core  fill:#f1f5f9,stroke:#64748b,stroke-width:1px,color:#0f172a
-    style callers fill:#eef2ff,stroke:#c7d2fe,color:#3730a3
-    style lib fill:#f8fafc,stroke:#cbd5e1,color:#334155
-    style CORE fill:#ffffff,stroke:#94a3b8,color:#0f172a
-    linkStyle 0,7 stroke:#6366f1,stroke-width:2.5px
-```
+![mantissa architecture: callers to the C ABI to the engine core](https://raw.githubusercontent.com/tekinertekin/mantissa/main/assets/diagrams/forward.svg)
 
 A call is one of three kinds:
 
@@ -235,22 +200,7 @@ inspectable.
 One training step is a loop: run forward, measure the loss against the target,
 propagate gradients backward, update the weights, repeat.
 
-```mermaid
-flowchart LR
-    X["input x"]:::io --> F["forward pass<br/>y = act(W·x + b)"]:::fwd
-    F --> P["prediction"]:::io
-    P --> L["loss<br/>tk_loss · MSE / BCE"]:::loss
-    G["target"]:::io --> L
-    L -->|"dL/dy"| B["backward pass<br/>tk_linear_backward"]:::bwd
-    B -->|"dW, db"| U["update weights<br/>tk_sgd_step · SR · L1/L2"]:::upd
-    U -.->|"repeat"| F
-
-    classDef io   fill:#e2e8f0,stroke:#94a3b8,stroke-width:1px,color:#0f172a
-    classDef fwd  fill:#dcfce7,stroke:#22c55e,stroke-width:1px,color:#14532d
-    classDef loss fill:#ede9fe,stroke:#8b5cf6,stroke-width:1px,color:#4c1d95
-    classDef bwd  fill:#ffe4e6,stroke:#fb7185,stroke-width:1px,color:#881337
-    classDef upd  fill:#fef3c7,stroke:#f59e0b,stroke-width:1px,color:#78350f
-```
+![training loop: forward, loss, backward, update](https://raw.githubusercontent.com/tekinertekin/mantissa/main/assets/diagrams/training.svg)
 
 Correctness is proven by a **gradient check** (`make testbp`): analytic
 gradients vs central finite differences, matching to <1e-2 relative error for
