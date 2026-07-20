@@ -17,6 +17,21 @@ Version history and per-release benchmark scores: **[RELEASES.md](RELEASES.md)**
 
 ---
 
+## The mantissa family
+
+Part of the **mantissa** family: a low-precision engine written in C, with
+small Python packages built on top. Each package sits under the one it depends
+on — ⭐ marks where you are, and every other name links to its repo.
+
+- ⭐ **mantissa** — low-precision neural-network engine in C (the core) *(you are here)*
+  - [mantissa-perceptron](https://github.com/tekinertekin/mantissa-perceptron) — perceptron & ADALINE, the linear classics
+  - [mantissa-nn](https://github.com/tekinertekin/mantissa-nn) — shared neural-net primitives (layers, engine binding)
+    - [mantissa-cnn](https://github.com/tekinertekin/mantissa-cnn) — convolutional networks for images
+      - [mantissa-auto-encoder](https://github.com/tekinertekin/mantissa-auto-encoder) — autoencoders for denoising & super-resolution
+      - [mantissa-interpret](https://github.com/tekinertekin/mantissa-interpret) — CNN interpretability (occlusion, saliency, Grad-CAM)
+    - [mantissa-mlp](https://github.com/tekinertekin/mantissa-mlp) — multilayer perceptrons, fully-connected nets
+
+
 ## How it works
 
 `mantissa` is a shared library with a plain **C ABI**, so any language that can
