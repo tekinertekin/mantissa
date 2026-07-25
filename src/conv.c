@@ -35,18 +35,35 @@ static void im2col(const float *restrict x, float *restrict cols,
     for (int oy = 0; oy < oh; oy++) {
         for (int ox = 0; ox < ow; ox++) {
             const int iy0 = oy * stride - pad, ix0 = ox * stride - pad;
-            for (int c = 0; c < in_c; c++) {
-                const float *restrict plane = x + (size_t)c * in_h * in_w;
-                for (int ky = 0; ky < kh; ky++) {
-                    const int iy = iy0 + ky;
-                    if (iy < 0 || iy >= in_h) {
-                        for (int kx = 0; kx < kw; kx++) *col++ = 0.0f;
-                        continue;
+            /* One interior test per patch: when the whole patch is in-bounds
+             * (every pad==0 patch, and interior patches under padding) the copy
+             * is branch-free and vectorizes. Same c->ky->kx write order and
+             * values as the checked path, so the packed columns are bit-identical. */
+            const int interior = (iy0 >= 0 && iy0 + kh <= in_h &&
+                                  ix0 >= 0 && ix0 + kw <= in_w);
+            if (interior) {
+                for (int c = 0; c < in_c; c++) {
+                    const float *restrict plane = x + (size_t)c * in_h * in_w;
+                    for (int ky = 0; ky < kh; ky++) {
+                        const float *restrict row =
+                            plane + (size_t)(iy0 + ky) * in_w + ix0;
+                        for (int kx = 0; kx < kw; kx++) *col++ = row[kx];
                     }
-                    const float *restrict row = plane + (size_t)iy * in_w;
-                    for (int kx = 0; kx < kw; kx++) {
-                        const int ix = ix0 + kx;
-                        *col++ = (ix >= 0 && ix < in_w) ? row[ix] : 0.0f;
+                }
+            } else {
+                for (int c = 0; c < in_c; c++) {
+                    const float *restrict plane = x + (size_t)c * in_h * in_w;
+                    for (int ky = 0; ky < kh; ky++) {
+                        const int iy = iy0 + ky;
+                        if (iy < 0 || iy >= in_h) {
+                            for (int kx = 0; kx < kw; kx++) *col++ = 0.0f;
+                            continue;
+                        }
+                        const float *restrict row = plane + (size_t)iy * in_w;
+                        for (int kx = 0; kx < kw; kx++) {
+                            const int ix = ix0 + kx;
+                            *col++ = (ix >= 0 && ix < in_w) ? row[ix] : 0.0f;
+                        }
                     }
                 }
             }
