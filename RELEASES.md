@@ -6,6 +6,23 @@ dense layer (4.2M params) unless noted, and are indicative, not absolute.
 
 ---
 
+## v0.2.6 — 2026-07-25  (tag `v0.2.6`)
+
+Two measured CPU optimizations, both correctness-preserving and RAM-neutral
+(peak RSS unchanged, no API/ABI change):
+
+- **conv forward/backward** — a branch-free `im2col` fast path for in-bounds
+  patches (the pad=0 common case): the per-element bounds test is dropped so the
+  contiguous copy vectorizes. ~11–15% faster forward and ~3–7% faster backward
+  on the pad=0 LeNet conv shapes (`bench_conv`); packed columns are bit-identical
+  to the checked path.
+- **dense backward** — skip the weight-row read for dead (`dz==0`) rows in the
+  threaded `tk_linear_backward`: a killed-ReLU row contributes `w·0 == ±0` to the
+  input gradient, a no-op, so the full narrow-weight-row read is skipped. ~18%
+  faster dense backward on a layer with ~50% dead ReLU rows; bit-identical result.
+
+---
+
 ## v0.2.4 — 2026-07-17  (tag `v0.2.4`)
 
 The naming release, ahead of the first PyPI publish: the distribution is
