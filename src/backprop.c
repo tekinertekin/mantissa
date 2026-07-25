@@ -16,11 +16,19 @@ static void bwd_range(const tk_scalar_t *restrict W, const tk_scalar_t *restrict
     for (int o = o0; o < o1; o++) {
         const float dz = dy[o] * tk_act_grad_scalar(z[o], act);
         if (db) db[o] = dz;
-        const tk_scalar_t *restrict wr  = W  + (size_t)o * in_dim;
-        float             *restrict dWr = dW + (size_t)o * in_dim;
+        float *restrict dWr = dW + (size_t)o * in_dim;
+        if (dxp == NULL || dz == 0.0f) {
+            /* Dead row (dz==0, e.g. a killed ReLU) or no dx requested: the dW
+             * row is computed identically, but the dx term wr[i]*dz == +/-0 is
+             * a no-op (x + +/-0 == x for every IEEE value), so skip the whole
+             * narrow W-row read. Bit-identical to the full path. */
+            for (int i = 0; i < in_dim; i++) dWr[i] = dz * TK_TO_FLOAT(x[i]);
+            continue;
+        }
+        const tk_scalar_t *restrict wr = W + (size_t)o * in_dim;
         for (int i = 0; i < in_dim; i++) {
             dWr[i] = dz * TK_TO_FLOAT(x[i]);
-            if (dxp) dxp[i] += TK_TO_FLOAT(wr[i]) * dz;
+            dxp[i] += TK_TO_FLOAT(wr[i]) * dz;
         }
     }
 }
