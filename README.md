@@ -17,6 +17,38 @@ Version history and per-release benchmark scores: **[RELEASES.md](RELEASES.md)**
 
 ---
 
+## Low-precision, in numbers
+
+mantissa keeps weights and activations in a **narrow** storage format and
+accumulates in float32 — *narrow storage, wide accumulate*. To show what that
+buys, a linear MNIST classifier (784→10) is trained once in float32, then its
+weights are **post-training-quantized** into each storage format via
+`Mantissa.prepare()` (rebuild the core with `make DTYPE=N`). Same weights, same
+test set — only the storage type changes:
+
+![MNIST accuracy vs. model footprint across mantissa storage formats](https://raw.githubusercontent.com/tekinertekin/mantissa/main/assets/precision-sweep.png)
+
+| storage format | bits (S-E-M) | bytes/param | model size | MNIST test acc |
+|---|---|---:|---:|---:|
+| float32 (baseline) | 1-8-23 | 4 | 30.6 KB | 81.20 % |
+| tekin32 | 1-7-24 | 4 | 30.6 KB | 81.20 % |
+| fp16 | 1-5-10 | 2 | 15.3 KB | 81.20 % |
+| bfloat16 | 1-8-7 | 2 | 15.3 KB | 81.25 % |
+| fp8 E5M2 | 1-5-2 | 1 | 7.7 KB | 81.25 % |
+| **tekin8 (fp8 E4M3)** | **1-4-3** | **1** | **7.7 KB** | **81.10 %** |
+| fp4 E2M1 (MXFP4) | 1-2-1 | ½ | 3.8 KB | 14.35 % |
+
+**fp8 holds float32 accuracy at 4× less memory** (−0.1 pt); fp16/bf16 are
+effectively lossless at 2×. fp4 is a step too far for *naïve* post-training
+quantization — 4-bit needs per-block scaling or quantization-aware training
+(a good first contribution — see [CONTRIBUTING.md](CONTRIBUTING.md)).
+
+<sub>The linear model tops out near 81 %; the point is the **relative** cost of
+each format, not the absolute number. Convolutions currently run in float32, so
+this low-precision story is about the dense/linear engine.</sub>
+
+---
+
 ## The mantissa family
 
 Part of the **mantissa** family: a low-precision engine written in C, with
