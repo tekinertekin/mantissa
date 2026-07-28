@@ -51,6 +51,10 @@ storage precision (needs only numpy + matplotlib).
 each format, not the absolute number. Convolutions currently run in float32, so
 this low-precision story is about the dense/linear engine.</sub>
 
+**How it gets its speed:** see **[docs/PERFORMANCE.md](docs/PERFORMANCE.md)** —
+the SIMD kernels (NEON + runtime-dispatched AVX2), im2col+GEMM convolution, and
+threading, each with measured numbers.
+
 ---
 
 ## The mantissa family
