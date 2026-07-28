@@ -6,6 +6,8 @@ dist/
 *.dll
 __pycache__/
 *.pyc
+# downloaded demo datasets
+examples/.data/
 # python packaging artifacts
 *.egg-info/
 .eggs/

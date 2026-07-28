@@ -43,6 +43,10 @@ effectively lossless at 2×. fp4 is a step too far for *naïve* post-training
 quantization — 4-bit needs per-block scaling or quantization-aware training
 (a good first contribution — see [CONTRIBUTING.md](CONTRIBUTING.md)).
 
+**Run it yourself:** `make DTYPE=4 lib && python examples/mnist_demo.py` trains a
+classifier on MNIST and reports accuracy, throughput, and footprint at the chosen
+storage precision (needs only numpy + matplotlib).
+
 <sub>The linear model tops out near 81 %; the point is the **relative** cost of
 each format, not the absolute number. Convolutions currently run in float32, so
 this low-precision story is about the dense/linear engine.</sub>
