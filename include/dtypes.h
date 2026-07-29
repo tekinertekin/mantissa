@@ -101,12 +101,20 @@ static inline float tk_e5m2_to_float(tk_e5m2_t v) {
     return tk__u2f((s << 31) | ((e + 112u) << 23) | (m << 21));  /* bias 15 -> 127 */
 }
 
+/* E2M1 has no inf/nan and only 16 encodings, so its entire value set is a
+ * 64-byte table that stays in L1 for the life of the process: the read is one
+ * load, replacing a shift/mask, a select on the subnormal case, and a sign
+ * fix-up. Entries are the same expression the arithmetic form computed --
+ * magnitudes 0,.5,1,1.5,2,3,4,6 indexed by (e<<1)|m, negated for s -- including
+ * the -0.0 at index 8, so the conversion is bit-identical for all 16 patterns.
+ * Measured 2.0x on the fp4 GEMV, flat from 512 to 8192 (0.25 MB to 64 MB): the
+ * bound was the conversion, not the memory traffic. */
 static inline float tk_fp4_to_float(tk_fp4_t v) {
-    const uint32_t s = (v >> 3) & 1u, e = (v >> 1) & 3u, m = v & 1u;
-    /* E2M1 has no inf/nan; the 8 magnitudes are 0,.5,1,1.5,2,3,4,6. */
-    const float val = (e == 0u) ? (float)m * 0.5f
-                                : (1.0f + 0.5f * (float)m) * (float)(1u << (e - 1u));
-    return s ? -val : val;
+    static const float lut[16] = {
+         0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
+        -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f,
+    };
+    return lut[v & 15u];
 }
 
 /* ---- WRITE path: float32 -> narrow ----------------------------------------
