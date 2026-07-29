@@ -235,6 +235,108 @@ static void test_sr_unbiased(void) {
     }
 }
 
+/* test_sr_unbiased above only probes |w| >= 1.0, which is target-NORMAL in every
+ * format -- the band where SR's float32-lattice construction is valid. Below the
+ * format's smallest normal the representable grid turns uniform, and getting
+ * that wrong is invisible to the test above: it made fp4's E[SR(0.75)] come out
+ * 0.5 instead of 0.75, and collapsed every fp4 |v| <= 0.25 to exactly 0. These
+ * two tests pin the low band, where fp4 (smallest normal 1.0) lives almost
+ * entirely and where SR matters most, since that is the regime it exists for. */
+static void test_sr_unbiased_subnormal(void) {
+    printf("\nSR unbiasedness below the smallest normal (1.0 -> 0.9375):\n");
+    enum { TRIALS = 200000 };
+    tk_optim opt = { 1.0f, 0.0f, 0.0f, 1 };
+    tk_rng r = tk_rng_seed(2024);
+    double acc = 0.0;
+    for (int k = 0; k < TRIALS; k++) {
+        tk_scalar_t w = TK_FROM_FLOAT(1.0f);
+        float g = 0.0625f;                      /* w - lr*g = 0.9375 exactly */
+        tk_sgd_step(&w, &g, 1, &opt, &r);
+        acc += (double)TK_TO_FLOAT(w);
+    }
+    /* Bound from the estimator, not from what happens to pass: the write-back is
+     * Bernoulli on a grid of step s, so the mean's standard error is at most
+     * s/(2*sqrt(TRIALS)). fp4 has the coarsest grid here (s = 0.5), giving
+     * ~5.6e-4; 4e-3 is ~7 SE, loose enough never to flake and still ~16x tighter
+     * than the 6.3e-2 bias the pre-fix code showed. */
+    check("SR mean of 200k (0.9375)", (float)(acc / TRIALS), 0.9375f, 0.0f, 4e-3f);
+}
+
+/* The test above is anchored at 0.9375, which is subnormal only for fp4 (whose
+ * smallest normal is 1.0). Every other narrow format keeps its subnormal band far
+ * lower -- 2^-6 for tekin8, 2^-14 for e5m2/fp16 -- so that test cannot see a bug
+ * there. This one is expressed in units of the format's OWN grid step: w starts
+ * at two steps (exactly representable, m=2) and one SGD step lands it on 1.5
+ * steps, which is never representable, so SR must split evenly between m=1 and
+ * m=2 and average back to 1.5 steps. Pre-fix, tekin8 returned two steps instead
+ * of 1.5 -- the fast path put its `down` candidate off the uniform grid and the
+ * closing conversion re-rounded it after the coin had been flipped. */
+#if TK_MANT_BITS < 23 && TK_SUB_SHIFT <= 30
+static void test_sr_unbiased_own_subnormal(void) {
+    printf("\nSR unbiasedness inside this format's own subnormal band:\n");
+    enum { TRIALS = 200000 };
+    const float step = ldexpf(1.0f, -TK_SUB_SHIFT);
+    tk_optim opt = { 1.0f, 0.0f, 0.0f, 1 };
+    tk_rng r = tk_rng_seed(31337);
+    double acc = 0.0;
+    for (int k = 0; k < TRIALS; k++) {
+        tk_scalar_t w = TK_FROM_FLOAT(2.0f * step);
+        float g = 0.5f * step;
+        tk_sgd_step(&w, &g, 1, &opt, &r);
+        acc += (double)TK_TO_FLOAT(w);
+    }
+    /* Same estimator bound as above, in grid units: SE <= step/(2*sqrt(TRIALS))
+     * ~= 1.1e-3 steps, so 0.02 steps is ~18 SE and cannot flake, while the
+     * pre-fix error was a full 0.5 steps -- 25x larger. */
+    check("SR mean of 200k (1.5 steps)", (float)(acc / TRIALS), 1.5f * step,
+          0.0f, 0.02f * step);
+}
+#endif
+
+static void test_sr_accumulates(void) {
+    /* config.h's claim for SR: an update too small to change the stored value
+     * still accumulates in expectation, which is what lets a narrow type train
+     * without an fp32 master copy. Round-to-nearest provably stalls; SR must not.
+     * Uses a step of an eighth of the format's ULP, repeated 50 times. */
+    printf("\nSR: sub-ULP updates accumulate where round-to-nearest stalls:\n");
+#if TK_MANT_BITS > 20
+    /* Not applicable to the float32-class formats. The probe needs w - lr*g to
+     * still carry delta = 2^-(TK_MANT_BITS+3) when computed in float32, but the
+     * spacing just below 1.0 is 2^-24, so delta survives only while
+     * TK_MANT_BITS <= 21. Above that the update is lost to the ambient float
+     * arithmetic before the storage grid is ever consulted -- and SR is a no-op
+     * for these formats anyway (their grid is exact, see tk_sr_from_float's
+     * TK_MANT_BITS >= 23 branch), so there is nothing here to test. */
+    check_ok(1, "not applicable: TK_MANT_BITS=%d is float32-class, SR grid exact",
+             TK_MANT_BITS);
+#else
+    const float ulp   = ldexpf(1.0f, -TK_MANT_BITS);
+    const float delta = ulp / 8.0f;
+    enum { STEPS = 50, TRIALS = 20000 };
+    tk_optim rtn = { 1.0f, 0.0f, 0.0f, 0 }, sr = { 1.0f, 0.0f, 0.0f, 1 };
+
+    tk_scalar_t w = TK_FROM_FLOAT(1.0f);
+    float g = delta;
+    for (int s = 0; s < STEPS; s++) tk_sgd_step(&w, &g, 1, &rtn, NULL);
+    check_ok(TK_TO_FLOAT(w) == 1.0f,
+             "round-to-nearest stalls after %d sub-ULP/8 steps (w=%.9g)",
+             STEPS, TK_TO_FLOAT(w));
+
+    tk_rng r = tk_rng_seed(2718);
+    double acc = 0.0;
+    for (int t = 0; t < TRIALS; t++) {
+        tk_scalar_t wt = TK_FROM_FLOAT(1.0f);
+        float gt = delta;
+        for (int s = 0; s < STEPS; s++) tk_sgd_step(&wt, &gt, 1, &sr, &r);
+        acc += (double)TK_TO_FLOAT(wt);
+    }
+    /* 50 steps of ulp/8 is 6.25 ULP of drift; allow a twentieth of a ULP, which
+     * is well above the estimator's noise and far below the drift being checked. */
+    check("SR mean after 50 steps", (float)(acc / TRIALS),
+          1.0f - STEPS * delta, 0.0f, 0.05f * ulp);
+#endif
+}
+
 int main(void) {
     printf("Active storage type: %s (%d bytes)\n\n", tk_dtype_name(), tk_scalar_size());
 
@@ -246,6 +348,11 @@ int main(void) {
     test_threaded_layer();
     test_batch_forward();
     test_sr_unbiased();
+    test_sr_unbiased_subnormal();
+#if TK_MANT_BITS < 23 && TK_SUB_SHIFT <= 30
+    test_sr_unbiased_own_subnormal();
+#endif
+    test_sr_accumulates();
 
     printf("\n%s\n", failures ? "FAILED" : "ALL PASSED");
     return failures ? 1 : 0;
