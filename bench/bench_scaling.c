@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <sys/resource.h>
 #include "ops.h"
 #include "pool.h"
 
@@ -24,6 +25,18 @@ static double now_s(void) {
     return (double)t.tv_sec + (double)t.tv_nsec * 1e-9;
 }
 static volatile float g_sink = 0.0f;
+
+/* Process high-water RSS since start (see bench/benchmark.c for the platform
+ * unit rationale: bytes on Darwin's ru_maxrss, kB on Linux's). */
+static double peak_rss_mb(void) {
+    struct rusage u;
+    if (getrusage(RUSAGE_SELF, &u) != 0) return -1.0;
+#if defined(__APPLE__)
+    return (double)u.ru_maxrss / (1024.0 * 1024.0);
+#else
+    return (double)u.ru_maxrss / 1024.0;
+#endif
+}
 
 static int cmp_d(const void *a, const void *b) {
     double x = *(const double *)a, y = *(const double *)b;
@@ -124,5 +137,6 @@ int main(int argc, char **argv) {
     else if (!strcmp(mode, "crossover")) mode_crossover(samples, reps);
     else if (!strcmp(mode, "barrier"))   mode_barrier(samples);
     else { fprintf(stderr, "unknown mode %s\n", mode); return 2; }
+    printf("peak RSS for the whole run: %.2f MB\n", peak_rss_mb());
     return 0;
 }

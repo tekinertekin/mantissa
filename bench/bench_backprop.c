@@ -12,9 +12,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <sys/resource.h>
 #include "ops.h"
 #include "loss.h"
 #include "backprop.h"
+
+#define SAMPLES 5
 
 static double now_s(void) {
     struct timespec t;
@@ -23,6 +26,18 @@ static double now_s(void) {
 }
 
 static volatile float g_sink = 0.0f;
+
+/* Process high-water RSS since start (see bench/benchmark.c for the platform
+ * unit rationale: bytes on Darwin's ru_maxrss, kB on Linux's). */
+static double peak_rss_mb(void) {
+    struct rusage u;
+    if (getrusage(RUSAGE_SELF, &u) != 0) return -1.0;
+#if defined(__APPLE__)
+    return (double)u.ru_maxrss / (1024.0 * 1024.0);
+#else
+    return (double)u.ru_maxrss / 1024.0;
+#endif
+}
 
 /* Train the 2-4-1 XOR net for `epochs`, return final mean loss. */
 static float train_xor(int stochastic, int epochs) {
@@ -163,19 +178,28 @@ int main(int argc, char **argv) {
 
     printf("=== mantissa backprop benchmark  (dtype=%s, %d bytes/param) ===\n",
            tk_dtype_name(), tk_scalar_size());
-    printf("note: single runs lie under DVFS -- compare medians of interleaved runs\n");
+    printf("note: single runs lie under DVFS -- reporting medians of %d samples, "
+           "%d passes/sample\n", SAMPLES, REPS);
     printf("layer %dx%d = %ld params\n", OUT, IN, params);
+    printf("peak RSS after allocating the 2048x2048 layer's buffers: %.2f MB\n",
+           peak_rss_mb());
 
     /* --- 1. dense backward throughput --- */
     tk_linear_backward(W, x, z, dy, dW, db, dx, OUT, IN, TK_ACT_RELU);   /* warm up */
-    double t0 = now_s();
-    for (int r = 0; r < REPS; r++) {
-        tk_linear_backward(W, x, z, dy, dW, db, dx, OUT, IN, TK_ACT_RELU);
-        g_sink += dW[r%params];
+    {
+        double samp[SAMPLES];
+        for (int s = 0; s < SAMPLES; s++) {
+            double t0 = now_s();
+            for (int r = 0; r < REPS; r++) {
+                tk_linear_backward(W, x, z, dy, dW, db, dx, OUT, IN, TK_ACT_RELU);
+                g_sink += dW[r%params];
+            }
+            samp[s] = (now_s()-t0) / REPS;
+        }
+        double dt = median_of(samp, SAMPLES);
+        double flops = 3.0*params;                              /* dW + dx (mul+add) */
+        printf("[backward] median %.3f ms/pass, %.2f GFLOP/s\n", dt*1e3, flops/dt/1e9);
     }
-    double dt = now_s()-t0;
-    double flops = 3.0*params*REPS;                              /* dW + dx (mul+add) */
-    printf("[backward] %.3f ms/pass, %.2f GFLOP/s\n", dt/REPS*1e3, flops/dt/1e9);
 
     /* --- 1a. float32 training step (forward+backward+update), the binding's path --- */
     {
@@ -189,13 +213,16 @@ int main(int argc, char **argv) {
             }
             for (int i = 0; i < IN; i++) xf[i] = ((float)(i%13)-6.0f)*0.1f;
             tk_train_step_f32(Wf, bf, xf, tf, OUT, IN, TK_ACT_RELU, 0.001f);  /* warm up */
-            double s0 = now_s();
-            for (int r = 0; r < REPS; r++) {
-                g_sink += tk_train_step_f32(Wf, bf, xf, tf, OUT, IN, TK_ACT_RELU, 0.001f);
+            double samp[SAMPLES];
+            for (int s = 0; s < SAMPLES; s++) {
+                double s0 = now_s();
+                for (int r = 0; r < REPS; r++)
+                    g_sink += tk_train_step_f32(Wf, bf, xf, tf, OUT, IN, TK_ACT_RELU, 0.001f);
+                samp[s] = (now_s()-s0) / REPS;
             }
-            double sdt = now_s()-s0;
-            double sflops = 4.0*params*REPS;   /* forward mul+add, backward mul+update */
-            printf("[train_step_f32] %.3f ms/pass, %.2f GFLOP/s\n", sdt/REPS*1e3, sflops/sdt/1e9);
+            double sdt = median_of(samp, SAMPLES);
+            double sflops = 4.0*params;   /* forward mul+add, backward mul+update */
+            printf("[train_step_f32] median %.3f ms/pass, %.2f GFLOP/s\n", sdt*1e3, sflops/sdt/1e9);
         }
         free(Wf);
         free(bf);
@@ -206,13 +233,21 @@ int main(int argc, char **argv) {
     /* --- 2. SGD weight-update throughput --- */
     tk_optim opt = tk_optim_default(0.01f);
     tk_sgd_step(W, dW, (int)params, &opt, &rng);   /* warm up */
-    t0 = now_s();
-    for (int r = 0; r < REPS; r++) {
-        tk_sgd_step(W, dW, (int)params, &opt, &rng);
-        g_sink += TK_TO_FLOAT(W[r%params]);
+    {
+        double samp[SAMPLES];
+        for (int s = 0; s < SAMPLES; s++) {
+            double t0 = now_s();
+            for (int r = 0; r < REPS; r++) {
+                tk_sgd_step(W, dW, (int)params, &opt, &rng);
+                g_sink += TK_TO_FLOAT(W[r%params]);
+            }
+            samp[s] = (now_s()-t0) / REPS;
+        }
+        double dt = median_of(samp, SAMPLES);
+        printf("[sgd_step] median %.3f ms/pass  (%.0f M weights/s)\n", dt*1e3, params/dt/1e6);
     }
-    dt = now_s()-t0;
-    printf("[sgd_step] %.3f ms/pass  (%.0f M weights/s)\n", dt/REPS*1e3, params*REPS/dt/1e6);
+
+    printf("peak RSS after backward/train_step/sgd sections: %.2f MB\n", peak_rss_mb());
 
     /* --- 3. stochastic rounding vs round-to-nearest: same run, final XOR loss --- */
     float rn = train_xor(0, 4000);
@@ -224,6 +259,8 @@ int main(int argc, char **argv) {
     /* --- 4. dataset-epoch primitives (f32 family, dtype-independent) --- */
     bench_epochs(1029, 4, 200, 9);      /* banknote-shaped: n=1029, d=4 */
     bench_epochs(2048, 2048, 1, 9);     /* wide: n=2048, d=2048 */
+
+    printf("\npeak RSS for the whole run: %.2f MB\n", peak_rss_mb());
 
     free(W);
     free(x);

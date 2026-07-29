@@ -16,6 +16,7 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <sys/resource.h>
 #include "ops.h"
 #include "pool.h"
 
@@ -35,6 +36,21 @@ static int cmp_d(const void *a, const void *b) {
     return (d > 0) - (d < 0);
 }
 static double median(double *v, int n) { qsort(v, n, sizeof *v, cmp_d); return v[n / 2]; }
+
+/* Process high-water RSS since start (see bench/benchmark.c for the platform
+ * unit rationale: bytes on Darwin's ru_maxrss, kB on Linux's). Group D (layer
+ * stacks up to depth 16, i.e. up to 16 * 2048 * 2048 * sizeof(tk_scalar_t))
+ * is where this benchmark's own footprint grows the most; printing it after
+ * that group makes the peak visible without cluttering the per-sample loop. */
+static double peak_rss_mb(void) {
+    struct rusage u;
+    if (getrusage(RUSAGE_SELF, &u) != 0) return -1.0;
+#if defined(__APPLE__)
+    return (double)u.ru_maxrss / (1024.0 * 1024.0);
+#else
+    return (double)u.ru_maxrss / 1024.0;
+#endif
+}
 
 static void fill_w(tk_scalar_t *W, size_t n) {
     for (size_t i = 0; i < n; i++) W[i] = TK_FROM_FLOAT(((float)(i % 17) - 8.0f) * 0.05f);
@@ -213,5 +229,6 @@ int main(void) {
             printf("  %-8d %-12.1f %-14.4f %.2f\n", depths[i], mb, ms, gf);
         }
     }
+    printf("\npeak RSS for the whole run: %.2f MB\n", peak_rss_mb());
     return 0;
 }

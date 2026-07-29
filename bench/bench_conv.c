@@ -13,9 +13,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+#include <sys/resource.h>
 #include "conv.h"
 #include "backprop.h"   /* tk_rng */
 #include "pool.h"       /* tk_num_threads */
+
+#define SAMPLES 5
 
 static double now_s(void) {
     struct timespec t;
@@ -24,6 +27,30 @@ static double now_s(void) {
 }
 
 static volatile float g_sink = 0.0f;
+
+static int cmp_double(const void *a, const void *b) {
+    double x = *(const double *)a, y = *(const double *)b;
+    return (x > y) - (x < y);
+}
+static double median_of(double *v, int n) {
+    qsort(v, n, sizeof *v, cmp_double);
+    return (n & 1) ? v[n / 2] : 0.5 * (v[n / 2 - 1] + v[n / 2]);
+}
+
+/* Process high-water RSS since start (see bench/benchmark.c for the platform
+ * unit rationale: bytes on Darwin's ru_maxrss, kB on Linux's). Conv scratch
+ * (im2col / packed panels) is allocated and freed per call, so this is the
+ * one number that shows whether that churn ever pushes the process's peak
+ * higher than the shape's own X/K/Y/dK/... buffers would need. */
+static double peak_rss_mb(void) {
+    struct rusage u;
+    if (getrusage(RUSAGE_SELF, &u) != 0) return -1.0;
+#if defined(__APPLE__)
+    return (double)u.ru_maxrss / (1024.0 * 1024.0);
+#else
+    return (double)u.ru_maxrss / 1024.0;
+#endif
+}
 
 typedef struct {
     const char *name;
@@ -60,26 +87,34 @@ static void bench_shape(const shape *sh, int reps) {
     tk_conv2d_forward_f32(X, K, b, Z, Y, sh->n, sh->in_c, sh->in_h, sh->in_w,
                           sh->out_c, sh->kh, sh->kw, sh->stride, sh->pad,
                           TK_ACT_RELU);                            /* warm up */
-    double t0 = now_s();
-    for (int r = 0; r < reps; r++) {
-        tk_conv2d_forward_f32(X, K, b, Z, Y, sh->n, sh->in_c, sh->in_h,
-                              sh->in_w, sh->out_c, sh->kh, sh->kw,
-                              sh->stride, sh->pad, TK_ACT_RELU);
-        g_sink += Y[(size_t)r % ysz];
+    double fsamp[SAMPLES];
+    for (int s = 0; s < SAMPLES; s++) {
+        double t0 = now_s();
+        for (int r = 0; r < reps; r++) {
+            tk_conv2d_forward_f32(X, K, b, Z, Y, sh->n, sh->in_c, sh->in_h,
+                                  sh->in_w, sh->out_c, sh->kh, sh->kw,
+                                  sh->stride, sh->pad, TK_ACT_RELU);
+            g_sink += Y[(size_t)r % ysz];
+        }
+        fsamp[s] = (now_s() - t0) / reps;
     }
-    const double fdt = (now_s() - t0) / reps;
+    const double fdt = median_of(fsamp, SAMPLES);
 
     tk_conv2d_backward_f32(X, K, Z, dY, dK, db, dX, sh->n, sh->in_c,
                            sh->in_h, sh->in_w, sh->out_c, sh->kh, sh->kw,
                            sh->stride, sh->pad, TK_ACT_RELU);      /* warm up */
-    t0 = now_s();
-    for (int r = 0; r < reps; r++) {
-        tk_conv2d_backward_f32(X, K, Z, dY, dK, db, dX, sh->n, sh->in_c,
-                               sh->in_h, sh->in_w, sh->out_c, sh->kh, sh->kw,
-                               sh->stride, sh->pad, TK_ACT_RELU);
-        g_sink += dK[(size_t)r % ksz];
+    double bsamp[SAMPLES];
+    for (int s = 0; s < SAMPLES; s++) {
+        double t0 = now_s();
+        for (int r = 0; r < reps; r++) {
+            tk_conv2d_backward_f32(X, K, Z, dY, dK, db, dX, sh->n, sh->in_c,
+                                   sh->in_h, sh->in_w, sh->out_c, sh->kh, sh->kw,
+                                   sh->stride, sh->pad, TK_ACT_RELU);
+            g_sink += dK[(size_t)r % ksz];
+        }
+        bsamp[s] = (now_s() - t0) / reps;
     }
-    const double bdt = (now_s() - t0) / reps;
+    const double bdt = median_of(bsamp, SAMPLES);
 
     printf("| %-26s | %3d | %8.3f | %7.2f | %8.3f | %7.2f |\n",
            sh->name, sh->n,
@@ -104,11 +139,13 @@ int main(int argc, char **argv) {
 
     printf("=== mantissa conv benchmark  (float32 family, threads=%d, "
            "%d reps) ===\n", tk_num_threads(), reps);
-    printf("note: single runs lie under DVFS -- compare medians of interleaved runs\n");
+    printf("note: single runs lie under DVFS -- reporting medians of %d samples, "
+           "%d reps/sample\n", SAMPLES, reps);
     printf("| %-26s | bat | fwd ms   | GFLOP/s | bwd ms   | GFLOP/s |\n",
            "shape");
     printf("|----------------------------|-----|----------|---------|----------|---------|\n");
     for (size_t i = 0; i < sizeof shapes / sizeof *shapes; i++)
         bench_shape(&shapes[i], reps);
+    printf("\npeak RSS for the whole run: %.2f MB\n", peak_rss_mb());
     return 0;
 }
