@@ -573,6 +573,24 @@ disagreed with the theory. Recorded here so they are not re-attempted.
   and repeatable −3.3 MB, but the timing came out +9.8% on one run and −12.4% on
   another. Unresolved rather than rejected; needs a quiet machine.
 
+- **A lookup table for the tekin8 (E4M3) read** — the trick that won for fp4 and
+  e5m2, and it **loses** here: mostly inconclusive on the forward and **1.6x
+  slower on the dense backward** (wall 1.597 [1.410, 1.698], CPU 1.729, against
+  an A/A control that was inconclusive throughout). The rule that falls out of
+  the three measurements is worth stating, because it decides which converter
+  each format should get:
+
+  > A table beats a *branch*. Arithmetic beats a *table* when the arithmetic
+  > vectorizes.
+
+  fp4 and e5m2 had branchy converters (subnormal case, and for e5m2 an inf/nan
+  case too) that could not vectorize at all, so replacing them with one load was
+  a pure win — 1.4-2.0x and 1.8-2.4x. tekin8's converter is now branchless
+  arithmetic that the compiler *does* vectorize, and the backward is
+  auto-vectorized and store-bandwidth bound, so swapping arithmetic for a
+  per-element table load de-vectorizes the loop and costs more than it saves.
+  Keep the multiply for E4M3, keep the table for E2M1 and E5M2.
+
 Two suggestions were already in place: `dW`/`dx` are computed in one pass over
 the weights (no double read), and small layers skip the thread pool via a work
 threshold.
