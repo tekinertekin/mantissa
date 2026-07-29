@@ -77,11 +77,16 @@ testconv: $(SRC) tests/test_conv.c
 
 # CNN primitive contract / edge cases: out_dim table, 1x1-conv==dense,
 # softmax-xent corners, degenerate dense shapes, whole-input pool, fixed-thread
-# determinism (float32, like testconv).
+# determinism (float32, like testconv). Run once under MANTISSA_THREADS=1 and
+# once at the default pool width: test_thread_determinism's repeat-call check
+# is a no-op proof at T=1 and only exercises the multi-worker dK/db/dX
+# reduction at T>1, so both invocations are needed for the comment in
+# tests/test_edges.c ("runs under both...") to actually be true.
 testedge: $(SRC) tests/test_edges.c
 	@mkdir -p $(BUILD)
 	$(CC) -O3 -funroll-loops -ffp-contract=fast -Wall -Wextra -std=c11 \
 	      -Iinclude -Isrc -DTK_DTYPE=0 -o $(BUILD)/test_edges $^ $(LDFLAGS)
+	@MANTISSA_THREADS=1 ./$(BUILD)/test_edges
 	@./$(BUILD)/test_edges
 
 bench: $(SRC) bench/benchmark.c
