@@ -508,6 +508,53 @@ disagreed with the theory. Recorded here so they are not re-attempted.
   amortize the pack less) and matches 256 threaded. 256 is the only width
   good at both thread counts.
 
+- **Hardware fp16 conversion for the WRITE path** (`__fp16` on arm64,
+  `_mm256_cvtps_ph` on x86 — both suggested by `dtypes.c`'s own comment) —
+  faster, and **rejected on numerics**. The reference rounds ties *away from
+  zero* (`lroundf`); the hardware convert rounds ties *to even*. Swept over all
+  2^32 patterns: they differ on **16,776,192 inputs (0.39%)**, first at
+  `0x33000000`. Adopting it would move every fp16 weight trajectory, so it is a
+  numerics decision and not an optimization. The shipped inline writer is a
+  hand-written bit-arithmetic reproduction of the *reference's* rounding
+  instead — bit-identical over all 2^32 patterns.
+- **Inlining the bf16 write path** alongside fp16/tekin8 — no gain, so not
+  shipped. bf16's converter was already branchless bit arithmetic with no libm
+  call to hoist; the float32 ladder measured 1.007x against a 1.049x A/A noise
+  band. The two formats that *did* pay (fp16, tekin8) had `frexpf`/`lroundf`
+  bodies behind a call boundary that blocked vectorization outright.
+- **`memcpy` fast path for the unclipped runs in `convg_pack_run`** — bit-identical,
+  and ~1% at the VGG64 shape (13.13 → 13.00 ms 1T), i.e. nothing. Consistent with
+  the phase split below: the whole non-kernel remainder is ~19% of the forward and
+  the copy loop inside it was already fine.
+- **Hoisting the col2im tap decode in `convb_dx_worker`** — real, consistent,
+  correctly signed, and **too small to ship**: four runs at 25 reps gave
+  −0.9/−0.9/−0.6/−0.4% of the backward (≈−0.4% of `bench_conv_ser`), against a
+  forward column moving ±1.6% as that run's own noise calibration. The scatter's
+  ~1/3-of-backward cost is the 9.4M float read-modify-writes into `dX`, not the
+  ~2.4M integer divisions it removes. Bit-identical; patch kept for the record.
+- **Eliminating the 4 MB `dZ` intermediate** on the conv backward (recomputing
+  `dy·act'(z)` on the fly) — the largest single allocation on that path, ~33% of
+  its scratch, and the implementation is correct with bit-identical output. Still
+  withdrawn: every timing run put it on the wrong side, and three controls
+  localise why — reading a different single array is free, reading the same array
+  twice plus the select is free, reading *two distinct* 4 MB arrays is not. It is
+  the **stream count**: the dX pass sweeps 64 rows 4 KB apart in 64-byte bites and
+  doubling that thrashes the prefetcher. Revisit only with a blocked recompute.
+- **Shrinking worker thread stacks** (512 KiB → 128/64 KiB, 9 workers) to reclaim
+  nominally 4 MiB — measured **zero** RSS effect. macOS faults stacks lazily and
+  the worker frames are shallow, so those pages were never resident. Same result
+  from `madvise(MADV_FREE)` before `free()`: no measurable benefit.
+- **`TK_CONV_JC` 256 → 128 as a *memory* lever** — the earlier sweep rejected
+  changing JC on time grounds, and re-examining it for footprint did find a real
+  −3.1 MB on pristine. Still not taken: the pack-burst change subsumes most of it
+  (it replaces the `npad·JC` term with `PB·NR·JC`, leaving ~650 KiB), and JC moves
+  `dK`'s reduction-chunk boundaries, so `dK` stops being bit-identical (~3.3e-7
+  relative, single-ULP scale — inside the documented reduction-order envelope, but
+  not free). A smaller saving for a numerics change is the wrong trade.
+- **`mmap`/`munmap` instead of `malloc` for the big conv GEMM scratch** — a real
+  and repeatable −3.3 MB, but the timing came out +9.8% on one run and −12.4% on
+  another. Unresolved rather than rejected; needs a quiet machine.
+
 Two suggestions were already in place: `dW`/`dx` are computed in one pass over
 the weights (no double read), and small layers skip the thread pool via a work
 threshold.
@@ -565,12 +612,40 @@ of `w - lr·g` discards any update below the type's ULP, so with a small learnin
 rate training silently stalls. SR rounds to the neighbouring grid point with
 probability equal to the fractional distance, so an update of ⅓ ULP moves the
 weight ⅓ of the time — correct in expectation. `tk_sr_from_float` does this in
-pure bit arithmetic: the storage grid is exactly the float32 patterns whose low
-`k = 23 − TK_MANT_BITS` bits are zero, so adding a uniform random k-bit tail to
-the f32 pattern and truncating rounds up with probability equal to the
-fractional distance — a mantissa carry lands exactly on the next binade's first
-grid point, so the algebra (and the exact unbiasedness proof, in the source
-comment) holds across binade boundaries; the final `TK_FROM_FLOAT` is exact.
+pure bit arithmetic: **while the result is normal in the storage type**, the grid
+is exactly the float32 patterns whose low `k = 23 − TK_MANT_BITS` bits are zero,
+so adding a uniform random k-bit tail to the f32 pattern and truncating rounds up
+with probability equal to the fractional distance — a mantissa carry lands
+exactly on the next binade's first grid point, so the algebra (and the exact
+unbiasedness proof, in the source comment) holds across binade boundaries; the
+final `TK_FROM_FLOAT` is exact.
+
+**The qualifier is load-bearing, and getting it wrong broke SR outright where it
+matters most.** Below the type's smallest normal the grid is not the per-binade
+f32 lattice at all — it is *uniform*, spaced at the type's smallest positive
+value. Constructing the two candidates on the lattice there puts `down` on a value
+the type cannot represent, and the closing `TK_FROM_FLOAT` re-rounds it *after*
+the probability has been spent, so the expectation moves. Measured on the code
+before the fix (200k trials per point): fp4 `E[SR(0.75)] = 0.5` instead of 0.75,
+and **every** fp4 `|v| ≤ 0.25` collapsed to exactly 0 — so on the format with the
+most to gain, SR bought nothing at all across nearly its whole range, since fp4's
+smallest normal is 1.0. tekin8 `E[SR(1e-3)] = 1.95e-3`, nearly double; e5m2
+biased below ~1.5e-5. bf16/fp16/tekin32/float32 were unaffected, their subnormal
+bands lying below anything `lr·g` produces.
+
+That band now routes to `tk_sr_subnormal`, where SR is simply `floor(x + u)` with
+`u ~ U[0,1)` once the spacing is scaled to 1 — the definition, on a uniform grid.
+Scaling by the compile-time `2^TK_SUB_SHIFT` is exact, so there is no division
+and no libm call, and it draws exactly one `u64` like the fast path, leaving the
+RNG cadence per weight unchanged. Two properties worth recording: the branch is
+a compare against a compile-time constant that is provably dead for
+float32/bf16/tekin32 (their smallest normal is low enough that the existing
+0/tiny guard already covers it), so the generated assembly for those is
+byte-identical before and after — no timing argument needed; and the only output
+that moves anywhere is stochastic-rounded SGD on the dtypes whose subnormal band
+is reachable. `test_sr_unbiased_own_subnormal` pins it per format, in units of
+that format's own grid step, and fails on the unfixed tree for fp16, tekin8,
+e5m2 and fp4 while passing for bf16 — the asymmetry being the point.
 No fdiv/floorf per weight, and the random tail is sign-adjusted so the up/down
 decision — and therefore every seeded weight trajectory — is bit-identical to
 the earlier floor-based implementation (verified exhaustively per exponent for
