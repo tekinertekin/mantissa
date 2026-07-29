@@ -109,7 +109,61 @@ static inline float tk_fp4_to_float(tk_fp4_t v) {
     return s ? -val : val;
 }
 
-/* ---- WRITE path: float32 -> narrow (cold; runs once at weight load) -------- */
+/* ---- WRITE path: float32 -> narrow ----------------------------------------
+ *
+ * "Runs once at weight load" holds for the narrow API but not for the float32
+ * one: ops.c's tk_q round-trips EVERY weight through the storage grid on every
+ * tk_linear_forward_f32 pass, and tk_quantize is a bulk conversion. For the two
+ * formats whose converter was libm-shaped (frexpf/lroundf), that call boundary
+ * blocked vectorisation outright -- the loop ran one element per iteration
+ * around a `bl`. Those two get a static inline bit-arithmetic writer here and
+ * dtypes.c's exported symbol forwards to it, so the inlined and exported forms
+ * are the same code.
+ *
+ * Both are bit-identical to the libm originals over all 2^32 float patterns
+ * (verified exhaustively against the pre-change functions, comparing returned
+ * patterns so signed zero and NaN payloads count). Two facts make that
+ * reproducible rather than lucky: frexpf's m-1 and the following power-of-two
+ * scale are exact, so lroundf sees an exact value and its round-half-AWAY-from-
+ * zero becomes "add half an ulp, then truncate" in integer form; and a mantissa
+ * carry out of that add lands exactly on the next binade's first grid point, so
+ * the reference's manual exponent bump falls out of the same add. Note this is
+ * NOT the hardware FCVT rounding, which is round-half-to-EVEN and differs from
+ * the reference on 0.39% of inputs -- see docs/DESIGN.md.
+ *
+ * bf16 is deliberately left on its exported function: its converter was already
+ * branchless bit arithmetic, and inlining it measured no change (the float32
+ * ladder came out at 1.007x, inside a 1.049x A/A noise band), so there is
+ * nothing to buy for the extra code. t32/e5m2/fp4 keep the libm forms too --
+ * each would need its own exhaustive proof and no benchmark exercises them hot. */
+
+static inline tk_fp16_t tk__fp16_from_float(float f) {
+    const uint32_t x = tk__f2u(f);
+    const uint32_t s = (x >> 16) & 0x8000u;
+    const uint32_t a = x & 0x7FFFFFFFu;                  /* |f| */
+    if (a > 0x7F800000u)  return (tk_fp16_t)(s | 0x7E00u);   /* nan */
+    if (a >= 0x477FF000u) return (tk_fp16_t)(s | 0x7C00u);   /* >= 65520, inf */
+    if (a >= 0x38800000u)                                    /* |f| >= 2^-14 */
+        return (tk_fp16_t)(s | (((a + 0x1000u) >> 13) - 0x1C000u));
+    const uint32_t sh = 126u - (a >> 23);                /* subnormal: |f|*2^24 */
+    if ((a >> 23) == 0u || sh > 25u) return (tk_fp16_t)s; /* rounds to +-0 */
+    return (tk_fp16_t)(s | (((0x800000u | (a & 0x7FFFFFu)) + (1u << (sh - 1u))) >> sh));
+}
+
+static inline tk_f8_t tk__f8_from_float(float f) {
+    const uint32_t x = tk__f2u(f);
+    const uint32_t s = (x >> 24) & 0x80u;
+    const uint32_t a = x & 0x7FFFFFFFu;
+    if (a >= 0x43800000u) return (tk_f8_t)(s | 0x7Fu);   /* >= 2^8, inf, nan */
+    if (a >= 0x3C800000u) {                              /* |f| >= 2^-6 */
+        const uint32_t r = (a + 0x80000u) >> 20;         /* round, carry included */
+        return (tk_f8_t)(r >= (135u << 3) ? (s | 0x7Fu) : (s | (r - 960u)));
+    }
+    const uint32_t sh = 141u - (a >> 23);                /* subnormal: |f|*2^9 */
+    if ((a >> 23) == 0u || sh > 25u) return (tk_f8_t)s;
+    return (tk_f8_t)(s | (((0x800000u | (a & 0x7FFFFFu)) + (1u << (sh - 1u))) >> sh));
+}
+
 TK_API tk_fp16_t tk_float_to_fp16(float f);
 TK_API tk_bf16_t tk_float_to_bf16(float f);
 TK_API tk_t32_t  tk_float_to_t32(float f);
@@ -129,7 +183,7 @@ TK_API tk_fp4_t  tk_float_to_fp4(float f);
 #elif TK_DTYPE == TK_DTYPE_FP16
     typedef tk_fp16_t tk_scalar_t;
     #define TK_TO_FLOAT(x)   tk_fp16_to_float(x)
-    #define TK_FROM_FLOAT(f) tk_float_to_fp16(f)
+    #define TK_FROM_FLOAT(f) tk__fp16_from_float(f)
     #define TK_DTYPE_NAME    "fp16"
     #define TK_MANT_BITS     10
     #define TK_MIN_NORM_BEXP 113
@@ -153,7 +207,7 @@ TK_API tk_fp4_t  tk_float_to_fp4(float f);
 #elif TK_DTYPE == TK_DTYPE_TEKIN8
     typedef tk_f8_t tk_scalar_t;
     #define TK_TO_FLOAT(x)   tk_f8_to_float(x)
-    #define TK_FROM_FLOAT(f) tk_float_to_f8(f)
+    #define TK_FROM_FLOAT(f) tk__f8_from_float(f)
     #define TK_DTYPE_NAME    "tekin8"
     #define TK_MANT_BITS     3
     #define TK_MIN_NORM_BEXP 121
