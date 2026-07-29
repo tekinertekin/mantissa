@@ -21,11 +21,24 @@ sentence.
 
 **The honest counter-story:** narrow storage only becomes speed when the *read*
 is cheap. bf16 is literally the top 16 bits of a float32, so its read is a single
-shift and it edges out float32. `tekin8` (FP8 E4M3), by contrast, is *slower*
-than float32 once the matrix is cache-resident: its unpack is a subnormal branch
-that doesn't map to one widening instruction, and that conversion now dominates
-the arithmetic. Byte count only helps if the hot-path conversion is a shift or a
-hardware instruction — which is exactly why the next two sections exist.
+shift and it edges out float32. `tekin8` (FP8 E4M3) is the cautionary case — a
+1-byte format that is *still slower* than 4-byte float32, at roughly **half its
+GEMV throughput in the same run** (M4, 2048², 28.8 vs 59.2 GFLOP/s). The reason
+has moved once already:
+
+- It began as a **conversion** problem. E4M3's unpack was a subnormal *branch*,
+  which forced the compiler into a compare/select/lane-extract chain and left
+  the conversion dominating the arithmetic. E4M3 reserves no inf/nan encoding
+  here, so that read is now branch-free — place the exp:mantissa field where a
+  float32 significand goes, multiply by 2^(254−bias), done. Worth **1.5–2.3×**
+  across GEMV, batch GEMM and the dense backward (paired A/B, bit-identical over
+  all 256 encodings).
+- It is now a **SIMD** problem. float32, bf16 and fp16 each have a hand-written
+  NEON kernel in `tk__dot4`; tekin8 does not, so it runs the portable loop. That,
+  not the conversion, is what remains of the gap.
+
+The lesson survives its own fix: byte count only pays if the hot path can *read*
+those bytes cheaply — which is why the next two sections exist.
 
 ## 2. The dot-product core
 
@@ -48,15 +61,39 @@ instead of re-read per row. ~**1.3×** across every dtype, for free.
 - **float32 → narrow (cold)** runs once at load/quantize time → clear
   `frexpf`/`lroundf` code in `dtypes.c`, correctness over speed.
 
+
 For fp16 the hot read is **hardware conversion** — one `FCVT`/`vcvt_f32_f16` on
 arm64, `_mm_cvtph_ps` (F16C) on x86 — verified bit-exact against the software
 converter across all 65536 patterns. That took the fp16 GEMV from ~3 GFLOP/s
 (conversion-bound) to **~54 GFLOP/s**, ~18×, closing the "tekin8 lesson" for fp16.
 
+**That second bullet was half wrong, and it cost real time.** It holds for the
+narrow API, but `tk_linear_forward_f32` — the entry point every language binding
+uses — round-trips *every weight through the storage grid on every pass* via
+`tk_q`. There a libm-shaped converter is not cold at all: the `bl` per element
+blocked vectorization outright, so the loop ran one element per iteration. fp16
+and tekin8, the two formats whose converters were libm-shaped, now have inline
+bit-arithmetic writers: **1.53×** and **2.28×** on that ladder (paired A/B),
+bit-identical to the originals over all 2³² float patterns.
+
+bf16 was measured and deliberately left alone — its converter was already
+branchless bit arithmetic, and inlining it landed at 1.007× inside a 1.049× A/A
+noise band. Nothing to buy.
+
+The tempting wrong answer, recorded so nobody re-tries it: the one-instruction
+hardware convert (`__fp16`, `_mm256_cvtps_ph`) is faster still but rounds ties to
+**even** where the reference rounds ties **away from zero** — they differ on
+0.39% of all float inputs. Adopting it would move every fp16 weight trajectory;
+that is a numerics decision, not an optimization.
+
 ## 4. Explicit SIMD, one portable binary
 
 The 4-row kernel has hand-written vector versions with **two accumulator chains
 per row** (depth-8, to beat FMA *latency* rather than throughput):
+
+(The before/after pairs below were taken with the earlier single-run bench
+harness; `make bench` now reports medians of five, which shifts the absolute
+GFLOP/s upward on this machine. Compare figures within a section, not across.)
 
 | dtype | arm64 NEON (serial, M4) | how the narrow read is done |
 |---|---|---|
@@ -94,6 +131,15 @@ accumulates the full `kdim` and stores once with bias+activation. The micro-kern
 reaches ~**86% of the core's float32 peak** (up from ~28% for the naïve
 per-sample version); the same machinery runs the backward (`dK = dZ·im2colᵀ`) at
 ~78% of forward. Net: the conv rewrite was **1.23×** end-to-end (5.36 → 4.35 s).
+
+**Packing only what the kernel holds.** Both pack sites used to buffer a whole
+`NC`=256-column panel before the micro-kernel consumed it, but the kernel retires
+one `NR`-column micro-panel at a time. Packing in bursts of `TK_CONV_PB` panels
+inside the consuming loop sizes the scratch to what is actually live, per worker:
+threaded conv **peak RSS −20.7%** (38.5 → 29.7 MB) and −41.3% on the conv test
+binary, output byte-identical, no measurable time cost (all paired-A/B intervals
+straddle 1.0). The saving scales with worker count, which is the right shape —
+memory pressure is a threaded-run problem; at one thread it is under a megabyte.
 
 ## 6. The backward pass
 
@@ -145,6 +191,21 @@ make benchscale     # the thread-scaling curve + per-dispatch barrier latency
 Numbers here are M4 (serial, interleaved medians) and GitHub CI (x86-64, AVX2)
 as labelled; see [DESIGN.md](DESIGN.md) for the full method, the ULP-repro
 envelope, and the alternatives that were measured and rejected.
+
+**On believing any of these numbers.** Absolute wall-clock on a laptop is
+dominated by DVFS, thermal state, background load, and — on Apple Silicon — which
+core class the thread landed on, so timing A now and B later compares two
+different machines. Speed claims above come from a paired design: both builds
+timed alternately in randomised order, adjacent runs paired, and the *median of
+the paired ratio* reported with a bootstrap CI, so drift slower than one pair
+cancels. Every such claim is gated on an **A/A control** — the identical build
+measured against itself — and anything inside that band is reported as no result.
+That gate earns its keep: an in-process variant of the harness produced a 10%
+*false* speedup between two byte-identical builds, and a non-paired sequential
+run showed a 16% conv "regression" that vanished under pairing. Where a change
+can be shown correct without timing at all — e.g. the stochastic-rounding fix,
+whose generated assembly is byte-identical for float32/bf16/tekin32 — that proof
+is preferred over any measurement.
 
 ## References
 
