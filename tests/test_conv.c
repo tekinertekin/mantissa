@@ -500,6 +500,86 @@ static void test_conv_training_reduces_loss(void) {
              first, last);
 }
 
+/* ---- nearest-neighbor upsample: exact adjoint + degenerate k=1 -----------
+ * tk_upsample2d_nearest_f32 is a LINEAR operator with no bias/activation, so
+ * instead of a finite-difference gradient check (built for a scalar loss),
+ * verify the defining property of its documented "exact adjoint" backward
+ * directly: for any X, dY,
+ *     <upsample(X), dY>  ==  <X, upsample_backward(dY)>
+ * (the bilinear-form identity that makes a backward pass the TRUE adjoint of
+ * its forward -- Griewank & Walther's reverse-mode definition). This is
+ * exact arithmetic reorganization (the same products summed in a different
+ * order), so the tolerance only needs to cover float64-accumulated summation
+ * order, not any model error. conv.h documents k*k block-sum as the exact
+ * adjoint; this is the first test that checks either half of this API at
+ * all -- previously untested. */
+static void test_upsample_adjoint(void) {
+    printf("\nupsample2d_nearest: forward/backward exact adjoint <Y,dY>==<X,dX>:\n");
+    enum { N = 2, C = 3, H = 5, W = 4 };
+    for (int k = 2; k <= 3; k++) {
+        const int oh = H * k, ow = W * k;
+        float *X  = malloc((size_t)N * C * H * W * sizeof(float));
+        float *Y  = malloc((size_t)N * C * oh * ow * sizeof(float));
+        float *dY = malloc((size_t)N * C * oh * ow * sizeof(float));
+        float *dX = malloc((size_t)N * C * H * W * sizeof(float));
+        if (!X || !Y || !dY || !dX) { check_ok(0, "upsample k=%d: alloc failed", k); goto next; }
+        tk_rng rng = tk_rng_seed(71 + k);
+        fill_rand(X, (size_t)N * C * H * W, &rng, 2.0f);
+        fill_rand(dY, (size_t)N * C * oh * ow, &rng, 2.0f);
+
+        tk_upsample2d_nearest_f32(X, Y, N, C, H, W, k);
+        tk_upsample2d_nearest_backward_f32(dY, dX, N, C, H, W, k);
+
+        double lhs = 0.0, rhs = 0.0;
+        for (size_t i = 0; i < (size_t)N * C * oh * ow; i++) lhs += (double)Y[i] * dY[i];
+        for (size_t i = 0; i < (size_t)N * C * H * W; i++)   rhs += (double)X[i] * dX[i];
+        double rel = fabs(lhs - rhs) / (fabs(lhs) > 1e-6 ? fabs(lhs) : 1e-6);
+        check_ok(rel < 1e-5, "k=%d: <Y,dY>=%.6f <X,dX>=%.6f rel err %.2e", k, lhs, rhs, rel);
+
+        /* forward sanity: every k x k output block repeats its source pixel */
+        int shape_ok = 1;
+        for (int pl = 0; pl < N * C && shape_ok; pl++)
+            for (int i = 0; i < H && shape_ok; i++)
+                for (int j = 0; j < W && shape_ok; j++) {
+                    float src = X[(size_t)pl * H * W + i * W + j];
+                    for (int a = 0; a < k && shape_ok; a++)
+                        for (int b = 0; b < k && shape_ok; b++)
+                            if (Y[(size_t)pl * oh * ow + (size_t)(i * k + a) * ow + (j * k + b)] != src)
+                                shape_ok = 0;
+                }
+        check_ok(shape_ok, "k=%d: every output block repeats its source pixel", k);
+next:
+        free(X); free(Y); free(dY); free(dX);
+    }
+
+    /* k=1 is the identity (degenerate but legal) */
+    float x1[6] = { 1, 2, 3, 4, 5, 6 }, y1[6], dy1[6] = { 1, 1, 1, 1, 1, 1 }, dx1[6];
+    tk_upsample2d_nearest_f32(x1, y1, 1, 1, 2, 3, 1);
+    tk_upsample2d_nearest_backward_f32(dy1, dx1, 1, 1, 2, 3, 1);
+    int id_ok = 1;
+    for (int i = 0; i < 6; i++) if (y1[i] != x1[i] || dx1[i] != dy1[i]) id_ok = 0;
+    check_ok(id_ok, "k=1 upsample/backward is the identity");
+}
+
+/* ---- tk_sgd_update_list_f32 == per-tensor tk_sgd_update_f32 -------------- */
+static void test_sgd_update_list(void) {
+    printf("\ntk_sgd_update_list_f32 == per-tensor tk_sgd_update_f32:\n");
+    float A[5] = { 1, 2, 3, 4, 5 }, dA[5] = { 0.1f, 0.2f, 0.3f, 0.4f, 0.5f };
+    float B[3] = { -1, -2, -3 },    dB[3] = { 1, 1, 1 };
+    float Aref[5], Bref[3];
+    memcpy(Aref, A, sizeof A); memcpy(Bref, B, sizeof B);
+    tk_sgd_update_f32(Aref, dA, 5, 0.1f);
+    tk_sgd_update_f32(Bref, dB, 3, 0.1f);
+
+    float *Ws[2] = { A, B };
+    const float *dWs[2] = { dA, dB };
+    int ns[2] = { 5, 3 };
+    tk_sgd_update_list_f32(Ws, dWs, ns, 2, 0.1f);
+
+    check_ok(memcmp(A, Aref, sizeof A) == 0 && memcmp(B, Bref, sizeof B) == 0,
+             "list update matches per-tensor update for both tensors");
+}
+
 int main(void) {
     printf("Conv/pool/dense-batch gradient check (float32, central differences):\n");
 
@@ -532,6 +612,8 @@ int main(void) {
 
     test_softmax_xent();
     test_sgd_update();
+    test_sgd_update_list();
+    test_upsample_adjoint();
     test_conv_training_reduces_loss();
 
     printf("\n%s\n", failures ? "FAILED" : "ALL PASSED");

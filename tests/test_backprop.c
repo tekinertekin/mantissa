@@ -355,6 +355,78 @@ static void test_l1l2(void) {
              "SGD L1+L2 update matches the closed form");
 }
 
+/* ---- tk_act_resolve / individually-exported activations match the switch -
+ * tk_act_resolve (the function-pointer table) and the named tk_act_* entry
+ * points are only ever exercised by bench/benchmark.c's SPEED comparison
+ * against tk_act_scalar -- nothing checked that they return the same VALUES.
+ * Since tk_act_scalar is the reference every gradient check above already
+ * trusts, this closes that gap directly against it. */
+static void test_act_resolve(void) {
+    printf("\ntk_act_resolve and named activation fns match tk_act_scalar:\n");
+    static const float zs[] = { -3.0f, -1.0f, -0.001f, 0.0f, 0.001f, 1.0f, 3.0f };
+    int ok = 1;
+    for (int a = 0; a < TK_ACT_COUNT; a++) {
+        tk_act_fn f = tk_act_resolve((tk_activation_t)a);
+        for (unsigned i = 0; i < sizeof(zs) / sizeof(*zs); i++) {
+            float want = tk_act_scalar(zs[i], (tk_activation_t)a);
+            float got = f(zs[i]);
+            if (got != want) {
+                ok = 0;
+                check_ok(0, "act %d z=%.4f fn-ptr=%.6g scalar=%.6g", a, zs[i], got, want);
+            }
+        }
+    }
+    check_ok(ok, "tk_act_resolve(a)(z) == tk_act_scalar(z,a) for all %d activations",
+             TK_ACT_COUNT);
+
+    ok = 1;
+    for (unsigned i = 0; i < sizeof(zs) / sizeof(*zs); i++) {
+        float z = zs[i];
+        ok &= (tk_act_identity(z) == tk_act_scalar(z, TK_ACT_IDENTITY));
+        ok &= (tk_act_step(z)     == tk_act_scalar(z, TK_ACT_STEP));
+        ok &= (tk_act_sign(z)     == tk_act_scalar(z, TK_ACT_SIGN));
+        ok &= (tk_act_relu(z)     == tk_act_scalar(z, TK_ACT_RELU));
+        ok &= (tk_act_sigmoid(z)  == tk_act_scalar(z, TK_ACT_SIGMOID));
+        ok &= (tk_act_tanh(z)     == tk_act_scalar(z, TK_ACT_TANH));
+        ok &= (tk_act_gelu(z)     == tk_act_scalar(z, TK_ACT_GELU));
+    }
+    check_ok(ok, "named tk_act_* functions match tk_act_scalar for the same enum");
+}
+
+/* ---- tk_optim_default reads config.h's compiled-in defaults -------------- */
+static void test_optim_default(void) {
+    printf("\ntk_optim_default reflects config.h defaults:\n");
+    tk_optim o = tk_optim_default(0.05f);
+    check_ok(o.lr == 0.05f, "lr passed through (%.4f)", o.lr);
+    /* All three training flags default OFF in config.h (TK_USE_L1/L2/
+     * STOCHASTIC_ROUNDING); this pins that tk_optim_default actually reads
+     * them rather than hardcoding fixed values that happen to match today. */
+    check_ok(o.l1 == (TK_USE_L1 ? (float)(TK_L1_LAMBDA) : 0.0f),
+             "l1 matches TK_USE_L1 (%.6g)", o.l1);
+    check_ok(o.l2 == (TK_USE_L2 ? (float)(TK_L2_LAMBDA) : 0.0f),
+             "l2 matches TK_USE_L2 (%.6g)", o.l2);
+    check_ok(o.stochastic == TK_USE_STOCHASTIC_ROUNDING,
+             "stochastic matches TK_USE_STOCHASTIC_ROUNDING (%d)", o.stochastic);
+}
+
+/* ---- tk_linear_backward with db == NULL: dW/dx unaffected ---------------- */
+static void test_backward_null_db(void) {
+    printf("\ntk_linear_backward with db=NULL: dW/dx unaffected:\n");
+    tk_scalar_t W[OUT * IN], x[IN];
+    float z[OUT], dy[OUT];
+    tk_rng rng = tk_rng_seed(606);
+    for (int i = 0; i < OUT * IN; i++) W[i] = TK_FROM_FLOAT(tk_rng_f01(&rng) - 0.5f);
+    for (int i = 0; i < IN; i++)       x[i] = TK_FROM_FLOAT(tk_rng_f01(&rng) - 0.5f);
+    for (int i = 0; i < OUT; i++) { z[i] = tk_rng_f01(&rng) - 0.5f; dy[i] = tk_rng_f01(&rng) - 0.5f; }
+
+    float dW_a[OUT * IN], db_a[OUT], dx_a[IN];
+    float dW_b[OUT * IN], dx_b[IN];
+    tk_linear_backward(W, x, z, dy, dW_a, db_a, dx_a, OUT, IN, TK_ACT_TANH);
+    tk_linear_backward(W, x, z, dy, dW_b, NULL,  dx_b, OUT, IN, TK_ACT_TANH);
+    check_ok(memcmp(dW_a, dW_b, sizeof dW_a) == 0 && memcmp(dx_a, dx_b, sizeof dx_a) == 0,
+             "db=NULL leaves dW/dx bit-identical to the db!=NULL call");
+}
+
 int main(void) {
     printf("Backprop gradient check (float32, central differences):\n");
     check_layer(TK_ACT_TANH,    "tanh");
@@ -370,6 +442,9 @@ int main(void) {
     test_train_epoch_order();
     test_perceptron_epoch();
     test_l1l2();
+    test_act_resolve();
+    test_optim_default();
+    test_backward_null_db();
 
     printf("\n%s\n", failures ? "FAILED" : "ALL PASSED");
     return failures ? 1 : 0;

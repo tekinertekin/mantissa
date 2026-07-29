@@ -139,6 +139,16 @@ static void test_softmax_edges(void) {
     int fin = isfinite(Lb);
     for (int i = 0; i < 6; i++) fin &= isfinite(dbg[i]);
     check_ok(fin && Lb >= 0.0f, "logits +-1e4 stay finite (loss %.4f)", Lb);
+
+    /* degenerate n=0 / classes=0: documented early return of 0, no crash (the
+     * n<=0||classes<=0 guard is the function's first statement, before any
+     * pointer is read, so passing NULL logits/labels here is safe and
+     * exercises exactly that guard). */
+    float d0[1];
+    check_ok(tk_softmax_xent_f32(NULL, NULL, d0, 0, 5) == 0.0f,
+             "softmax_xent n=0 returns 0, does not read logits/labels");
+    check_ok(tk_softmax_xent_f32(NULL, NULL, d0, 5, 0) == 0.0f,
+             "softmax_xent classes=0 returns 0, does not read logits/labels");
 }
 
 /* ---- degenerate dense-batch shapes: n=1 and out_dim=1 --------------------
