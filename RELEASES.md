@@ -6,6 +6,57 @@ dense layer (4.2M params) unless noted, and are indicative, not absolute.
 
 ---
 
+## v0.2.7 — 2026-07-29  (tag `v0.2.7`)
+
+One correctness fix in the headline low-precision feature, two measured speedups
+on the narrow formats, and a threaded-conv memory reduction. No API or ABI change.
+
+**Fixed: stochastic rounding was biased below a format's smallest normal.**
+`tk_sr_from_float` built its two rounding candidates on the float32 bit lattice,
+which is the storage grid only while the result is *normal* in that format. Below
+that the grid is uniform, so a candidate could be unrepresentable and the closing
+conversion re-rounded it *after* the probability had been spent. Measured before
+the fix (200k trials/point): fp4 `E[SR(0.75)] = 0.5` instead of 0.75, and every
+fp4 `|v| ≤ 0.25` collapsed to exactly **0** — so on the format with the most to
+gain, SR bought nothing across nearly its whole range (fp4's smallest normal is
+1.0). tekin8 `E[SR(1e-3)] = 1.95e-3`; e5m2 biased below ~1.5e-5. bf16, fp16,
+tekin32 and float32 were unaffected. That band now rounds on the uniform grid,
+where SR is `floor(x + u)`. **This changes stochastic-rounded SGD output** for
+fp4/tekin8/e5m2/fp16 in that band; everything else is bit-identical, and the
+generated assembly for float32/bf16/tekin32 is byte-identical.
+
+**tekin8 (FP8 E4M3) read is branchless — 1.5–2.3×.** E4M3 reserves no inf/nan
+encoding here, so the subnormal branch that had been forcing a
+compare/select/lane-extract chain is gone. Paired A/B medians with bootstrap CIs:
+GEMV 2048² **1.89×**, GEMV 64² **2.25×**, batch GEMM **2.06×**, dense backward
+**2.06×**. Bit-identical over all 256 encodings. tekin8 is still slower than
+float32 — the remaining gap is the missing NEON kernel, not the conversion.
+
+**fp16/tekin8 float32-API write path inlined — 1.53× / 2.28×.** The write path was
+documented as cold; that is false for `tk_linear_forward_f32`, which round-trips
+every weight through the storage grid on every pass. Those two formats had
+`frexpf`/`lroundf` bodies behind a call boundary that blocked vectorization
+outright. Both new writers are bit-identical to the originals over **all 2³²**
+float patterns. bf16 was measured and deliberately left alone (already branchless;
+1.007× inside a 1.049× noise band).
+
+**Threaded conv peak RSS −20.7%.** Both conv pack sites buffered a whole
+256-column panel while the micro-kernel retires one 16-column micro-panel at a
+time. Packing in bursts (`TK_CONV_PB`, default 4) sizes the scratch to what is
+live: `bench_conv_mt` 38.5 → 29.7 MB, the conv test binary −41.3%, output
+byte-identical, no measurable time cost. The saving scales with worker count.
+
+**Tests and benchmarks.** 104 checks per dtype, up from 60: exact edge
+bit-patterns, NaN canonicalization, per-format tie-breaking, `tk_quantize`,
+`tk_dot` block/tail boundaries, NULL-bias equivalence, degenerate shapes,
+repeat-call determinism, the serial batch path, and three stochastic-rounding
+properties including the one this release fixes. Benchmarks now report real peak
+RSS from `getrusage` and take medians of five instead of single runs; `testedge`
+runs at both thread regimes, which its own comment had claimed but the Makefile
+did not do.
+
+---
+
 ## v0.2.6 — 2026-07-25  (tag `v0.2.6`)
 
 Two measured CPU optimizations, both correctness-preserving and RAM-neutral
