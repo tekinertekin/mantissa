@@ -199,11 +199,13 @@ static void conv_fwd_direct(const float *restrict X, const float *restrict K,
  *   C (out_c x n*oh*ow) = A (K, out_c x kdim) . B (im2col, kdim x n*oh*ow),
  * blocked BLIS-style (Van Zee & van de Geijn, 2015, "BLIS: A Framework for
  * Rapidly Instantiating BLAS Functionality"): A is packed once per call into
- * MR-row micro-panels, B is packed panel-by-panel (NC columns at a time, a
- * panel spans batch samples) into NR-column micro-panels, and an MR x NR
- * register tile of C accumulates over the full kdim. The full-batch im2col
- * matrix is never materialized (rejected in RELEASES v0.2.1: n x the
- * footprint); per-worker footprint is one kdim x NC panel.
+ * MR-row micro-panels, B is packed one NR-column micro-panel at a time (NC
+ * columns is the threading/panel granularity, and a panel spans batch
+ * samples), and an MR x NR register tile of C accumulates over the full kdim.
+ * The full-batch im2col matrix is never materialized (rejected in RELEASES
+ * v0.2.1: n x the footprint); the per-worker footprint is one kdim x NR
+ * micro-panel, because the kernel finishes with one before the next is
+ * packed -- buffering the whole NC panel cost NC/NR times that for nothing.
  *
  * kdim is NOT blocked: target shapes keep it small (<= 576 for a 64-channel
  * 3x3 layer), so one A micro-panel (MR*kdim) plus one B micro-panel
@@ -232,10 +234,21 @@ enum { TK_CONV_MR = 6, TK_CONV_NR = 16 };
 enum { TK_CONV_MR = 4, TK_CONV_NR = 4 };
 #endif
 
-/* Columns per packed B panel (the per-worker working set is kdim*NC floats).
- * Swept 128/256/512 on M4 (see DESIGN.md); flat within noise, 256 kept. */
+/* Columns per B panel: the threading granularity, and the span an A sweep is
+ * amortized over. Swept 128/256/512 on M4 (see DESIGN.md); flat within noise,
+ * 256 kept. */
 #ifndef TK_CONV_NC
 #define TK_CONV_NC 256
+#endif
+
+/* B micro-panels packed per burst. The kernel consumes a micro-panel
+ * completely before the next is needed, so this -- not NC -- is what the
+ * packed-B scratch has to hold: PB*NR*kdim floats per worker instead of
+ * NC*kdim. PB=NC/NR reproduces whole-panel packing. PB>1 keeps the X read one
+ * long stream, which short-kdim shapes (the 3-channel VGG stem, kdim=27) are
+ * bound by. */
+#ifndef TK_CONV_PB
+#define TK_CONV_PB 4
 #endif
 
 /* MACs below this run the per-sample path: its scratch is smaller and the
@@ -320,16 +333,22 @@ static void convg_pack_run(const float *restrict xs, float *restrict dst,
     }
 }
 
-/* Pack im2col columns [j0, j0+nc) into NR-column micro-panels:
- * Bp[panel][k][NR]. Column j is output pixel (sample j/npatch, patch
- * j%npatch); each micro-panel's columns are split into runs sharing
- * (sample, output row) so convg_pack_run can stream them. Columns past nc
- * are zero-filled (the kernel always runs full NR). */
+/* Pack im2col columns [j0, j0+jn), jn <= NR, into ONE NR-column micro-panel
+ * Bp[k][NR]. Column j is output pixel (sample j/npatch, patch j%npatch); the
+ * panel's columns are split into runs sharing (sample, output row) so
+ * convg_pack_run can stream them. Columns past jn are zero-filled (the kernel
+ * always runs full NR).
+ *
+ * A burst of up to TK_CONV_PB micro-panels per call, not a whole NC panel:
+ * the kernel consumes a micro-panel completely (sweeping every A panel against
+ * it) before the next is needed, so buffering all NC/NR of them widens the
+ * per-worker footprint by NC/(PB*NR) -- 590 KB instead of 147 KB at the VGG
+ * 64-channel shape -- for nothing. NC stays the threading granularity. */
 static void convg_pack_B(const float *restrict X, float *restrict Bp,
-                         const tk_conv_geom *g, long j0, int nc) {
+                         const tk_conv_geom *g, long j0, int nb) {
     const int NR = TK_CONV_NR;
-    for (int jj = 0; jj < nc; jj += NR) {
-        const int jn = (nc - jj < NR) ? nc - jj : NR;
+    for (int jj = 0; jj < nb; jj += NR) {
+        const int jn = (nb - jj < NR) ? nb - jj : NR;
         float *restrict dst = Bp + (size_t)(jj / NR) * g->kdim * NR;
         if (jn < NR)                                  /* pad columns to NR */
             memset(dst, 0, (size_t)g->kdim * NR * sizeof(float));
@@ -591,10 +610,9 @@ static void convg_store(const float *restrict Ct, float *Z, float *Y,
     }
 }
 
-/* Per-worker packed-B slice size: micro-panels round columns up to NR. */
+/* Per-worker packed-B slice size: one pack burst (see convg_pack_B). */
 static size_t conv_bp_stride(int kdim) {
-    return (size_t)((TK_CONV_NC + TK_CONV_NR - 1) / TK_CONV_NR)
-         * TK_CONV_NR * kdim;
+    return (size_t)TK_CONV_PB * TK_CONV_NR * kdim;
 }
 
 typedef struct {
@@ -604,8 +622,8 @@ typedef struct {
     tk_activation_t act;
 } tk_convg_fwd_ctx;
 
-/* Column panels [p0, p1): pack B for the panel, then sweep all filter
- * micro-panels against each B micro-panel (B micro-panel stays L1-hot). */
+/* Column panels [p0, p1): per NR-column micro-panel, pack it and sweep all
+ * filter micro-panels against it (the B micro-panel stays L1-hot). */
 static void convg_fwd_worker(void *pv, int p0, int p1, int worker) {
     const tk_convg_fwd_ctx *c = (const tk_convg_fwd_ctx *)pv;
     const tk_conv_geom *g = &c->g;
@@ -615,17 +633,23 @@ static void convg_fwd_worker(void *pv, int p0, int p1, int worker) {
         const long j0 = (long)pan * TK_CONV_NC;
         const int nc = (g->ncols - j0 < TK_CONV_NC) ? (int)(g->ncols - j0)
                                                     : TK_CONV_NC;
-        convg_pack_B(c->X, Bp, g, j0, nc);
-        for (int jr = 0; jr < nc; jr += NR) {
-            const float *restrict Bmp = Bp + (size_t)(jr / NR) * g->kdim * NR;
-            const int nf = (nc - jr < NR) ? nc - jr : NR;
-            for (int oc0 = 0; oc0 < g->out_c; oc0 += MR) {
-                const int m = (g->out_c - oc0 < MR) ? g->out_c - oc0 : MR;
-                float Ct[TK_CONV_MR * TK_CONV_NR];
-                convg_kern(g->kdim, c->Ap + (size_t)(oc0 / MR) * g->kdim * MR,
-                           Bmp, Ct);
-                convg_store(Ct, c->Z, c->Y, c->bias, g, c->act,
-                            oc0, m, j0 + jr, nf);
+        for (int jb = 0; jb < nc; jb += NR * TK_CONV_PB) {
+            const int nb = (nc - jb < NR * TK_CONV_PB) ? nc - jb
+                                                       : NR * TK_CONV_PB;
+            convg_pack_B(c->X, Bp, g, j0 + jb, nb);
+            for (int jr = 0; jr < nb; jr += NR) {
+                const int nf = (nb - jr < NR) ? nb - jr : NR;
+                const float *restrict Bmp =
+                    Bp + (size_t)(jr / NR) * g->kdim * NR;
+                for (int oc0 = 0; oc0 < g->out_c; oc0 += MR) {
+                    const int m = (g->out_c - oc0 < MR) ? g->out_c - oc0 : MR;
+                    float Ct[TK_CONV_MR * TK_CONV_NR];
+                    convg_kern(g->kdim,
+                               c->Ap + (size_t)(oc0 / MR) * g->kdim * MR,
+                               Bmp, Ct);
+                    convg_store(Ct, c->Z, c->Y, c->bias, g, c->act,
+                                oc0, m, j0 + jb + jr, nf);
+                }
             }
         }
     }
@@ -744,62 +768,69 @@ static void convb_pack_dzT(const float *restrict dZ, float *restrict Ap,
     }
 }
 
-/* Pack im2col rows [j0, j0+jc) as the dK GEMM's B: Bp[npanel][k][NR], lanes
- * NR consecutive kdim taps. Loops tap-outer / column-inner in runs sharing
- * (sample, output row), so at stride 1 each tap reads a contiguous X row
- * segment; the NR-strided writes land one cache line apart and each line is
- * filled across the t loop. */
+/* Pack im2col rows [j0, j0+jc) for ONE NR-tap micro-panel of the dK GEMM's B:
+ * Bp[k][NR], lanes = kdim taps [kd0, kd0+NR). Loops tap-outer / column-inner
+ * in runs sharing (sample, output row), so at stride 1 each tap reads a
+ * contiguous X row segment; the NR-strided writes land one cache line apart
+ * and each line is filled across the r loop.
+ *
+ * A burst of up to TK_CONV_PB tap panels per call for the same reason as
+ * convg_pack_B: the kd0 loop in convb_dk_worker finishes with a panel before
+ * asking for the next, so buffering all kdim/NR of them costs
+ * kdim/(PB*NR) x the per-worker footprint (590 KB instead of 64 KB at the VGG
+ * 64-channel shape). */
 static void convb_pack_colsT(const float *restrict X, float *restrict Bp,
-                             const tk_conv_geom *g, long j0, int jc) {
+                             const tk_conv_geom *g, long j0, int jc,
+                             int kd0, int ntap) {
     const int NR = TK_CONV_NR;
     const int khw = g->kh * g->kw;
-    for (int kd0 = 0; kd0 < g->kdim; kd0 += NR) {
-        const int nt = (g->kdim - kd0 < NR) ? g->kdim - kd0 : NR;
-        float *restrict dst = Bp + (size_t)(kd0 / NR) * jc * NR;
-        int k = 0;
-        while (k < jc) {
-            const long j = j0 + k;
-            const int s = (int)(j / g->npatch), p = (int)(j % g->npatch);
-            const int oy = p / g->ow, ox = p % g->ow;
-            int run = g->ow - ox;
-            if (run > jc - k) run = jc - k;
-            const float *restrict xs = X + (size_t)s * g->in_sz;
-            const int iy0 = oy * g->stride - g->pad;
-            const int ixb = ox * g->stride - g->pad;
-            for (int t = 0; t < NR; t++) {
-                float *restrict d = dst + (size_t)k * NR + t;
-                if (t >= nt) {
-                    for (int r = 0; r < run; r++) d[(size_t)r * NR] = 0.0f;
-                    continue;
-                }
-                const int kd = kd0 + t;
-                const int c = kd / khw, rem = kd % khw;
-                const int ky = rem / g->kw, kx = rem % g->kw;
-                const int iy = iy0 + ky;
-                if (iy < 0 || iy >= g->in_h) {
-                    for (int r = 0; r < run; r++) d[(size_t)r * NR] = 0.0f;
-                    continue;
-                }
-                const float *restrict row =
-                    xs + ((size_t)c * g->in_h + iy) * g->in_w;
-                if (g->stride == 1) {
-                    const int lo = ixb + kx;
-                    int a = lo < 0 ? -lo : 0;
-                    int b = (lo + run > g->in_w) ? g->in_w - lo : run;
-                    if (b < a) b = a;
-                    for (int r = 0; r < a; r++)   d[(size_t)r * NR] = 0.0f;
-                    for (int r = a; r < b; r++)   d[(size_t)r * NR] = row[lo + r];
-                    for (int r = b; r < run; r++) d[(size_t)r * NR] = 0.0f;
-                } else {
-                    for (int r = 0; r < run; r++) {
-                        const int ix = ixb + r * g->stride + kx;
-                        d[(size_t)r * NR] =
-                            (ix >= 0 && ix < g->in_w) ? row[ix] : 0.0f;
-                    }
+    for (int kk = 0; kk < ntap; kk += NR) {
+    const int nt = (ntap - kk < NR) ? ntap - kk : NR;
+    float *restrict pan = Bp + (size_t)(kk / NR) * jc * NR;
+    int k = 0;
+    while (k < jc) {
+        const long j = j0 + k;
+        const int s = (int)(j / g->npatch), p = (int)(j % g->npatch);
+        const int oy = p / g->ow, ox = p % g->ow;
+        int run = g->ow - ox;
+        if (run > jc - k) run = jc - k;
+        const float *restrict xs = X + (size_t)s * g->in_sz;
+        const int iy0 = oy * g->stride - g->pad;
+        const int ixb = ox * g->stride - g->pad;
+        for (int t = 0; t < NR; t++) {
+            float *restrict d = pan + (size_t)k * NR + t;
+            if (t >= nt) {
+                for (int r = 0; r < run; r++) d[(size_t)r * NR] = 0.0f;
+                continue;
+            }
+            const int kd = kd0 + kk + t;
+            const int c = kd / khw, rem = kd % khw;
+            const int ky = rem / g->kw, kx = rem % g->kw;
+            const int iy = iy0 + ky;
+            if (iy < 0 || iy >= g->in_h) {
+                for (int r = 0; r < run; r++) d[(size_t)r * NR] = 0.0f;
+                continue;
+            }
+            const float *restrict row =
+                xs + ((size_t)c * g->in_h + iy) * g->in_w;
+            if (g->stride == 1) {
+                const int lo = ixb + kx;
+                int a = lo < 0 ? -lo : 0;
+                int b = (lo + run > g->in_w) ? g->in_w - lo : run;
+                if (b < a) b = a;
+                for (int r = 0; r < a; r++)   d[(size_t)r * NR] = 0.0f;
+                for (int r = a; r < b; r++)   d[(size_t)r * NR] = row[lo + r];
+                for (int r = b; r < run; r++) d[(size_t)r * NR] = 0.0f;
+            } else {
+                for (int r = 0; r < run; r++) {
+                    const int ix = ixb + r * g->stride + kx;
+                    d[(size_t)r * NR] =
+                        (ix >= 0 && ix < g->in_w) ? row[ix] : 0.0f;
                 }
             }
-            k += run;
         }
+        k += run;
+    }
     }
 }
 
@@ -817,28 +848,31 @@ static void convb_dk_worker(void *pv, int c0, int c1, int worker) {
     const tk_conv_geom *g = &c->g;
     const int MR = TK_CONV_MR, NR = TK_CONV_NR;
     const int mpad = (g->out_c + MR - 1) / MR * MR;
-    const int npad = (g->kdim + NR - 1) / NR * NR;
     float *Ap = c->Ap + (size_t)worker * mpad * TK_CONV_JC;
-    float *Bp = c->Bp + (size_t)worker * npad * TK_CONV_JC;
+    float *Bp = c->Bp + (size_t)worker * TK_CONV_PB * NR * TK_CONV_JC;
     float *dKp = c->dKp + (size_t)worker * g->out_c * g->kdim;
     for (int ch = c0; ch < c1; ch++) {
         const long j0 = (long)ch * TK_CONV_JC;
         const int jc = (g->ncols - j0 < TK_CONV_JC) ? (int)(g->ncols - j0)
                                                     : TK_CONV_JC;
         convb_pack_dzT(c->dZ, Ap, g, j0, jc);
-        convb_pack_colsT(c->X, Bp, g, j0, jc);
-        for (int kd0 = 0; kd0 < g->kdim; kd0 += NR) {
-            const int nf = (g->kdim - kd0 < NR) ? g->kdim - kd0 : NR;
-            const float *restrict Bmp = Bp + (size_t)(kd0 / NR) * jc * NR;
-            for (int oc0 = 0; oc0 < g->out_c; oc0 += MR) {
-                const int m = (g->out_c - oc0 < MR) ? g->out_c - oc0 : MR;
-                float Ct[TK_CONV_MR * TK_CONV_NR];
-                convg_kern(jc, Ap + (size_t)(oc0 / MR) * jc * MR, Bmp, Ct);
-                for (int i = 0; i < m; i++) {
-                    float *restrict dkr =
-                        dKp + (size_t)(oc0 + i) * g->kdim + kd0;
-                    const float *restrict src = Ct + (size_t)i * NR;
-                    for (int t = 0; t < nf; t++) dkr[t] += src[t];
+        for (int kb = 0; kb < g->kdim; kb += NR * TK_CONV_PB) {
+            const int nt = (g->kdim - kb < NR * TK_CONV_PB) ? g->kdim - kb
+                                                            : NR * TK_CONV_PB;
+            convb_pack_colsT(c->X, Bp, g, j0, jc, kb, nt);
+            for (int kd0 = 0; kd0 < nt; kd0 += NR) {
+                const int nf = (nt - kd0 < NR) ? nt - kd0 : NR;
+                const float *restrict Bmp = Bp + (size_t)(kd0 / NR) * jc * NR;
+                for (int oc0 = 0; oc0 < g->out_c; oc0 += MR) {
+                    const int m = (g->out_c - oc0 < MR) ? g->out_c - oc0 : MR;
+                    float Ct[TK_CONV_MR * TK_CONV_NR];
+                    convg_kern(jc, Ap + (size_t)(oc0 / MR) * jc * MR, Bmp, Ct);
+                    for (int i = 0; i < m; i++) {
+                        float *restrict dkr =
+                            dKp + (size_t)(oc0 + i) * g->kdim + kb + kd0;
+                        const float *restrict src = Ct + (size_t)i * NR;
+                        for (int t = 0; t < nf; t++) dkr[t] += src[t];
+                    }
                 }
             }
         }
@@ -948,16 +982,17 @@ static int conv_bwd_gemm(const float *X, const float *K, const float *Z,
                          const float *dY, float *dK, float *db, float *dX,
                          const tk_conv_geom *g, tk_activation_t act, int T) {
     const int MR = TK_CONV_MR, NR = TK_CONV_NR;
-    const int Tw = (T > 1) ? tk_num_threads() : 1;
     const int mpad = (g->out_c + MR - 1) / MR * MR;
-    const int npad = (g->kdim + NR - 1) / NR * NR;
     const int ktpanels = (g->kdim + MR - 1) / MR;
     const size_t ksz = (size_t)g->out_c * g->kdim;
+    const int Tw = (T > 1) ? tk_num_threads() : 1;
 
     float *dZ  = malloc((size_t)g->n * g->out_sz * sizeof(float));
     float *dKp = calloc((size_t)Tw * ksz + (db ? (size_t)Tw * g->out_c : 0),
                         sizeof(float));
-    float *Ap  = malloc((size_t)Tw * (mpad + npad) * TK_CONV_JC
+    /* dzT pack (mpad x JC per worker) + one colsT pack burst
+     * (PB*NR x JC per worker), one allocation. */
+    float *Ap  = malloc((size_t)Tw * (mpad + TK_CONV_PB * NR) * TK_CONV_JC
                         * sizeof(float));
     float *Kt = NULL, *B3 = NULL;
     if (dX) {
