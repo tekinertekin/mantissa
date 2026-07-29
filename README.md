@@ -6,9 +6,29 @@
 ![Python](https://img.shields.io/badge/python-ctypes-3776AB.svg)
 ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen.svg)
 
-**A fast, memory-lean neural-network core in C, with a Python binding.**
+**A low-precision neural-network compute core in C, with a Python binding.**
 
-`mantissa` is an ultra-lightweight, high-performance neural network engine designed to execute forward and backward passes with minimal time and memory overhead per parameter. By pairing a bare-metal, highly optimized C compute core with a thin Python interface, *mantissa* enables the training and deployment of large-scale models directly within tightly constrained RAM/VRAM environments.
+`mantissa` is a from-scratch AI compute core: dense layers and 2-D convolution,
+forward and backward, with weights and activations stored in a narrow float
+format of your choice — bfloat16, fp16, FP8 (E4M3/E5M2), FP4 (E2M1), or a custom
+1·7·24 type — while every accumulator stays float32. That is the standard
+mixed-precision recipe, *narrow storage / wide accumulate*, and it is the whole
+design: on a dense layer the budget is memory bandwidth, so halving the stored
+size of a weight is worth nearly as much as halving the runtime.
+
+It is dependency-free C11 with hand-written NEON and runtime-dispatched AVX2
+kernels in one portable binary, a thread pool, and a `ctypes` Python layer. It
+runs on the **CPU** today.
+
+**Roadmap** (not yet implemented): a GPU backend, and the sequence models the
+same primitive already implies — word2vec, GRU/LSTM, and transformer-shaped
+work. See [DESIGN.md §3](docs/DESIGN.md) for why `tk_linear_forward` is the
+shared building block of all of them.
+
+Every performance number in this repository is measured, and the counter-stories
+are written down too: [PERFORMANCE.md](docs/PERFORMANCE.md) says where narrow
+storage does *not* pay, and [DESIGN.md](docs/DESIGN.md) lists the optimizations
+that were tried and rejected with the measurement that killed them.
 
 > Started by Tekin Ertekin (2024); later refactored with Claude Code — see
 > [AUTHORS.md](AUTHORS.md).
