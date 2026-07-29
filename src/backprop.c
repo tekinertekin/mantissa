@@ -101,6 +101,44 @@ static tk_scalar_t __attribute__((noinline, cold)) tk_sr_guarded(float v) {
     return TK_FROM_FLOAT(v);
 }
 
+/* Below the storage type's smallest NORMAL value the representable grid is
+ * UNIFORM with spacing 2^-TK_SUB_SHIFT -- it is not the per-binade lattice the
+ * fast path below assumes. Feeding that band through the fast path puts `down`
+ * on a value the type cannot hold, and the closing TK_FROM_FLOAT re-rounds it
+ * *after* the probability has been spent, which biases the result. Measured on
+ * the pre-fix code: fp4 E[SR(0.75)] = 0.5 rather than 0.75, and every |v| <=
+ * 0.25 collapsed to exactly 0 -- so SR bought nothing at all in the band it
+ * exists to serve; tekin8 E[SR(1e-3)] = 1.95e-3, nearly double.
+ *
+ * On a uniform grid SR is simply floor(x + u), u ~ U[0,1), once the spacing is
+ * scaled to 1: that lands on the upper neighbour with probability frac(x), which
+ * is the definition of stochastic rounding. Draws exactly one u64, like the fast
+ * path, so the RNG cadence per weight is unchanged.
+ *
+ * Only compiled where the band is reachable. bf16/float32 place their smallest
+ * normal at 2^-126, and tekin32 at 2^-62, so for those the 0/tiny guard above
+ * already catches everything this would handle (and 2^133 / 2^149 would not
+ * scale in float32 anyway). */
+#if TK_MANT_BITS < 23 && TK_SUB_SHIFT <= 30
+/* x * 2^e, exact and branch-free for the small |e| used here (the product's
+ * exponent stays inside float32's normal range), so this path needs no libm
+ * call and no division. */
+static inline float tk__scale2(float x, int e) {
+    return x * tk__u2f(tk__f2u(1.0f) + ((uint32_t)e << 23));
+}
+
+static tk_scalar_t __attribute__((noinline)) tk_sr_subnormal(float v, tk_rng *rng) {
+    const float a = v < 0.0f ? -v : v;
+    /* Caller enters only for |v| below the type's smallest normal, so the scaled
+     * magnitude is bounded by 2^TK_MANT_BITS+1 (fp16's 1024 is the largest across
+     * the dtypes compiled here) and the truncating cast cannot overflow. */
+    const uint32_t n = (uint32_t)(tk__scale2(a, TK_SUB_SHIFT) + tk_rng_f01(rng));
+    const float q = tk__scale2((float)n, -TK_SUB_SHIFT);
+    return TK_FROM_FLOAT(v < 0.0f ? -q : q);
+}
+#define TK_HAVE_SR_SUBNORMAL 1
+#endif
+
 /* Stochastic rounding to the active storage grid, in pure bit arithmetic: add
  * a random k-bit tail below the target's mantissa width to the f32 pattern,
  * then truncate onto the grid (Gupta et al., 2015, arXiv:1502.02551). No
@@ -119,11 +157,10 @@ static tk_scalar_t __attribute__((noinline, cold)) tk_sr_guarded(float v) {
  * runs on |v|; the sign-conditional tail below only aligns the decision with
  * the previous float implementation, it does not affect the probability.)
  * Grid points carry <= TK_MANT_BITS+1 significand bits, so the final
- * TK_FROM_FLOAT is exact for target-normal results; in the target-subnormal
- * band it re-rounds RNE onto the coarser grid, as before. Draws exactly one
- * u64 per non-guarded weight and makes the same up/down decision as the old
- * fdiv/floorf code for every (value, RNG state), so seeded weight
- * trajectories are bit-identical across the change. */
+ * TK_FROM_FLOAT is exact -- but only for target-NORMAL results. The argument
+ * above needs the grid to be the per-binade f32 lattice, which stops being true
+ * below the type's smallest normal; that band is uniform instead and goes to
+ * tk_sr_subnormal. Draws exactly one u64 per non-guarded weight either way. */
 static inline tk_scalar_t tk_sr_from_float(float v, tk_rng *rng) {
     const uint32_t bits = tk__f2u(v);
     const uint32_t bexp = (bits >> 23) & 0xFFu;
@@ -131,6 +168,12 @@ static inline tk_scalar_t tk_sr_from_float(float v, tk_rng *rng) {
      * No RNG draw here, matching the pre-integer-SR stream. */
     if (bexp - ((uint32_t)TK_MANT_BITS + 1u) >= 0xFEu - (uint32_t)TK_MANT_BITS)
         return tk_sr_guarded(v);
+#if defined(TK_HAVE_SR_SUBNORMAL)
+    /* Invariant compare against a compile-time constant; for bf16 (where
+     * TK_MIN_NORM_BEXP == 1) the guard above has already taken every value this
+     * could match, so the default build's tuned SR loop is unaffected. */
+    if (bexp < (uint32_t)TK_MIN_NORM_BEXP) return tk_sr_subnormal(v, rng);
+#endif
 #if TK_MANT_BITS >= 23
     (void)tk_rng_u64(rng);       /* grid is exact; draw keeps the stream aligned */
     return TK_FROM_FLOAT(v);

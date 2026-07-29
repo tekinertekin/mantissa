@@ -116,42 +116,56 @@ TK_API tk_fp4_t  tk_float_to_fp4(float f);
     #define TK_FROM_FLOAT(f) ((float)(f))
     #define TK_DTYPE_NAME    "float32"
     #define TK_MANT_BITS     23
+    #define TK_MIN_NORM_BEXP 1
+    #define TK_SUB_SHIFT     149   /* float32: 2^-126 normal, 2^-149 subnormal step */
 #elif TK_DTYPE == TK_DTYPE_FP16
     typedef tk_fp16_t tk_scalar_t;
     #define TK_TO_FLOAT(x)   tk_fp16_to_float(x)
     #define TK_FROM_FLOAT(f) tk_float_to_fp16(f)
     #define TK_DTYPE_NAME    "fp16"
     #define TK_MANT_BITS     10
+    #define TK_MIN_NORM_BEXP 113
+    #define TK_SUB_SHIFT     24   /* fp16: 2^-14 normal, 2^-24 subnormal step */
 #elif TK_DTYPE == TK_DTYPE_BFLOAT16
     typedef tk_bf16_t tk_scalar_t;
     #define TK_TO_FLOAT(x)   tk_bf16_to_float(x)
     #define TK_FROM_FLOAT(f) tk_float_to_bf16(f)
     #define TK_DTYPE_NAME    "bfloat16"
     #define TK_MANT_BITS     7
+    #define TK_MIN_NORM_BEXP 1
+    #define TK_SUB_SHIFT     133   /* bf16: 2^-126 normal, 2^-133 subnormal step */
 #elif TK_DTYPE == TK_DTYPE_TEKIN32
     typedef tk_t32_t tk_scalar_t;
     #define TK_TO_FLOAT(x)   tk_t32_to_float(x)
     #define TK_FROM_FLOAT(f) tk_float_to_t32(f)
     #define TK_DTYPE_NAME    "tekin32"
     #define TK_MANT_BITS     24
+    #define TK_MIN_NORM_BEXP 65
+    #define TK_SUB_SHIFT     86   /* tekin32: 2^-62 normal, 2^-86 subnormal step */
 #elif TK_DTYPE == TK_DTYPE_TEKIN8
     typedef tk_f8_t tk_scalar_t;
     #define TK_TO_FLOAT(x)   tk_f8_to_float(x)
     #define TK_FROM_FLOAT(f) tk_float_to_f8(f)
     #define TK_DTYPE_NAME    "tekin8"
     #define TK_MANT_BITS     3
+    #define TK_MIN_NORM_BEXP 121
+    #define TK_SUB_SHIFT     9   /* tekin8 E4M3: 2^-6 normal, 2^-9 subnormal step */
 #elif TK_DTYPE == TK_DTYPE_FP8_E5M2
     typedef tk_e5m2_t tk_scalar_t;
     #define TK_TO_FLOAT(x)   tk_e5m2_to_float(x)
     #define TK_FROM_FLOAT(f) tk_float_to_e5m2(f)
     #define TK_DTYPE_NAME    "fp8_e5m2"
     #define TK_MANT_BITS     2
+    #define TK_MIN_NORM_BEXP 113
+    #define TK_SUB_SHIFT     16   /* e5m2: 2^-14 normal, 2^-16 subnormal step */
 #elif TK_DTYPE == TK_DTYPE_FP4_E2M1
     typedef tk_fp4_t tk_scalar_t;
     #define TK_TO_FLOAT(x)   tk_fp4_to_float(x)
     #define TK_FROM_FLOAT(f) tk_float_to_fp4(f)
     #define TK_DTYPE_NAME    "fp4_e2m1"
     #define TK_MANT_BITS     1
+    #define TK_MIN_NORM_BEXP 127
+    #define TK_SUB_SHIFT     1   /* fp4 E2M1: 1.0 is the smallest normal, 0.5 the only subnormal */
 #else
     #error "Unknown TK_DTYPE in config.h"
 #endif
