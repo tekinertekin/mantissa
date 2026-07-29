@@ -73,13 +73,21 @@ static inline float tk_t32_to_float(tk_t32_t v) {
     return tk__u2f(s | (fe << 23) | fm);
 }
 
+/* Branchless: place the 7-bit (exp:mantissa) field as if it were already a
+ * float32 significand (mag << (23-3)), then multiply by the constant
+ * 2^(254-bias) = 2^120. Multiplying a float by a power of two is exact and
+ * shifts the *value* of both the normal and the subnormal encoding alike --
+ * the same trick as the classic branch-free fp16->fp32 widen (Giesen,
+ * "Fast Half Float Conversions", 2012), generalized from bias 15 to bias 7.
+ * It only stays a pure multiply because tekin8 reserves no S.1111.111 NaN
+ * slot (docs/DESIGN.md): every one of the 256 patterns is a finite value, so
+ * there is no inf/nan case to special-case. Verified bit-identical to the
+ * branchy form over all 256 patterns. This is the fix for "the tekin8
+ * lesson" (docs/PERFORMANCE.md): the subnormal branch was exactly what kept
+ * the narrow read off the vectorizer. */
 static inline float tk_f8_to_float(tk_f8_t v) {
-    const uint32_t s = (v >> 7) & 1u, e = (v >> 3) & 0xFu, m = v & 7u;
-    if (e == 0u) {                                 /* subnormal: m * 2^-9 */
-        const float sub = (float)m * (1.0f / 512.0f);
-        return s ? -sub : sub;
-    }
-    return tk__u2f((s << 31) | ((e + 120u) << 23) | (m << 20));  /* bias 7 -> 127 */
+    const uint32_t bits = ((uint32_t)(v & 0x80u) << 24) | ((uint32_t)(v & 0x7Fu) << 20);
+    return tk__u2f(bits) * tk__u2f(247u << 23);   /* 2^(254-7) */
 }
 
 static inline float tk_e5m2_to_float(tk_e5m2_t v) {
