@@ -91,12 +91,30 @@ bound**, so halving the storage size approaches halving the runtime. `make
 bench` confirms the direction: bfloat16 (half the bytes, a one-shift read) edges
 out float32.
 
-But the benchmark also tells the honest counter-story: **tekin8 is slower**, not
-4× faster, once the matrix is cache-resident — its E4M3→float conversion (a
-subnormal branch, not SIMD-friendly) now dominates the arithmetic. The lesson is
-real: narrow storage only converts to speed when the read is cheap (a shift) or
-hardware-accelerated (F16C, AVX512-BF16, Blackwell FP8 tensor cores). This is
-why the conversion hot path matters as much as the byte count.
+But the benchmark also tells the honest counter-story: **tekin8 is still slower**
+than float32, not 4× faster — roughly half its GEMV throughput in the same run
+(M4, 2048²: 28.8 vs 59.2 GFLOP/s). The cause has moved once, which is worth
+recording because the lesson outlived its first fix:
+
+- It *was* the conversion. E4M3→float went through a subnormal *branch*, so the
+  compiler built a compare/select/lane-extract chain and the conversion dominated
+  the arithmetic. Since E4M3 reserves no inf/nan slot here, that read is now
+  branch-free (shift the exp:mantissa field into a float32 significand, multiply
+  by `2^(254−bias)`) — 1.5–2.3× across GEMV, batch GEMM and the dense backward,
+  bit-identical over all 256 encodings.
+- It is *now* the missing SIMD kernel. float32/bf16/fp16 each have a hand-written
+  NEON kernel in `tk__dot4`; tekin8, e5m2 and fp4 fall through to the portable
+  loop. That gap is what remains.
+
+The general lesson stands either way: narrow storage only converts to speed when
+the read is cheap (a shift), hardware-accelerated (F16C, AVX512-BF16, Blackwell
+FP8 tensor cores), *and* fed by a vector kernel. Byte count alone buys nothing.
+
+One further byte-count caveat, currently unaddressed: **fp4 is stored one element
+per byte** (`tk_fp4_t` is a `uint8_t` holding a 4-bit value), so it has the same
+footprint and the same memory traffic as tekin8 — a 2048² weight matrix is 4.0 MB
+in both. Packing two elements per byte is the outstanding structural win for that
+format, in footprint and in bandwidth alike.
 
 ### Conversion: hot path vs cold path
 
