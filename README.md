@@ -63,9 +63,17 @@ effectively lossless at 2×. fp4 is a step too far for *naïve* post-training
 quantization — 4-bit needs per-block scaling or quantization-aware training
 (a good first contribution — see [CONTRIBUTING.md](CONTRIBUTING.md)).
 
-**Run it yourself:** `make DTYPE=4 lib && python examples/mnist_demo.py` trains a
-classifier on MNIST and reports accuracy, throughput, and footprint at the chosen
-storage precision (needs only numpy + matplotlib).
+**Run it yourself:**
+
+```sh
+make DTYPE=4 lib
+MANTISSA_LIB=build/libmantissa.dylib python examples/mnist_demo.py   # .so on Linux
+```
+
+trains a classifier on MNIST and reports accuracy, throughput, and footprint at
+the chosen storage precision (needs only numpy + matplotlib). `MANTISSA_LIB` is
+what selects that build: without it the binding prefers the bundled library,
+which is bfloat16, so `DTYPE=` would appear to have no effect.
 
 <sub>The linear model tops out near 81 %; the point is the **relative** cost of
 each format, not the absolute number. Convolutions currently run in float32, so

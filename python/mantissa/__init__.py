@@ -9,6 +9,7 @@ Python code exercises float32, bfloat16, fp8, ... just by rebuilding the lib.
 from __future__ import annotations
 
 import ctypes
+import os
 import sys
 import weakref as _weakref
 from array import array
@@ -90,8 +91,17 @@ def _library_path() -> str:
     ext = {"darwin": "dylib", "win32": "dll"}.get(sys.platform, "so")
     here = Path(__file__).resolve().parent           # python/mantissa (or the installed package)
     root = here.parent.parent                        # repo root in a source checkout
-    # Prefer the library bundled inside the installed package (wheel), then fall
-    # back to a source-tree `make dist` / `make lib`.
+    # An explicit path wins over everything. Without this, a source checkout that
+    # has a bundled or dist/ library cannot be pointed at a `make lib DTYPE=N`
+    # build: the bundled copy is found first, so the caller measures whatever
+    # dtype it was built for while believing they selected another.
+    override = os.environ.get("MANTISSA_LIB")
+    if override:
+        if not Path(override).exists():
+            raise FileNotFoundError(f"MANTISSA_LIB={override} does not exist")
+        return override
+    # Otherwise prefer the library bundled inside the installed package (wheel),
+    # then fall back to a source-tree `make dist` / `make lib`.
     for lib in (here / f"libmantissa.{ext}",
                 root / "dist" / f"libmantissa.{ext}",
                 root / "build" / f"libmantissa.{ext}"):
