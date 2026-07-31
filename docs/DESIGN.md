@@ -392,6 +392,19 @@ disagreed with the theory. Recorded here so they are not re-attempted.
 - **Manual branchless `dropout`/L1-sign and loop unswitching** — no change:
   `-O3` already emits `csel`/`cmov` for the data-dependent selects and hoists the
   loop-invariant branches.
+- **Explicit NEON read for E5M2** — **0.85-0.87× (13-15% slower)**: GEMV
+  31.13 → 26.48 GFLOP/s, GEMM batch=64 41.24 → 35.90 (M4, 2048×2048). The
+  vectorized read was bit-exact — all 256 patterns in all four lanes, inf and
+  the three nan payloads included — so this was a pure throughput loss. E5M2's
+  scalar read is a single load from a 1 KB table that stays resident in L1;
+  reproducing it arithmetically costs ~10 instructions per four values (widen
+  twice, four mask/shift pairs, or, multiply, and a compare-plus-select for the
+  exponent-all-ones lanes, which the scaled form otherwise maps to a finite
+  2^16). This is the same boundary as the scalar finding above — a table wins
+  for E5M2 and loses for tekin8 — and it holds after vectorizing: tekin8's read
+  is arithmetic either way, so NEON helps it (1.34-1.49×), while E5M2 is already
+  one load and cannot be beaten by arithmetic. fp4, also table-backed, is
+  expected to behave like E5M2.
 - **Explicit NEON for the backward pass** — **~40% slower** for the `dx`
   reduction than the compiler's auto-vectorized scalar loop. Backward is
   store-bandwidth bound (it writes `dW`, 4×params bytes), so hand-vectorizing the
