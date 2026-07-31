@@ -392,6 +392,19 @@ disagreed with the theory. Recorded here so they are not re-attempted.
 - **Manual branchless `dropout`/L1-sign and loop unswitching** — no change:
   `-O3` already emits `csel`/`cmov` for the data-dependent selects and hoists the
   loop-invariant branches.
+- **fp4 two-per-byte packing** — halves the weight bytes and measures **0.89-0.91×
+  out of cache (64 MB working set, five runs) and ~0.93× in cache (4 MB)**, i.e. it
+  costs roughly 10% throughput and never wins at any size tried (1, 4, 16, 64 MB).
+  An earlier prototype had measured 1.32× *for the packed arm against the scalar
+  table read*; that advantage disappeared once the unpacked read was vectorised
+  through `TBL`, because halving the bytes buys nothing while the nibble extract
+  (shift, and, interleave) sits on the critical path. Widening the load from 4 to
+  16 elements per step, so the extract amortises, narrows the gap from 0.78× to
+  ~0.9× but does not close it. Verified by checksum that both arms compute the
+  same dot products. **Not rejected outright**: packing is what makes the "½ byte"
+  column honest, and MXFP4/NVFP4 define packed storage, so it is a prerequisite
+  for block scaling rather than an optimization — but it should land with block
+  scaling, as a memory feature costing ~10% speed, not as a speedup.
 - **Explicit NEON read for E5M2** — **0.85-0.87× (13-15% slower)**: GEMV
   31.13 → 26.48 GFLOP/s, GEMM batch=64 41.24 → 35.90 (M4, 2048×2048). The
   vectorized read was bit-exact — all 256 patterns in all four lanes, inf and
