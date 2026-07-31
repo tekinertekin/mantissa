@@ -93,6 +93,23 @@ static void tk__dot4_bfmlal(const tk_bf16_t *W, int in, const tk_bf16_t *x, floa
 static inline float32x4_t tk__fp16x4(const tk_fp16_t *p) {
     return vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(p)));
 }
+#elif TK_DTYPE == TK_DTYPE_TEKIN8
+#define TK_HAVE_NEON_F8 1
+/* Load 4 tekin8 as float32, lane-for-lane the same arithmetic as
+ * tk_f8_to_float: place the sign at bit 31, the exponent+mantissa at bit 20,
+ * then scale by 2^(254-7) to correct the exponent bias. E4M3 has no inf/nan,
+ * so there is nothing to special-case and the whole read is four instructions
+ * of shifts and a multiply. Bit-identical to the scalar read over all 256
+ * patterns in every lane. */
+static inline float32x4_t tk__f8x4(const tk_f8_t *p) {
+    uint32_t four;
+    memcpy(&four, p, 4);
+    uint32x4_t v = vmovl_u16(vget_low_u16(vmovl_u8(vreinterpret_u8_u32(vdup_n_u32(four)))));
+    uint32x4_t bits = vorrq_u32(vshlq_n_u32(vandq_u32(v, vdupq_n_u32(0x80u)), 24),
+                                vshlq_n_u32(vandq_u32(v, vdupq_n_u32(0x7Fu)), 20));
+    return vmulq_f32(vreinterpretq_f32_u32(bits),
+                     vreinterpretq_f32_u32(vdupq_n_u32(247u << 23)));
+}
 #endif /* TK_DTYPE, within __aarch64__ */
 
 #elif defined(__x86_64__) && (TK_DTYPE == TK_DTYPE_FLOAT32 || TK_DTYPE == TK_DTYPE_BFLOAT16 || TK_DTYPE == TK_DTYPE_FP16)
@@ -241,7 +258,7 @@ static inline void tk__dot4(const tk_scalar_t *restrict W, int in,
                        *restrict w2 = W + 2 * in, *restrict w3 = W + 3 * in;
     float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
     int i = 0;
-#if defined(TK_HAVE_NEON_F32) || defined(TK_HAVE_NEON_BF16) || defined(TK_HAVE_NEON_FP16)
+#if defined(TK_HAVE_NEON_F32) || defined(TK_HAVE_NEON_BF16) || defined(TK_HAVE_NEON_FP16) || defined(TK_HAVE_NEON_F8)
   #if defined(TK_HAVE_BF16_MLAL)
     if (tk__cpu_has_bf16()) { tk__dot4_bfmlal(W, in, x, out); return; }
   #endif
@@ -249,6 +266,8 @@ static inline void tk__dot4(const tk_scalar_t *restrict W, int in,
     #define TK__LD4(p) vld1q_f32(p)
   #elif defined(TK_HAVE_NEON_BF16)
     #define TK__LD4(p) tk__bf16x4(p)         /* load + widen */
+  #elif defined(TK_HAVE_NEON_F8)
+    #define TK__LD4(p) tk__f8x4(p)           /* load + shift + scale */
   #else
     #define TK__LD4(p) tk__fp16x4(p)         /* load + FCVTL */
   #endif
