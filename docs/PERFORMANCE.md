@@ -101,6 +101,18 @@ GFLOP/s upward on this machine. Compare figures within a section, not across.)
 | bfloat16 | 34 → **53** GFLOP/s | `vld1_u16` + `vshll_n_u16(v,16)` — the shift *is* the conversion |
 | fp16 | ~3 → **~54** GFLOP/s | one `FCVTL` widen + hardware scalar read |
 | bf16 on FEAT_BF16 | **~65** GFLOP/s | `BFMLALB/T` — exact f32 FMAs of bf16 products |
+| tekin8 | 28.0 → **37.5** GFLOP/s | mask/shift the sign and exponent into place, one multiply for the bias |
+| fp4 | 30.8 → **33.8** GFLOP/s | two `vqtbl1q_u8` lookups for the two non-zero bytes, then combine |
+| fp8 E5M2 | **no NEON kernel** | its 256-entry table beats any arithmetic reconstruction (see DESIGN.md) |
+
+The three narrow types split on how their scalar read is spelled, not on how
+narrow they are. tekin8's read is bit arithmetic, so vectorizing it wins outright
+(batch GEMM 39.6 → 58.8 GFLOP/s, 1.49×). fp4's is a sixteen-entry table, which is
+exactly what `TBL` indexes, so it wins by less (43.7 → ~49.8, ~1.17×). E5M2's is a
+256-entry table that stays in L1 — too wide for `TBL`, and reconstructing it with
+shifts and an inf/nan select measured *slower*, so E5M2 keeps the scalar read.
+The read arithmetic in each case is bit-identical to the scalar path over every
+input pattern in every lane, checked by `make testsimd`.
 
 The **same kernels exist as AVX2 + FMA** on x86-64, compiled unconditionally via
 a per-function `__attribute__((target("avx2,fma")))` and dispatched at runtime
