@@ -6,6 +6,48 @@ dense layer (4.2M params) unless noted, and are indicative, not absolute.
 
 ---
 
+## v0.2.8 — 2026-07-31  (tag `v0.2.8`)
+
+Vectorised reads for two of the three narrow storage formats, and a standing
+check that they agree with the scalar reads. No API or ABI change, no change to
+any stored value.
+
+**tekin8 (FP8 E4M3) gets a NEON read — 1.34× GEMV, 1.49× batch GEMM.** float32,
+bfloat16 and fp16 each had a NEON loader in the register-blocked kernel; the
+narrow formats fell through to the scalar path. E4M3's read is pure bit
+arithmetic after the branchless rewrite in v0.2.7, which maps straight onto
+NEON: mask and shift the sign to bit 31 and the exponent plus mantissa to bit
+20, then one multiply for the bias. E4M3 carries no inf or nan, so nothing needs
+special-casing. GEMV 28.0 → 37.5 GFLOP/s, batch GEMM 39.6 → 58.8 (M4, 2048²).
+
+**fp4 (E2M1) gets a NEON read — ~1.17× batch GEMM.** All sixteen E2M1 values
+have a zero low half as float32, so each is `(hi << 24) | (lo << 16)` for two
+bytes drawn from 16-entry tables — exactly the width `TBL` indexes. Two
+`vqtbl1q_u8` lookups replace four scalar loads. Batch GEMM 42.0–43.0 → 49.7–50.0
+GFLOP/s over three alternating builds; the ranges do not overlap.
+
+**fp8 E5M2 keeps its scalar read, on measurement.** A bit-exact NEON version was
+written and measured **0.85–0.87×**, so it was dropped. Its scalar read is a
+single load from a 1 KB table that stays in L1, and reconstructing that
+arithmetically needs about ten instructions per four values, including a
+compare-and-select because the scaled form maps the exponent-all-ones patterns
+to a finite 2^16 rather than inf. Recorded in DESIGN.md under the rejected
+optimizations, together with the correction it forces: what decides these three
+is how the scalar read is spelled, not how narrow the format is.
+
+**New: `make testsimd`.** Every vectorised read is checked against its scalar
+counterpart over all 256 input patterns in each of the four lanes. It includes
+`src/ops.c` rather than restating the arithmetic, because the loaders are static
+inline and a copy could drift from what the library compiles. Storage types
+without a vectorised loader report that and pass, so the target is meaningful
+for any `DTYPE`.
+
+Both new reads are bit-identical to the scalar path for every input, so stored
+values and accuracy are unchanged; only the FMA grouping differs, as it already
+did for the vectorised types.
+
+---
+
 ## v0.2.7 — 2026-07-29  (tag `v0.2.7`)
 
 One correctness fix in the headline low-precision feature, two measured speedups
