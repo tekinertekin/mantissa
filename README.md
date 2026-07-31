@@ -199,19 +199,32 @@ The numbers behind *Performance at a glance*, per dtype. `make DTYPE=<n> bench` 
 a 2048×2048 dense layer (4.2M params), plus the activation-dispatch micro-test.
 Apple M-series laptop, clang `-O3`; indicative, not absolute.
 
-| dtype    | weight memory | GEMV ms/pass | GEMV GFLOP/s | vs baseline |
-|----------|:-------------:|:------------:|:------------:|:-----------:|
-| bfloat16 |  8.0 MB | 0.39 | ~21 | **2.5×** (NEON) |
-| float32  | 16.0 MB | 0.55 | ~15 | 1.9× (NEON) |
-| tekin8   |  4.0 MB | 2.6  | ~3.2 | 1.25× (blocking) |
+| dtype    | weight memory | GEMV ms/pass | GEMV GFLOP/s | vectorised read |
+|----------|:-------------:|:------------:|:------------:|:---------------:|
+| bfloat16 |  8.0 MB | 0.055 | ~153 | widen + shift (the shift *is* the conversion) |
+| fp16     |  8.0 MB | 0.067 | ~125 | one `FCVTL` |
+| float32  | 16.0 MB | 0.100 |  ~84 | plain load, bandwidth-bound |
+| fp4 E2M1 |  4.0 MB | 0.286 |  ~29 | two `TBL` lookups |
+| tekin8   |  4.0 MB | 0.308 |  ~27 | mask/shift + one multiply |
+| fp8 E5M2 |  4.0 MB | 0.371 |  ~23 | scalar — its 256-entry table beats arithmetic |
+
+All six rows come from one back-to-back run, so they are comparable with each
+other; absolute wall-clock on a laptop moves with thermal state and background
+load, so do not compare them against figures from another session. fp4 and tekin8
+sit close enough that their order swaps between runs.
 
 The forward pass is register-blocked (4 output rows share each `x` load and run
-4 independent FMA chains), with explicit SIMD FMA kernels for float32 and
-bfloat16 — **NEON** on arm64, **AVX2** on x86-64 (runtime-dispatched via
-`__builtin_cpu_supports`, scalar fallback on older CPUs). **bfloat16 leads on
-both axes**:
-it moves half the bytes of float32 for the same FMAs. `tekin8` stays conversion-
-bound (E4M3→float unpack, no SIMD; native FP8 hardware removes that).
+4 independent FMA chains), with explicit SIMD FMA kernels — **NEON** on arm64,
+**AVX2** on x86-64 (runtime-dispatched via `__builtin_cpu_supports`, scalar
+fallback on older CPUs). **bfloat16 leads on both axes**: it moves half the bytes
+of float32 for the same FMAs.
+
+The one-byte formats are still conversion-bound rather than bandwidth-bound, but
+two of the three now have a vectorised read of their own: tekin8 because its
+E4M3 unpack is bit arithmetic, fp4 because its sixteen values fit what `TBL`
+indexes. E5M2 keeps the scalar read on measurement — a 256-entry table in L1
+beats reconstructing it arithmetically. Native FP8 hardware would close the
+remaining gap; see [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
 
 On top, a **thread pool** splits the output rows across cores for large layers,
 both forward and backward (the per-kernel numbers above are single-thread):
