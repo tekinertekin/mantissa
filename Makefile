@@ -18,6 +18,9 @@ CFLAGS  := -O3 -funroll-loops -ffp-contract=fast -Wall -Wextra -std=c11 \
 LDFLAGS := -lm -pthread
 
 SRC     := src/dtypes.c src/activations.c src/ops.c src/loss.c src/backprop.c src/pool.c src/conv.c
+# test_simd.c includes src/ops.c directly to reach its static inline loaders,
+# so it must not also link the standalone object.
+SRC_NO_OPS := src/dtypes.c src/activations.c src/loss.c src/backprop.c src/pool.c src/conv.c
 BUILD   := build
 
 UNAME_S := $(shell uname -s)
@@ -27,7 +30,7 @@ else
     LIBEXT := so
 endif
 
-.PHONY: test testbp testconv testedge lib dist example mlp train bench benchbp benchconv clean
+.PHONY: test testbp testconv testedge testsimd lib dist example mlp train bench benchbp benchconv clean
 
 test: $(SRC) tests/test_dtypes.c
 	@mkdir -p $(BUILD)
@@ -74,6 +77,14 @@ testconv: $(SRC) tests/test_conv.c
 	$(CC) -O3 -funroll-loops -ffp-contract=fast -Wall -Wextra -std=c11 \
 	      -Iinclude -DTK_DTYPE=0 -o $(BUILD)/test_conv $^ $(LDFLAGS)
 	@./$(BUILD)/test_conv
+
+# Vectorised narrow reads vs the scalar reads, bit-for-bit. Runs over the
+# storage types that have a NEON loader; DTYPE selects which.
+testsimd: $(SRC_NO_OPS) tests/test_simd.c
+	@mkdir -p $(BUILD)
+	$(CC) -O3 -funroll-loops -ffp-contract=fast -Wall -Wextra -std=c11 \
+	      -Iinclude -Isrc -DTK_DTYPE=$(DTYPE) -o $(BUILD)/test_simd $^ $(LDFLAGS)
+	@./$(BUILD)/test_simd
 
 # CNN primitive contract / edge cases: out_dim table, 1x1-conv==dense,
 # softmax-xent corners, degenerate dense shapes, whole-input pool, fixed-thread
