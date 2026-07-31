@@ -403,8 +403,11 @@ disagreed with the theory. Recorded here so they are not re-attempted.
   2^16). This is the same boundary as the scalar finding above — a table wins
   for E5M2 and loses for tekin8 — and it holds after vectorizing: tekin8's read
   is arithmetic either way, so NEON helps it (1.34-1.49×), while E5M2 is already
-  one load and cannot be beaten by arithmetic. fp4, also table-backed, is
-  expected to behave like E5M2.
+  one load and cannot be beaten by arithmetic. Note that being table-backed is
+  not on its own the deciding factor: fp4 is table-backed too and its vectorized
+  read *wins* (~1.17×), because its sixteen entries fit what TBL indexes while
+  E5M2's 256 do not. What loses is reconstructing a table lookup with
+  arithmetic, not vectorizing a small table.
 - **Explicit NEON for the backward pass** — **~40% slower** for the `dx`
   reduction than the compiler's auto-vectorized scalar loop. Backward is
   store-bandwidth bound (it writes `dW`, 4×params bytes), so hand-vectorizing the

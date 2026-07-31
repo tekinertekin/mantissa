@@ -110,6 +110,27 @@ static inline float32x4_t tk__f8x4(const tk_f8_t *p) {
     return vmulq_f32(vreinterpretq_f32_u32(bits),
                      vreinterpretq_f32_u32(vdupq_n_u32(247u << 23)));
 }
+#elif TK_DTYPE == TK_DTYPE_FP4_E2M1
+#define TK_HAVE_NEON_FP4 1
+/* Load 4 E2M1 as float32 through two vector table lookups. All sixteen E2M1
+ * values have a zero low half as float32 (0.5 is 0x3F000000, -6 is 0xC0C00000),
+ * so each one is (hi << 24) | (lo << 16) for a pair of bytes drawn from
+ * 16-entry tables -- exactly the width TBL indexes, which the 256-entry E5M2
+ * table could not offer. */
+static inline float32x4_t tk__fp4x4(const tk_fp4_t *p) {
+    static const uint8_t hi_tbl[16] = {0x00, 0x3F, 0x3F, 0x3F, 0x40, 0x40, 0x40, 0x40,
+                                       0x80, 0xBF, 0xBF, 0xBF, 0xC0, 0xC0, 0xC0, 0xC0};
+    static const uint8_t lo_tbl[16] = {0x00, 0x00, 0x80, 0xC0, 0x00, 0x40, 0x80, 0xC0,
+                                       0x00, 0x00, 0x80, 0xC0, 0x00, 0x40, 0x80, 0xC0};
+    uint32_t four;
+    memcpy(&four, p, 4);
+    uint8x16_t idx = vandq_u8(vreinterpretq_u8_u32(vdupq_n_u32(four)), vdupq_n_u8(15));
+    uint8x16_t hi = vqtbl1q_u8(vld1q_u8(hi_tbl), idx);
+    uint8x16_t lo = vqtbl1q_u8(vld1q_u8(lo_tbl), idx);
+    uint32x4_t hw = vmovl_u16(vget_low_u16(vmovl_u8(vget_low_u8(hi))));
+    uint32x4_t lw = vmovl_u16(vget_low_u16(vmovl_u8(vget_low_u8(lo))));
+    return vreinterpretq_f32_u32(vorrq_u32(vshlq_n_u32(hw, 24), vshlq_n_u32(lw, 16)));
+}
 #endif /* TK_DTYPE, within __aarch64__ */
 
 #elif defined(__x86_64__) && (TK_DTYPE == TK_DTYPE_FLOAT32 || TK_DTYPE == TK_DTYPE_BFLOAT16 || TK_DTYPE == TK_DTYPE_FP16)
@@ -258,7 +279,7 @@ static inline void tk__dot4(const tk_scalar_t *restrict W, int in,
                        *restrict w2 = W + 2 * in, *restrict w3 = W + 3 * in;
     float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
     int i = 0;
-#if defined(TK_HAVE_NEON_F32) || defined(TK_HAVE_NEON_BF16) || defined(TK_HAVE_NEON_FP16) || defined(TK_HAVE_NEON_F8)
+#if defined(TK_HAVE_NEON_F32) || defined(TK_HAVE_NEON_BF16) || defined(TK_HAVE_NEON_FP16) || defined(TK_HAVE_NEON_F8) || defined(TK_HAVE_NEON_FP4)
   #if defined(TK_HAVE_BF16_MLAL)
     if (tk__cpu_has_bf16()) { tk__dot4_bfmlal(W, in, x, out); return; }
   #endif
@@ -268,6 +289,8 @@ static inline void tk__dot4(const tk_scalar_t *restrict W, int in,
     #define TK__LD4(p) tk__bf16x4(p)         /* load + widen */
   #elif defined(TK_HAVE_NEON_F8)
     #define TK__LD4(p) tk__f8x4(p)           /* load + shift + scale */
+  #elif defined(TK_HAVE_NEON_FP4)
+    #define TK__LD4(p) tk__fp4x4(p)          /* two TBL lookups + combine */
   #else
     #define TK__LD4(p) tk__fp16x4(p)         /* load + FCVTL */
   #endif

@@ -9,6 +9,35 @@
 
 #include <stdio.h>
 
+#if defined(TK_HAVE_NEON_FP4)
+/* Only sixteen distinct inputs, but the stored byte carries the value in its low
+ * nibble, so sweep all 256 byte values to pin the masking too. */
+static int check_fp4(void) {
+    int bad = 0;
+    for (int lane = 0; lane < 4; lane++) {
+        for (int v = 0; v < 256; v++) {
+            tk_fp4_t buf[4] = {0, 0, 0, 0};
+            buf[lane] = (tk_fp4_t)v;
+            float got[4];
+            vst1q_f32(got, tk__fp4x4(buf));
+            for (int k = 0; k < 4; k++) {
+                float want = tk_fp4_to_float(buf[k]);
+                uint32_t g, w;
+                memcpy(&g, &got[k], 4);
+                memcpy(&w, &want, 4);
+                if (g != w) {
+                    if (bad < 5)
+                        printf("  FAIL v=%3d lane=%d k=%d: neon=%08x scalar=%08x\n", v, lane, k, g, w);
+                    bad++;
+                }
+            }
+        }
+    }
+    printf("  fp4 NEON read: 1024 patterns checked, %d mismatches\n", bad);
+    return bad;
+}
+#endif
+
 #if defined(TK_HAVE_NEON_F8)
 /* Every pattern in every lane: a loader that mishandled one lane, or that
  * worked only for the low byte of the 32-bit load, would pass a single-lane
@@ -44,6 +73,8 @@ int main(void) {
     printf("SIMD read equivalence (%s)\n", tk_dtype_name());
 #if defined(TK_HAVE_NEON_F8)
     bad += check_f8();
+#elif defined(TK_HAVE_NEON_FP4)
+    bad += check_fp4();
 #else
     printf("  no vectorised loader for this storage type -- nothing to check\n");
 #endif
