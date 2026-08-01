@@ -434,6 +434,67 @@ void tk_linear_forward_batch(const tk_scalar_t *restrict W,
  * API reproduces that type's precision on plain-float inputs. */
 static inline float tk_q(float v) { return TK_TO_FLOAT(TK_FROM_FLOAT(v)); }
 
+/* One E8M0 scale per TK_BLOCK elements, chosen from the block's peak magnitude,
+ * then the elements are stored divided by it. A short trailing block is scaled
+ * on the elements it has. */
+void tk_quantize_blocked(const float *restrict src, tk_scalar_t *restrict dst,
+                         uint8_t *restrict scales, int n) {
+    for (int b0 = 0; b0 < n; b0 += TK_BLOCK) {
+        int len = (n - b0 < TK_BLOCK) ? n - b0 : TK_BLOCK;
+        float amax = 0.0f;
+        for (int i = 0; i < len; i++) {
+            float a = src[b0 + i] < 0.0f ? -src[b0 + i] : src[b0 + i];
+            if (a > amax) amax = a;
+        }
+        uint8_t sb = tk_e8m0_from_amax(amax);
+        float inv = 1.0f / tk_e8m0_to_float(sb);   /* exact: a power of two */
+        scales[b0 / TK_BLOCK] = sb;
+        for (int i = 0; i < len; i++)
+            dst[b0 + i] = TK_FROM_FLOAT(src[b0 + i] * inv);
+    }
+}
+
+/* Accumulate each block in the elements' own units, then apply the two scales
+ * once for the whole block. Keeping the scale out of the inner loop is the
+ * point: it stays a plain dot product over TK_BLOCK values. */
+static float tk__dot_blocked(const tk_scalar_t *restrict w, const uint8_t *restrict ws,
+                             const tk_scalar_t *restrict x, const uint8_t *restrict xs,
+                             int n) {
+    float total = 0.0f;
+    for (int b0 = 0; b0 < n; b0 += TK_BLOCK) {
+        int len = (n - b0 < TK_BLOCK) ? n - b0 : TK_BLOCK;
+        float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+        int i = 0;
+        for (; i + 4 <= len; i += 4) {
+            s0 += TK_TO_FLOAT(w[b0+i+0]) * TK_TO_FLOAT(x[b0+i+0]);
+            s1 += TK_TO_FLOAT(w[b0+i+1]) * TK_TO_FLOAT(x[b0+i+1]);
+            s2 += TK_TO_FLOAT(w[b0+i+2]) * TK_TO_FLOAT(x[b0+i+2]);
+            s3 += TK_TO_FLOAT(w[b0+i+3]) * TK_TO_FLOAT(x[b0+i+3]);
+        }
+        float s = (s0 + s1) + (s2 + s3);
+        for (; i < len; i++) s += TK_TO_FLOAT(w[b0+i]) * TK_TO_FLOAT(x[b0+i]);
+        total += s * tk_e8m0_to_float(ws[b0 / TK_BLOCK]) * tk_e8m0_to_float(xs[b0 / TK_BLOCK]);
+    }
+    return total;
+}
+
+void tk_linear_forward_blocked(const tk_scalar_t *restrict W,
+                               const uint8_t *restrict W_scales,
+                               const tk_scalar_t *restrict x,
+                               const uint8_t *restrict x_scales,
+                               const float *restrict bias,
+                               float *restrict y,
+                               int out_dim, int in_dim,
+                               tk_activation_t act) {
+    int nb = (in_dim + TK_BLOCK - 1) / TK_BLOCK;
+    for (int o = 0; o < out_dim; o++) {
+        float z = tk__dot_blocked(W + (size_t)o * in_dim, W_scales + (size_t)o * nb,
+                                  x, x_scales, in_dim);
+        if (bias) z += bias[o];
+        y[o] = tk_act_scalar(z, act);
+    }
+}
+
 void tk_quantize(const float *restrict src, tk_scalar_t *restrict dst, int n) {
     for (int i = 0; i < n; i++) dst[i] = TK_FROM_FLOAT(src[i]);
 }

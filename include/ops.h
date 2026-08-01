@@ -50,6 +50,33 @@ TK_API void tk_linear_forward_batch(const tk_scalar_t *restrict W,
  * weight on each call. dst is tk_scalar_t*; size it with tk_scalar_size(). */
 TK_API void tk_quantize(const float *restrict src, tk_scalar_t *restrict dst, int n);
 
+/* ---- MX-style block-scaled path -------------------------------------------
+ *
+ * Quantize with one shared power-of-two scale per TK_BLOCK elements. This is
+ * what makes the 4-bit formats usable: fp4 spans 0.5 to 6, so a weight matrix
+ * with std 0.05 quantizes almost entirely to zero, and MNIST accuracy collapses
+ * from 79.6% to 14.3%. Per-block scaling restores it to 79.2% at the same 4
+ * bits per weight.
+ *
+ * scales must hold ceil(n / TK_BLOCK) bytes; each is an E8M0 exponent. */
+TK_API void tk_quantize_blocked(const float *restrict src, tk_scalar_t *restrict dst,
+                                uint8_t *restrict scales, int n);
+
+/* Forward pass over block-scaled operands. W is out_dim x in_dim row-major and
+ * each row carries its own scales, so W_scales holds out_dim * ceil(in_dim /
+ * TK_BLOCK) bytes; x_scales holds ceil(in_dim / TK_BLOCK).
+ *
+ * bias stays float32 here: it is out_dim values, too few to matter for memory,
+ * and narrowing it would add error for nothing. Pass NULL to disable. */
+TK_API void tk_linear_forward_blocked(const tk_scalar_t *restrict W,
+                                      const uint8_t *restrict W_scales,
+                                      const tk_scalar_t *restrict x,
+                                      const uint8_t *restrict x_scales,
+                                      const float *restrict bias,
+                                      float *restrict y,
+                                      int out_dim, int in_dim,
+                                      tk_activation_t act);
+
 /* Same forward pass, but all buffers are plain float32. Each value is quantized
  * through the configured storage type before the multiply, so the caller sees
  * that type's numerical behavior while passing ordinary floats. This is the
