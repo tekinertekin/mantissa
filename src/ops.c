@@ -264,6 +264,20 @@ float tk_dot(const tk_scalar_t *restrict a, const tk_scalar_t *restrict b, int n
     return s;
 }
 
+/* The per-dtype vector loader, shared by the flat and block-scaled kernels.
+ * Defined once at file scope so both use the same read. */
+#if defined(TK_HAVE_NEON_F32)
+  #define TK__LD4(p) vld1q_f32(p)
+#elif defined(TK_HAVE_NEON_BF16)
+  #define TK__LD4(p) tk__bf16x4(p)         /* load + widen */
+#elif defined(TK_HAVE_NEON_F8)
+  #define TK__LD4(p) tk__f8x4(p)           /* load + shift + scale */
+#elif defined(TK_HAVE_NEON_FP4)
+  #define TK__LD4(p) tk__fp4x4(p)          /* two TBL lookups + combine */
+#elif defined(TK_HAVE_NEON_FP16)
+  #define TK__LD4(p) tk__fp16x4(p)         /* load + FCVTL */
+#endif
+
 /* Four dot products (4 consecutive weight rows against the same x) at once.
  * Register blocking: each x element is loaded once and feeds independent FMA
  * chains, so the FP units stay busy and x conversions are shared across rows —
@@ -283,17 +297,6 @@ static inline void tk__dot4(const tk_scalar_t *restrict W, int in,
   #if defined(TK_HAVE_BF16_MLAL)
     if (tk__cpu_has_bf16()) { tk__dot4_bfmlal(W, in, x, out); return; }
   #endif
-  #if defined(TK_HAVE_NEON_F32)
-    #define TK__LD4(p) vld1q_f32(p)
-  #elif defined(TK_HAVE_NEON_BF16)
-    #define TK__LD4(p) tk__bf16x4(p)         /* load + widen */
-  #elif defined(TK_HAVE_NEON_F8)
-    #define TK__LD4(p) tk__f8x4(p)           /* load + shift + scale */
-  #elif defined(TK_HAVE_NEON_FP4)
-    #define TK__LD4(p) tk__fp4x4(p)          /* two TBL lookups + combine */
-  #else
-    #define TK__LD4(p) tk__fp16x4(p)         /* load + FCVTL */
-  #endif
     /* Two accumulator chains per row (depth-8): one chain is bound by FMA
      * latency, not throughput — splitting it measured ~1.6-2x (M4, bf16). */
     float32x4_t a0 = vdupq_n_f32(0), a1 = a0, a2 = a0, a3 = a0;
@@ -305,7 +308,6 @@ static inline void tk__dot4(const tk_scalar_t *restrict W, int in,
         a2 = vfmaq_f32(a2, TK__LD4(w2 + i), x0); b2 = vfmaq_f32(b2, TK__LD4(w2 + i + 4), x1);
         a3 = vfmaq_f32(a3, TK__LD4(w3 + i), x0); b3 = vfmaq_f32(b3, TK__LD4(w3 + i + 4), x1);
     }
-  #undef TK__LD4
     s0 = vaddvq_f32(vaddq_f32(a0, b0)); s1 = vaddvq_f32(vaddq_f32(a1, b1));
     s2 = vaddvq_f32(vaddq_f32(a2, b2)); s3 = vaddvq_f32(vaddq_f32(a3, b3));
 #elif defined(TK_HAVE_AVX2)
@@ -457,6 +459,66 @@ void tk_quantize_blocked(const float *restrict src, tk_scalar_t *restrict dst,
 /* Accumulate each block in the elements' own units, then apply the two scales
  * once for the whole block. Keeping the scale out of the inner loop is the
  * point: it stays a plain dot product over TK_BLOCK values. */
+/* Four rows at once over block-scaled operands: the same register blocking as
+ * tk__dot4, wrapped in a loop over blocks so each block's two scales are applied
+ * once to its finished partial sum. TK_BLOCK is a multiple of 8, so the depth-8
+ * body divides it exactly and the scale never enters the inner loop. */
+static inline void tk__dot4_blocked(const tk_scalar_t *restrict W, int in,
+                                    const uint8_t *restrict ws, int nb,
+                                    const tk_scalar_t *restrict x,
+                                    const uint8_t *restrict xs,
+                                    float *restrict out) {
+    const tk_scalar_t *restrict w0 = W, *restrict w1 = W + in,
+                       *restrict w2 = W + 2 * in, *restrict w3 = W + 3 * in;
+    float t0 = 0.0f, t1 = 0.0f, t2 = 0.0f, t3 = 0.0f;
+#if defined(TK__LD4)
+    float32x4_t T0 = vdupq_n_f32(0), T1 = T0, T2 = T0, T3 = T0;
+#endif
+    for (int b = 0, b0 = 0; b0 < in; b++, b0 += TK_BLOCK) {
+        int len = (in - b0 < TK_BLOCK) ? in - b0 : TK_BLOCK;
+        float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+        int i = 0;
+#if defined(TK__LD4)
+        float32x4_t a0 = vdupq_n_f32(0), a1 = a0, a2 = a0, a3 = a0;
+        float32x4_t c0 = a0, c1 = a0, c2 = a0, c3 = a0;
+        for (; i + 8 <= len; i += 8) {
+            const int k = b0 + i;
+            float32x4_t x0 = TK__LD4(x + k), x1 = TK__LD4(x + k + 4);
+            a0 = vfmaq_f32(a0, TK__LD4(w0 + k), x0); c0 = vfmaq_f32(c0, TK__LD4(w0 + k + 4), x1);
+            a1 = vfmaq_f32(a1, TK__LD4(w1 + k), x0); c1 = vfmaq_f32(c1, TK__LD4(w1 + k + 4), x1);
+            a2 = vfmaq_f32(a2, TK__LD4(w2 + k), x0); c2 = vfmaq_f32(c2, TK__LD4(w2 + k + 4), x1);
+            a3 = vfmaq_f32(a3, TK__LD4(w3 + k), x0); c3 = vfmaq_f32(c3, TK__LD4(w3 + k + 4), x1);
+        }
+#endif
+        for (; i < len; i++) {
+            float xi = TK_TO_FLOAT(x[b0 + i]);
+            s0 += TK_TO_FLOAT(w0[b0 + i]) * xi; s1 += TK_TO_FLOAT(w1[b0 + i]) * xi;
+            s2 += TK_TO_FLOAT(w2[b0 + i]) * xi; s3 += TK_TO_FLOAT(w3[b0 + i]) * xi;
+        }
+        const float sx = tk_e8m0_to_float(xs[b]);
+        const float g0 = tk_e8m0_to_float(ws[b]) * sx;
+        const float g1 = tk_e8m0_to_float(ws[nb + b]) * sx;
+        const float g2 = tk_e8m0_to_float(ws[2 * nb + b]) * sx;
+        const float g3 = tk_e8m0_to_float(ws[3 * nb + b]) * sx;
+#if defined(TK__LD4)
+        /* Scale the block's vector accumulator and keep accumulating in vector
+         * form. Reducing per block instead would put a horizontal add in the
+         * inner loop -- 64 of them per row at in=2048, against one for the flat
+         * kernel, and that alone cost ~1.9x. */
+        T0 = vfmaq_n_f32(T0, vaddq_f32(a0, c0), g0);
+        T1 = vfmaq_n_f32(T1, vaddq_f32(a1, c1), g1);
+        T2 = vfmaq_n_f32(T2, vaddq_f32(a2, c2), g2);
+        T3 = vfmaq_n_f32(T3, vaddq_f32(a3, c3), g3);
+#endif
+        t0 += s0 * g0; t1 += s1 * g1; t2 += s2 * g2; t3 += s3 * g3;
+    }
+#if defined(TK__LD4)
+    t0 += vaddvq_f32(T0); t1 += vaddvq_f32(T1);
+    t2 += vaddvq_f32(T2); t3 += vaddvq_f32(T3);
+#endif
+    out[0] = t0; out[1] = t1; out[2] = t2; out[3] = t3;
+}
+
 static float tk__dot_blocked(const tk_scalar_t *restrict w, const uint8_t *restrict ws,
                              const tk_scalar_t *restrict x, const uint8_t *restrict xs,
                              int n) {
@@ -487,7 +549,17 @@ void tk_linear_forward_blocked(const tk_scalar_t *restrict W,
                                int out_dim, int in_dim,
                                tk_activation_t act) {
     int nb = (in_dim + TK_BLOCK - 1) / TK_BLOCK;
-    for (int o = 0; o < out_dim; o++) {
+    int o = 0;
+    for (; o + 4 <= out_dim; o += 4) {
+        float s[4];
+        tk__dot4_blocked(W + (size_t)o * in_dim, in_dim, W_scales + (size_t)o * nb, nb,
+                         x, x_scales, s);
+        for (int k = 0; k < 4; k++) {
+            float z = s[k] + (bias ? bias[o + k] : 0.0f);
+            y[o + k] = tk_act_scalar(z, act);
+        }
+    }
+    for (; o < out_dim; o++) {
         float z = tk__dot_blocked(W + (size_t)o * in_dim, W_scales + (size_t)o * nb,
                                   x, x_scales, in_dim);
         if (bias) z += bias[o];
