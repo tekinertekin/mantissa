@@ -151,6 +151,14 @@ fp4 gives 9.0 GFLOP/s at 4 bits where flat bfloat16 gives 107 at 16, and
 bfloat16 is also more accurate. It earns its place when the model has to fit,
 not when it has to be fast.
 
+On the block-scaled path fp4 also packs two elements per byte, because that is
+what MXFP4 is. The demo model's weights go from 7840 bytes to 3920, and with the
+250 bytes of block scales that is **4.26 bits per weight**. It costs a further
+~22% (6.7-7.0 vs 8.6-9.5 GFLOP/s over five runs each), even with a packed `TBL`
+loader that pulls four values from two bytes: the nibble extract is on the
+critical path and halving the bytes buys nothing at this working set. Carried for
+the memory, not the clock.
+
 Formats that already span float32's exponent range (float32, bfloat16, tekin32)
 are left unscaled. There is nothing for a shared exponent to recover, and
 scaling them is worse than useless: the scale lands on the 2^-126 clamp and the

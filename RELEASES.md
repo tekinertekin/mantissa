@@ -6,6 +6,42 @@ dense layer (4.2M params) unless noted, and are indicative, not absolute.
 
 ---
 
+## v0.2.10 — 2026-08-01  (tag `v0.2.10`)
+
+fp4 is now actually four bits. Storage change on the block-scaled path only; the
+flat path and every other format are untouched, and no result moves.
+
+**Two E2M1 values share a byte**, low nibble first. TK_BLOCK is even, so each
+block is a whole number of bytes and blocks stay byte-aligned; rows are padded
+to a byte so a row never starts mid-byte. On the demo model the weights go from
+7840 bytes to 3920 — exactly 2× — and with the 250 bytes of block scales that is
+**4.26 bits per weight**, against the 4.25 MXFP4 implies. The difference is row
+padding.
+
+Confining it to the block-scaled path is what kept it small: four functions and
+the binding, rather than the ~200 indexing sites in conv.c, ops.c and backprop.c
+that packing the flat path would touch. It is also where it belongs, since
+MXFP4 is defined as packed elements plus a block scale.
+
+**A packed NEON loader** pulls four values from two bytes: each byte duplicated
+across lanes, a per-lane shift of 0 or 4 picks the nibble, then the same two TBL
+lookups as the unpacked read. Checked against reading the nibbles one at a time
+over 4096 byte pairs in `make testsimd`.
+
+**The cost, measured rather than estimated: about 22%.** Five runs each at
+2048², blocked path: 6.7-7.0 GFLOP/s packed against 8.6-9.5 unpacked. An earlier
+standalone prototype had suggested ~10%; with the loader actually in place it is
+worse. The nibble extract sits on the critical path and halving the bytes buys
+nothing at this working set. Packing is carried for the memory, not the clock —
+the same conclusion the flat-path experiment reached, now confirmed.
+
+Accuracy is unchanged at 78.85%, as it has to be: packing moves bits, not values.
+
+New: `tk_elems_per_byte()`, so the binding derives the row stride instead of
+assuming in_dim bytes.
+
+---
+
 ## v0.2.9 — 2026-08-01  (tag `v0.2.9`)
 
 Block scaling, which is what the 4-bit format was waiting for. No change to any

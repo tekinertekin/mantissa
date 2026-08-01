@@ -187,7 +187,7 @@ not the goal itself.
 | 5 | `fp8_e5m2` | 1 | FP8, wider range |
 | 6 | `fp4_e2m1` | ½* | FP4 — the extreme |
 
-*\*fp4 is stored one value per byte today (1 B); the "½" is the logical E2M1 width. Block scaling is implemented; two-per-byte packing is what remains, and it measures ~10% slower rather than faster — see [`docs/DESIGN.md`](docs/DESIGN.md).*
+*\*fp4 stores two values per byte on the block-scaled path, so the "½" is real there: 4.26 bits per weight including the shared scales, against MXFP4's 4.25. The flat path still stores one per byte. Packing costs ~22% throughput rather than gaining any — see [`docs/DESIGN.md`](docs/DESIGN.md).*
 
 Bit layouts, the `tekin` formats' design rationale, the hot/cold conversion
 split, and the current-research context (MX / NVFP4 / posit / IEEE P3109) all

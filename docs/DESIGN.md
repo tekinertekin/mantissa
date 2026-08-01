@@ -392,19 +392,14 @@ disagreed with the theory. Recorded here so they are not re-attempted.
 - **Manual branchless `dropout`/L1-sign and loop unswitching** — no change:
   `-O3` already emits `csel`/`cmov` for the data-dependent selects and hoists the
   loop-invariant branches.
-- **fp4 two-per-byte packing** — halves the weight bytes and measures **0.89-0.91×
-  out of cache (64 MB working set, five runs) and ~0.93× in cache (4 MB)**, i.e. it
-  costs roughly 10% throughput and never wins at any size tried (1, 4, 16, 64 MB).
-  An earlier prototype had measured 1.32× *for the packed arm against the scalar
-  table read*; that advantage disappeared once the unpacked read was vectorised
-  through `TBL`, because halving the bytes buys nothing while the nibble extract
-  (shift, and, interleave) sits on the critical path. Widening the load from 4 to
-  16 elements per step, so the extract amortises, narrows the gap from 0.78× to
-  ~0.9× but does not close it. Verified by checksum that both arms compute the
-  same dot products. **Not rejected outright**: packing is what makes the "½ byte"
-  column honest, and MXFP4/NVFP4 define packed storage, so it is a prerequisite
-  for block scaling rather than an optimization — but it should land with block
-  scaling, as a memory feature costing ~10% speed, not as a speedup.
+- **fp4 two-per-byte packing on the flat path** — halves the weight bytes and
+  measures **0.89-0.91× out of cache, ~0.93× in cache**, never winning at 1, 4,
+  16 or 64 MB. An earlier prototype had measured 1.32× *for the packed arm
+  against the scalar table read*; that advantage disappeared once the unpacked
+  read was vectorized through `TBL`. Not done on the flat path, where it would
+  touch ~200 indexing sites for a loss. It **is** done on the block-scaled path,
+  where MXFP4 requires it — see below.
+
 - **Explicit NEON read for E5M2** — **0.85-0.87× (13-15% slower)**: GEMV
   31.13 → 26.48 GFLOP/s, GEMM batch=64 41.24 → 35.90 (M4, 2048×2048). The
   vectorized read was bit-exact — all 256 patterns in all four lanes, inf and
@@ -654,7 +649,12 @@ of reimplementing the numerics.
   types MXFP8 (E4M3/E5M2), MXFP6, MXFP4 (E2M1). mantissa implements the element
   formats and the shared per-block scale: `tk_quantize_blocked` writes one E8M0
   exponent per 32 elements and `tk_linear_forward_blocked` applies it, which is
-  what takes fp4 from 12.63% to 78.85% on the MNIST demo. Formats that already
+  what takes fp4 from 12.63% to 78.85% on the MNIST demo. Elements are packed
+  two per byte there, which is what MXFP4 means and what makes the format
+  actually four bits: 3920 weight bytes instead of 7840, plus 250 bytes of
+  scales, i.e. 4.26 bits per weight against the 4.25 the format implies. Packing
+  costs about 22% throughput even with a packed `TBL` loader, so it is carried
+  for the memory, not against the clock. Formats that already
   span float32's exponent range are left unscaled -- there is nothing for a
   shared exponent to recover, and scaling them underflowed the dot product's
   combined scale factor to zero. Two-per-byte packing is what remains.
