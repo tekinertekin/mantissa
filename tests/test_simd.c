@@ -101,10 +101,43 @@ static int check_block_scale(void) {
     return bad;
 }
 
+
+#if defined(TK_HAVE_NEON_FP4) && TK_ELEMS_PER_BYTE == 2
+/* The packed loader must agree with reading the same nibbles one at a time.
+ * Both nibble positions in both bytes are swept, so a loader that read only the
+ * low nibble, or swapped the pair, fails here. */
+static int check_fp4_packed(void) {
+    int bad = 0;
+    for (int a = 0; a < 256; a++) {
+        for (int b = 0; b < 256; b += 17) {          /* stride keeps it quick but covers both nibbles */
+            tk_fp4_t buf[2] = {(tk_fp4_t)a, (tk_fp4_t)b};
+            float got[4];
+            vst1q_f32(got, tk__fp4x4_packed(buf));
+            for (int k = 0; k < 4; k++) {
+                float want = tk_fp4_to_float(tk_packed_get(buf, k));
+                uint32_t g, w;
+                memcpy(&g, &got[k], 4);
+                memcpy(&w, &want, 4);
+                if (g != w) {
+                    if (bad < 5)
+                        printf("  FAIL bytes=%02x,%02x k=%d: neon=%08x scalar=%08x\n", a, b, k, g, w);
+                    bad++;
+                }
+            }
+        }
+    }
+    printf("  fp4 packed NEON read: %d pairs checked, %d mismatches\n", 256 * 16, bad);
+    return bad;
+}
+#endif
+
 int main(void) {
     int bad = 0;
     printf("SIMD read equivalence (%s)\n", tk_dtype_name());
     bad += check_block_scale();
+#if defined(TK_HAVE_NEON_FP4) && TK_ELEMS_PER_BYTE == 2
+    bad += check_fp4_packed();
+#endif
 #if defined(TK_HAVE_NEON_F8)
     bad += check_f8();
 #elif defined(TK_HAVE_NEON_FP4)

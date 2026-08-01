@@ -117,6 +117,28 @@ static inline float32x4_t tk__f8x4(const tk_f8_t *p) {
  * so each one is (hi << 24) | (lo << 16) for a pair of bytes drawn from
  * 16-entry tables -- exactly the width TBL indexes, which the 256-entry E5M2
  * table could not offer. */
+/* Four packed E2M1 from two bytes. The nibbles are spread one per lane -- each
+ * byte duplicated, then a per-lane shift of 0 or 4 selects low or high -- and
+ * from there it is the same pair of TBL lookups as the unpacked read. */
+static inline float32x4_t tk__fp4x4_packed(const tk_fp4_t *p) {
+    static const uint8_t hi_tbl[16] = {0x00, 0x3F, 0x3F, 0x3F, 0x40, 0x40, 0x40, 0x40,
+                                       0x80, 0xBF, 0xBF, 0xBF, 0xC0, 0xC0, 0xC0, 0xC0};
+    static const uint8_t lo_tbl[16] = {0x00, 0x00, 0x80, 0xC0, 0x00, 0x40, 0x80, 0xC0,
+                                       0x00, 0x00, 0x80, 0xC0, 0x00, 0x40, 0x80, 0xC0};
+    static const int8_t shifts[8] = {0, -4, 0, -4, 0, -4, 0, -4};
+    uint16_t two;
+    memcpy(&two, p, 2);
+    uint8x8_t b = vreinterpret_u8_u16(vdup_n_u16(two));
+    uint8x8_t dup = vzip1_u8(b, b);                       /* b0,b0,b1,b1,... */
+    uint8x8_t nib = vand_u8(vshl_u8(dup, vld1_s8(shifts)), vdup_n_u8(15));
+    uint8x16_t idx = vcombine_u8(nib, nib);
+    uint8x16_t hi = vqtbl1q_u8(vld1q_u8(hi_tbl), idx);
+    uint8x16_t lo = vqtbl1q_u8(vld1q_u8(lo_tbl), idx);
+    uint32x4_t hw = vmovl_u16(vget_low_u16(vmovl_u8(vget_low_u8(hi))));
+    uint32x4_t lw = vmovl_u16(vget_low_u16(vmovl_u8(vget_low_u8(lo))));
+    return vreinterpretq_f32_u32(vorrq_u32(vshlq_n_u32(hw, 24), vshlq_n_u32(lw, 16)));
+}
+
 static inline float32x4_t tk__fp4x4(const tk_fp4_t *p) {
     static const uint8_t hi_tbl[16] = {0x00, 0x3F, 0x3F, 0x3F, 0x40, 0x40, 0x40, 0x40,
                                        0x80, 0xBF, 0xBF, 0xBF, 0xC0, 0xC0, 0xC0, 0xC0};
@@ -276,6 +298,17 @@ float tk_dot(const tk_scalar_t *restrict a, const tk_scalar_t *restrict b, int n
   #define TK__LD4(p) tk__fp4x4(p)          /* two TBL lookups + combine */
 #elif defined(TK_HAVE_NEON_FP16)
   #define TK__LD4(p) tk__fp16x4(p)         /* load + FCVTL */
+#endif
+
+/* Load four elements starting at element index k. Packed storage puts two per
+ * byte, so the byte offset is k/2; the block loop steps by 8, so k is always
+ * even and the halving is exact. */
+#if defined(TK__LD4)
+  #if TK_ELEMS_PER_BYTE == 2
+    #define TK__LD4_AT(p, k) tk__fp4x4_packed((p) + ((k) >> 1))
+  #else
+    #define TK__LD4_AT(p, k) TK__LD4((p) + (k))
+  #endif
 #endif
 
 /* Four dot products (4 consecutive weight rows against the same x) at once.
@@ -472,25 +505,23 @@ static inline void tk__dot4_blocked(const tk_scalar_t *restrict W, int in,
     const tk_scalar_t *restrict w0 = W, *restrict w1 = W + row,
                        *restrict w2 = W + 2 * row, *restrict w3 = W + 3 * row;
     float t0 = 0.0f, t1 = 0.0f, t2 = 0.0f, t3 = 0.0f;
-#if defined(TK__LD4) && TK_ELEMS_PER_BYTE == 1
+#if defined(TK__LD4)
     float32x4_t T0 = vdupq_n_f32(0), T1 = T0, T2 = T0, T3 = T0;
 #endif
     for (int b = 0, b0 = 0; b0 < in; b++, b0 += TK_BLOCK) {
         int len = (in - b0 < TK_BLOCK) ? in - b0 : TK_BLOCK;
         float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
         int i = 0;
-/* The vector loaders read one element per byte; packed storage puts two in a
- * byte, so they cannot be used until there is a packed loader. */
-#if defined(TK__LD4) && TK_ELEMS_PER_BYTE == 1
+#if defined(TK__LD4)
         float32x4_t a0 = vdupq_n_f32(0), a1 = a0, a2 = a0, a3 = a0;
         float32x4_t c0 = a0, c1 = a0, c2 = a0, c3 = a0;
         for (; i + 8 <= len; i += 8) {
             const int k = b0 + i;
-            float32x4_t x0 = TK__LD4(x + k), x1 = TK__LD4(x + k + 4);
-            a0 = vfmaq_f32(a0, TK__LD4(w0 + k), x0); c0 = vfmaq_f32(c0, TK__LD4(w0 + k + 4), x1);
-            a1 = vfmaq_f32(a1, TK__LD4(w1 + k), x0); c1 = vfmaq_f32(c1, TK__LD4(w1 + k + 4), x1);
-            a2 = vfmaq_f32(a2, TK__LD4(w2 + k), x0); c2 = vfmaq_f32(c2, TK__LD4(w2 + k + 4), x1);
-            a3 = vfmaq_f32(a3, TK__LD4(w3 + k), x0); c3 = vfmaq_f32(c3, TK__LD4(w3 + k + 4), x1);
+            float32x4_t x0 = TK__LD4_AT(x, k), x1 = TK__LD4_AT(x, k + 4);
+            a0 = vfmaq_f32(a0, TK__LD4_AT(w0, k), x0); c0 = vfmaq_f32(c0, TK__LD4_AT(w0, k + 4), x1);
+            a1 = vfmaq_f32(a1, TK__LD4_AT(w1, k), x0); c1 = vfmaq_f32(c1, TK__LD4_AT(w1, k + 4), x1);
+            a2 = vfmaq_f32(a2, TK__LD4_AT(w2, k), x0); c2 = vfmaq_f32(c2, TK__LD4_AT(w2, k + 4), x1);
+            a3 = vfmaq_f32(a3, TK__LD4_AT(w3, k), x0); c3 = vfmaq_f32(c3, TK__LD4_AT(w3, k + 4), x1);
         }
 #endif
         for (; i < len; i++) {
@@ -505,7 +536,7 @@ static inline void tk__dot4_blocked(const tk_scalar_t *restrict W, int in,
         const float g1 = tk_e8m0_to_float(ws[nb + b]) * sx;
         const float g2 = tk_e8m0_to_float(ws[2 * nb + b]) * sx;
         const float g3 = tk_e8m0_to_float(ws[3 * nb + b]) * sx;
-#if defined(TK__LD4) && TK_ELEMS_PER_BYTE == 1
+#if defined(TK__LD4)
         /* Scale the block's vector accumulator and keep accumulating in vector
          * form. Reducing per block instead would put a horizontal add in the
          * inner loop -- 64 of them per row at in=2048, against one for the flat
@@ -517,7 +548,7 @@ static inline void tk__dot4_blocked(const tk_scalar_t *restrict W, int in,
 #endif
         t0 += s0 * g0; t1 += s1 * g1; t2 += s2 * g2; t3 += s3 * g3;
     }
-#if defined(TK__LD4) && TK_ELEMS_PER_BYTE == 1
+#if defined(TK__LD4)
     t0 += vaddvq_f32(T0); t1 += vaddvq_f32(T1);
     t2 += vaddvq_f32(T2); t3 += vaddvq_f32(T3);
 #endif
