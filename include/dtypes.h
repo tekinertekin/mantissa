@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <string.h>
+#include <math.h>   /* frexpf, for the block-scale exponent */
 #include "config.h"
 #include "tk_export.h"
 
@@ -225,6 +226,7 @@ TK_API tk_fp4_t  tk_float_to_fp4(float f);
     #define TK_TO_FLOAT(x)   ((float)(x))
     #define TK_FROM_FLOAT(f) ((float)(f))
     #define TK_DTYPE_NAME    "float32"
+    #define TK_MAX_MAG       3.4028235e38f
     #define TK_MANT_BITS     23
     #define TK_MIN_NORM_BEXP 1
     #define TK_SUB_SHIFT     149   /* float32: 2^-126 normal, 2^-149 subnormal step */
@@ -233,6 +235,7 @@ TK_API tk_fp4_t  tk_float_to_fp4(float f);
     #define TK_TO_FLOAT(x)   tk_fp16_to_float(x)
     #define TK_FROM_FLOAT(f) tk__fp16_from_float(f)
     #define TK_DTYPE_NAME    "fp16"
+    #define TK_MAX_MAG       65504.0f
     #define TK_MANT_BITS     10
     #define TK_MIN_NORM_BEXP 113
     #define TK_SUB_SHIFT     24   /* fp16: 2^-14 normal, 2^-24 subnormal step */
@@ -241,6 +244,7 @@ TK_API tk_fp4_t  tk_float_to_fp4(float f);
     #define TK_TO_FLOAT(x)   tk_bf16_to_float(x)
     #define TK_FROM_FLOAT(f) tk_float_to_bf16(f)
     #define TK_DTYPE_NAME    "bfloat16"
+    #define TK_MAX_MAG       3.3895314e38f
     #define TK_MANT_BITS     7
     #define TK_MIN_NORM_BEXP 1
     #define TK_SUB_SHIFT     133   /* bf16: 2^-126 normal, 2^-133 subnormal step */
@@ -249,6 +253,7 @@ TK_API tk_fp4_t  tk_float_to_fp4(float f);
     #define TK_TO_FLOAT(x)   tk_t32_to_float(x)
     #define TK_FROM_FLOAT(f) tk_float_to_t32(f)
     #define TK_DTYPE_NAME    "tekin32"
+    #define TK_MAX_MAG       3.4028235e38f
     #define TK_MANT_BITS     24
     #define TK_MIN_NORM_BEXP 65
     #define TK_SUB_SHIFT     86   /* tekin32: 2^-62 normal, 2^-86 subnormal step */
@@ -257,6 +262,7 @@ TK_API tk_fp4_t  tk_float_to_fp4(float f);
     #define TK_TO_FLOAT(x)   tk_f8_to_float(x)
     #define TK_FROM_FLOAT(f) tk__f8_from_float(f)
     #define TK_DTYPE_NAME    "tekin8"
+    #define TK_MAX_MAG       480.0f
     #define TK_MANT_BITS     3
     #define TK_MIN_NORM_BEXP 121
     #define TK_SUB_SHIFT     9   /* tekin8 E4M3: 2^-6 normal, 2^-9 subnormal step */
@@ -265,6 +271,7 @@ TK_API tk_fp4_t  tk_float_to_fp4(float f);
     #define TK_TO_FLOAT(x)   tk_e5m2_to_float(x)
     #define TK_FROM_FLOAT(f) tk_float_to_e5m2(f)
     #define TK_DTYPE_NAME    "fp8_e5m2"
+    #define TK_MAX_MAG       57344.0f
     #define TK_MANT_BITS     2
     #define TK_MIN_NORM_BEXP 113
     #define TK_SUB_SHIFT     16   /* e5m2: 2^-14 normal, 2^-16 subnormal step */
@@ -273,12 +280,48 @@ TK_API tk_fp4_t  tk_float_to_fp4(float f);
     #define TK_TO_FLOAT(x)   tk_fp4_to_float(x)
     #define TK_FROM_FLOAT(f) tk_float_to_fp4(f)
     #define TK_DTYPE_NAME    "fp4_e2m1"
+    #define TK_MAX_MAG       6.0f
     #define TK_MANT_BITS     1
     #define TK_MIN_NORM_BEXP 127
     #define TK_SUB_SHIFT     1   /* fp4 E2M1: 1.0 is the smallest normal, 0.5 the only subnormal */
 #else
     #error "Unknown TK_DTYPE in config.h"
 #endif
+
+/* ---- MX-style block scaling ------------------------------------------------
+ *
+ * A block of TK_BLOCK elements shares one power-of-two scale, stored as an E8M0
+ * byte (OCP Microscaling v1.0): value = 2^(byte - 127). Narrow formats have too
+ * little exponent range to carry a whole tensor -- fp4's magnitudes stop at 6
+ * and start at 0.5, so weights around 0.05 all quantize to zero -- and one
+ * shared exponent per block restores it without touching the element encoding.
+ * The scale is a pure power of two, so applying it is exact. */
+#define TK_BLOCK 32
+
+/* Byte b is the float32 exponent field, so the value is 2^(b-127) for
+ * b in [1,254]. Byte 0 would be the subnormal encoding and 255 the inf/nan one,
+ * which is why tk_e8m0_from_amax never produces them. */
+static inline float tk_e8m0_to_float(uint8_t b) {
+    return tk__u2f((uint32_t)b << 23);
+}
+
+/* Smallest power of two with amax/scale <= TK_MAX_MAG, i.e.
+ * ceil(log2(amax / TK_MAX_MAG)). Rounding the other way overflows the format
+ * whenever TK_MAX_MAG is not itself a power of two: fp4 tops out at 6, so a
+ * floor would leave the scaled peak anywhere in [4,8) and clip a third of the
+ * blocks. With frexpf both operands are m*2^e for m in [0.5,1), so the
+ * comparison of the two mantissas supplies the ceiling exactly, with no log. */
+static inline uint8_t tk_e8m0_from_amax(float amax) {
+    if (!(amax > 0.0f)) return 127;               /* also catches nan -> scale 1 */
+    int ea, em;
+    float ma = frexpf(amax, &ea);
+    float mm = frexpf(TK_MAX_MAG, &em);
+    int e = (ea - em) + (ma > mm ? 1 : 0);
+    if (e < -126) e = -126;                       /* stay inside the normal range */
+    if (e >  127) e =  127;
+    return (uint8_t)(e + 127);
+}
+
 
 TK_API const char *tk_dtype_name(void);   /* active storage type name */
 TK_API int         tk_scalar_size(void);  /* sizeof(tk_scalar_t), for the binding */
