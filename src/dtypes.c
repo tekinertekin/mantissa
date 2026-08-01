@@ -71,3 +71,4 @@ tk_fp4_t tk_float_to_fp4(float f) {
 
 const char *tk_dtype_name(void) { return TK_DTYPE_NAME; }
 int         tk_scalar_size(void) { return (int)sizeof(tk_scalar_t); }
+int         tk_block_size(void)  { return TK_BLOCK; }

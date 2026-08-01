@@ -325,5 +325,6 @@ static inline uint8_t tk_e8m0_from_amax(float amax) {
 
 TK_API const char *tk_dtype_name(void);   /* active storage type name */
 TK_API int         tk_scalar_size(void);  /* sizeof(tk_scalar_t), for the binding */
+TK_API int         tk_block_size(void);   /* TK_BLOCK, for the binding */
 
 #endif /* MANTISSA_DTYPES_H */

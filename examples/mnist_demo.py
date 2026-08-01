@@ -65,7 +65,11 @@ def main():
     print(f"trained {NTR} images x {EPOCHS} epochs in {train_s:.1f}s  (final mse {loss:.4f})")
 
     # --- inference at the build's storage precision (weights quantized) ---
-    prep = tk.prepare(W, OUT, IN, bias)
+    # MANTISSA_BLOCKED=1 switches to MX-style per-block scaling, which is what
+    # the 4-bit formats need: fp4 spans 0.5 to 6, so these weights (std ~0.05)
+    # otherwise quantize almost entirely to zero.
+    blocked = os.environ.get("MANTISSA_BLOCKED") == "1"
+    prep = (tk.prepare_blocked if blocked else tk.prepare)(W, OUT, IN, bias)
     preds = np.empty(NTE, dtype=np.int64)
     t0 = time.time()
     for i in range(NTE):
@@ -75,7 +79,8 @@ def main():
     acc = (preds == yte).mean()
 
     model_kb = OUT * IN * bpp / 1024.0
-    print(f"\n  test accuracy      {acc * 100:.2f}%  on {NTE} images")
+    scaling = "per-block (MX, 32)" if blocked else "per-tensor"
+    print(f"\n  test accuracy      {acc * 100:.2f}%  on {NTE} images   [{scaling}]")
     print(f"  inference          {NTE / infer_s:,.0f} img/s  ({infer_s * 1e6 / NTE:.1f} us/img)")
     print(f"  model footprint    {model_kb:.1f} KB  ({OUT * IN} params x {bpp} B)")
     print(f"                     {4 / bpp:.0f}x smaller than float32\n"

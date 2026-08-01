@@ -119,6 +119,7 @@ class Mantissa:
 
         self._lib.tk_dtype_name.restype = ctypes.c_char_p
         self._lib.tk_scalar_size.restype = ctypes.c_int
+        self._lib.tk_block_size.restype = ctypes.c_int
 
         # narrow-storage primitives for the resident-weights inference path
         # (Prepared): quantize float32 into the storage dtype, and the narrow
@@ -130,6 +131,20 @@ class Mantissa:
         self._lib.tk_linear_forward.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, _f32p,  # W, x, bias, y
             ctypes.c_int, ctypes.c_int, ctypes.c_int,                  # out_dim, in_dim, act
+        ]
+
+        # MX-style block scaling: one E8M0 exponent per TK_BLOCK elements. This
+        # is what makes the 4-bit formats usable -- see prepare_blocked.
+        self._lib.tk_quantize_blocked.restype = None
+        self._lib.tk_quantize_blocked.argtypes = [
+            _f32p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint8), ctypes.c_int,
+        ]
+        self._lib.tk_linear_forward_blocked.restype = None
+        self._lib.tk_linear_forward_blocked.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint8),   # W, W_scales
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint8),   # x, x_scales
+            _f32p, _f32p,                                      # bias (float32), y
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,          # out_dim, in_dim, act
         ]
 
         self._lib.tk_linear_forward_f32.restype = None
@@ -281,6 +296,22 @@ class Mantissa:
         up to ~35x at 1024x1024 in Python (bf16, serial), at half the weight
         bytes of float32. W is row-major out_dim x in_dim; bias may be None."""
         return Prepared(self._lib, W, out_dim, in_dim, bias)
+
+    def prepare_blocked(self, W, out_dim: int, in_dim: int, bias=None) -> "PreparedBlocked":
+        """Like prepare(), but with MX-style block scaling: every TK_BLOCK
+        elements share one power-of-two scale, stored as an E8M0 byte alongside
+        the narrowed values.
+
+        This is what the 4-bit formats need. fp4 spans 0.5 to 6, so a weight
+        matrix with std 0.05 quantizes almost entirely to zero -- on the MNIST
+        demo model that is 14.3% accuracy against float32's 79.6%. With per-block
+        scales the same weights give 78.9%, still at 4 bits each.
+
+        It costs throughput: the blocked kernel measures roughly 3.4-4.7x slower
+        than the flat one, uniformly across storage types, because the scale is
+        applied per block. Use it where memory decides and the flat path where
+        speed does."""
+        return PreparedBlocked(self._lib, W, out_dim, in_dim, bias)
 
     def train_step(self, W, x, target, out_dim: int, in_dim: int,
                    act: int, lr: float, bias=None) -> float:
@@ -947,3 +978,63 @@ class Prepared:
         self._lib.tk_linear_forward(self._W, self._xbuf, self._bias, yc,
                                     self.out_dim, self.in_dim, act)
         return list(yc)
+
+class PreparedBlocked:
+    """A dense layer quantized with MX-style block scaling: TK_BLOCK elements
+    share one power-of-two scale, kept as an E8M0 byte next to the narrowed
+    values. Construct via Mantissa.prepare_blocked().
+
+    Each row of W is blocked on its own, so a block never spans two rows, and
+    bias stays float32 -- out_dim values, too few to matter for memory, and
+    narrowing them would add error for nothing."""
+
+    def __init__(self, lib, W, out_dim: int, in_dim: int, bias=None):
+        self._lib = lib
+        self.out_dim, self.in_dim = out_dim, in_dim
+        ssz = lib.tk_scalar_size()
+        self.block = lib.tk_block_size()
+        self._nb = (in_dim + self.block - 1) // self.block
+        self._u8 = ctypes.POINTER(ctypes.c_uint8)
+
+        Wc, _ = _as_c_float(W, out_dim * in_dim, "W")
+        self._W = (ctypes.c_char * (ssz * out_dim * in_dim))()
+        self._Ws = (ctypes.c_uint8 * (out_dim * self._nb))()
+        # Row by row, because a block must not span two rows. _as_c_float hands
+        # back a POINTER, so the row offset has to be real pointer arithmetic:
+        # ctypes.byref(ptr, off) offsets the pointer variable, not the data.
+        base = ctypes.cast(Wc, ctypes.c_void_p).value
+        fsz = ctypes.sizeof(ctypes.c_float)
+        for o in range(out_dim):
+            row = ctypes.cast(base + o * in_dim * fsz, _f32p)
+            dst = ctypes.cast(ctypes.byref(self._W, o * in_dim * ssz), ctypes.c_void_p)
+            sc = ctypes.cast(ctypes.byref(self._Ws, o * self._nb), self._u8)
+            lib.tk_quantize_blocked(row, dst, sc, in_dim)
+
+        self._bias = None
+        if bias is not None:
+            self._bias, _ = _as_c_float(bias, out_dim, "bias")
+        self._xbuf = (ctypes.c_char * (ssz * in_dim))()
+        self._xs = (ctypes.c_uint8 * self._nb)()
+
+    def forward(self, x, act: int, out=None):
+        """y = act(W @ x + bias) with both operands block-scaled. x is quantized
+        into reused scratch per call, the same as Prepared.forward."""
+        xc, _ = _as_c_float(x, self.in_dim, "x")
+        self._lib.tk_quantize_blocked(xc, ctypes.cast(self._xbuf, ctypes.c_void_p),
+                                      ctypes.cast(self._xs, self._u8), self.in_dim)
+        if out is not None:
+            yc, y_wb = _as_c_float(out, self.out_dim, "out")
+            self._call(yc, act)
+            if y_wb:
+                y_wb()
+            return out
+        yc = (ctypes.c_float * self.out_dim)()
+        self._call(yc, act)
+        return list(yc)
+
+    def _call(self, yc, act: int):
+        self._lib.tk_linear_forward_blocked(
+            ctypes.cast(self._W, ctypes.c_void_p), ctypes.cast(self._Ws, self._u8),
+            ctypes.cast(self._xbuf, ctypes.c_void_p), ctypes.cast(self._xs, self._u8),
+            self._bias, yc, self.out_dim, self.in_dim, act)
+
