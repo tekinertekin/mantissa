@@ -68,9 +68,43 @@ static int check_f8(void) {
 }
 #endif
 
+
+/* Block scaling must never make the dot product's scale factor underflow.
+ * tk__dot_blocked multiplies a block's partial sum by scale_w * scale_x, so if
+ * a format's scale sits near the 2^-126 clamp that product is zero in float32
+ * and every output silently becomes zero -- which is what happened to bfloat16
+ * before wide formats stopped being scaled at all. */
+static int check_block_scale(void) {
+    int bad = 0;
+    const float amaxes[] = {1e-8f, 1e-4f, 0.05f, 0.46f, 1.0f, 7.5f, 1e3f, 1e8f};
+    for (unsigned t = 0; t < sizeof amaxes / sizeof *amaxes; t++) {
+        uint8_t b = tk_e8m0_from_amax(amaxes[t]);
+        float sc = tk_e8m0_to_float(b);
+        if (!(sc > 0.0f) || sc * sc == 0.0f) {
+            printf("  FAIL amax=%g: scale=%g, scale^2 underflows\n", (double)amaxes[t], (double)sc);
+            bad++;
+            continue;
+        }
+        if (TK_BLOCK_SCALED && amaxes[t] / sc > TK_MAX_MAG) {
+            printf("  FAIL amax=%g: scaled to %g, over TK_MAX_MAG %g\n",
+                   (double)amaxes[t], (double)(amaxes[t] / sc), (double)TK_MAX_MAG);
+            bad++;
+        }
+        if (!TK_BLOCK_SCALED && sc != 1.0f) {
+            printf("  FAIL wide format should not scale, got %g\n", (double)sc);
+            bad++;
+        }
+    }
+    printf("  block scale (%s): %u magnitudes checked, %d bad\n",
+           TK_BLOCK_SCALED ? "active" : "no-op for this format",
+           (unsigned)(sizeof amaxes / sizeof *amaxes), bad);
+    return bad;
+}
+
 int main(void) {
     int bad = 0;
     printf("SIMD read equivalence (%s)\n", tk_dtype_name());
+    bad += check_block_scale();
 #if defined(TK_HAVE_NEON_F8)
     bad += check_f8();
 #elif defined(TK_HAVE_NEON_FP4)

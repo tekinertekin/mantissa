@@ -311,7 +311,18 @@ static inline float tk_e8m0_to_float(uint8_t b) {
  * floor would leave the scaled peak anywhere in [4,8) and clip a third of the
  * blocks. With frexpf both operands are m*2^e for m in [0.5,1), so the
  * comparison of the two mantissas supplies the ceiling exactly, with no log. */
+/* Block scaling only means something when the element format's exponent range
+ * is the limitation. float32, bfloat16 and tekin32 already span float32's range,
+ * so there is nothing to recover -- and scaling them is actively wrong: the
+ * scale would sit at the 2^-126 clamp and the product of the two scales the dot
+ * product applies underflows to zero, which silently zeroed every output. One
+ * rule rather than a per-dtype list, so the two cannot drift apart. */
+#define TK_BLOCK_SCALED (TK_MAX_MAG < 1.0e30f)
+
 static inline uint8_t tk_e8m0_from_amax(float amax) {
+    /* A C-level constant, not #if: the preprocessor cannot compare floats, and
+     * the compiler folds this away either way. */
+    if (!TK_BLOCK_SCALED) return 127;             /* scale 1.0: a no-op */
     if (!(amax > 0.0f)) return 127;               /* also catches nan -> scale 1 */
     int ea, em;
     float ma = frexpf(amax, &ea);
