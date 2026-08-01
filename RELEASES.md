@@ -6,6 +6,47 @@ dense layer (4.2M params) unless noted, and are indicative, not absolute.
 
 ---
 
+## v0.2.9 — 2026-08-01  (tag `v0.2.9`)
+
+Block scaling, which is what the 4-bit format was waiting for. No change to any
+existing API or to unblocked results.
+
+**fp4 goes from 12.63% to 78.85% on the MNIST demo**, against 79.57% in float32,
+at the same 3.8 KB. A narrow format's exponent range is what breaks 4-bit
+inference, not its mantissa: E2M1's magnitudes run 0.5 to 6, so weights with std
+~0.05 quantize almost entirely to zero. One shared power-of-two scale per 32
+elements — MX v1.0, stored as an E8M0 byte — restores it.
+
+New: `tk_quantize_blocked`, `tk_linear_forward_blocked`, `tk_block_size`, and
+`prepare_blocked()` in the Python binding. `examples/mnist_demo.py` takes
+`MANTISSA_BLOCKED=1`. Each row of W is blocked on its own, so a block never
+spans two rows, and bias stays float32.
+
+The scale is `ceil(log2(amax / TK_MAX_MAG))`, not floor. Rounding down overflows
+the format whenever the maximum is not a power of two: for fp4 it leaves the
+scaled peak anywhere in [4,8) against a limit of 6, which clipped a third of the
+blocks in a sweep of 729 magnitudes.
+
+**Formats that already span float32's range are not scaled.** float32, bfloat16
+and tekin32 have nothing for a shared exponent to recover, and scaling them was
+actively broken: the scale landed on the 2^-126 clamp and the product of the two
+scales the dot product applies underflowed to zero, taking bfloat16 from 79.55%
+to 9.80%. Found by running all seven builds rather than only fp4. `make testsimd`
+now guards it.
+
+**It costs throughput.** The blocked kernel is vectorised — same 4-row register
+blocking, same depth-8 body, the block's partial sum scaled in vector form so no
+horizontal add enters the inner loop — and still measures 3.4-4.7× slower than
+the flat kernel, uniformly across storage types, because the scale is applied per
+block. Batch GEMM at 2048²: bfloat16 31.3 vs 107.3 GFLOP/s, tekin8 10.8 vs 49.1,
+fp4 9.0 vs 42.8. Use it where memory decides.
+
+**Also fixed: `MANTISSA_LIB`.** The binding preferred the bundled library over a
+`make lib DTYPE=N` build, so the documented recipe silently measured bfloat16
+whatever DTYPE was passed. It now takes an explicit path.
+
+---
+
 ## v0.2.8 — 2026-07-31  (tag `v0.2.8`)
 
 Vectorised reads for two of the three narrow storage formats, and a standing

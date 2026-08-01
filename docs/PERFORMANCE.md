@@ -123,6 +123,41 @@ fat binaries. CI medians (GitHub ubuntu runner): f32 GEMV 45.8, bf16 50.8, **fp1
 cheaper than the bf16 zext+shift there). FEAT_BF16 and AVX2 paths are picked by
 runtime feature detection, never by a separate build.
 
+## 4b. Block scaling: what it buys and what it costs
+
+A narrow format's exponent range, not its mantissa, is what breaks 4-bit
+inference. fp4's magnitudes run 0.5 to 6, so a weight matrix with std ~0.05
+quantizes almost entirely to zero and the MNIST demo model scores 12.63%. One
+shared power-of-two scale per 32 elements (MX v1.0, an E8M0 byte) restores it to
+**78.85%**, against 79.57% in float32, with the elements still 4 bits each.
+
+The kernel keeps the scale out of the inner loop: each block accumulates in the
+elements' own units and the two scales are applied once to the finished partial
+sum, in vector form. Reducing per block instead would put a horizontal add every
+32 elements — 64 per row at in=2048, against one for the flat kernel.
+
+It is not free. Measured at 2048×2048 against the flat kernel on the same build:
+
+| dtype | blocked | flat | |
+|---|---:|---:|---|
+| bfloat16 | 31.3 | 107.3 GFLOP/s | 3.4× slower |
+| tekin8 | 10.8 | 49.1 | 4.6× |
+| fp4 | 9.0 | 42.8 | 4.7× |
+
+The penalty is roughly constant across storage types, so it is the block
+structure — a 32-element inner loop, accumulators reset per block, two scales
+per block — and not the narrow read. Read it as a memory feature: block-scaled
+fp4 gives 9.0 GFLOP/s at 4 bits where flat bfloat16 gives 107 at 16, and
+bfloat16 is also more accurate. It earns its place when the model has to fit,
+not when it has to be fast.
+
+Formats that already span float32's exponent range (float32, bfloat16, tekin32)
+are left unscaled. There is nothing for a shared exponent to recover, and
+scaling them is worse than useless: the scale lands on the 2^-126 clamp and the
+product of the two scales the dot product applies underflows to zero, which
+silently zeroed every output until it was caught by running all seven builds
+rather than only fp4.
+
 ## 5. Convolution is one big GEMM
 
 Convolution is im2col + GEMM (Chellapilla et al. 2006). Two decisions carry it:

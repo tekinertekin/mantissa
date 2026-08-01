@@ -27,9 +27,9 @@ References for the standard formats:
   range and is used for gradients. tekin8 does not reserve the `S.1111.111` NaN
   slot, so its max finite is 480 rather than OCP's 448.
 - **fp4 E2M1** — the element type of MXFP4/NVFP4 (OCP Microscaling v1.0, 2023;
-  NVIDIA Blackwell). Eight magnitudes `{0,.5,1,1.5,2,3,4,6}`, no inf/nan; only
-  usable inside a block-scaling scheme (roadmap), included here as the scalar
-  primitive.
+  NVIDIA Blackwell). Eight magnitudes `{0,.5,1,1.5,2,3,4,6}`, no inf/nan. Only
+  usable inside a block-scaling scheme, which the engine now implements: on its
+  own it scores 12.63% on the MNIST demo, with per-block scales 78.85%.
 
 ### Why bfloat16 beats fp16 for training
 
@@ -652,7 +652,12 @@ of reimplementing the numerics.
 - **Microscaling (MX)** — OCP MX v1.0 (2023): a block of 32 elements shares one
   E8M0 scale, restoring the dynamic range that 4/6-bit elements lack. Element
   types MXFP8 (E4M3/E5M2), MXFP6, MXFP4 (E2M1). mantissa implements the element
-  formats; a shared per-block scale is the next step.
+  formats and the shared per-block scale: `tk_quantize_blocked` writes one E8M0
+  exponent per 32 elements and `tk_linear_forward_blocked` applies it, which is
+  what takes fp4 from 12.63% to 78.85% on the MNIST demo. Formats that already
+  span float32's exponent range are left unscaled -- there is nothing for a
+  shared exponent to recover, and scaling them underflowed the dot product's
+  combined scale factor to zero. Two-per-byte packing is what remains.
 - **NVFP4** — NVIDIA Blackwell (2024 hardware): 16-element blocks, an FP8 E4M3
   block scale plus a per-tensor FP32 scalar; LLMs pretrained at 4 bits per
   "Pretraining LLMs with NVFP4" (NVIDIA, arXiv:2509.25149, 2025).

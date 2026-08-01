@@ -56,12 +56,20 @@ test set — only the storage type changes:
 | bfloat16 | 1-8-7 | 2 | 15.3 KB | 81.25 % |
 | fp8 E5M2 | 1-5-2 | 1 | 7.7 KB | 81.25 % |
 | **tekin8 (fp8 E4M3)** | **1-4-3** | **1** | **7.7 KB** | **81.10 %** |
-| fp4 E2M1 (MXFP4) | 1-2-1 | ½ | 3.8 KB | 14.35 % |
+| fp4 E2M1 (MXFP4) | 1-2-1 | ½ | 3.8 KB | 12.63 % → **78.85 %** with block scaling |
 
 **fp8 holds float32 accuracy at 4× less memory** (−0.1 pt); fp16/bf16 are
 effectively lossless at 2×. fp4 is a step too far for *naïve* post-training
-quantization — 4-bit needs per-block scaling or quantization-aware training
-(a good first contribution — see [CONTRIBUTING.md](CONTRIBUTING.md)).
+quantization: its magnitudes run 0.5 to 6, so weights with std ~0.05 quantize
+almost entirely to zero.
+
+**Per-block scaling fixes that.** With one shared power-of-two scale per 32
+elements (MX v1.0, stored as an E8M0 byte), the same 4-bit weights give
+**78.85 %** against float32's 79.57 % — at 3.8 KB instead of 30.6 KB. Pass
+`MANTISSA_BLOCKED=1` to the demo, or use `prepare_blocked()` from Python. It
+costs throughput: the blocked kernel measures 3.4–4.7× slower than the flat one,
+uniformly across storage types, because the scale is applied per block. Use it
+where memory decides and the flat path where speed does.
 
 **Run it yourself:**
 
@@ -179,7 +187,7 @@ not the goal itself.
 | 5 | `fp8_e5m2` | 1 | FP8, wider range |
 | 6 | `fp4_e2m1` | ½* | FP4 — the extreme |
 
-*\*fp4 is stored one value per byte today (1 B); the "½" is the logical E2M1 width. Two-per-byte packing is a roadmap item gated on block-scaling — see [`docs/DESIGN.md`](docs/DESIGN.md).*
+*\*fp4 is stored one value per byte today (1 B); the "½" is the logical E2M1 width. Block scaling is implemented; two-per-byte packing is what remains, and it measures ~10% slower rather than faster — see [`docs/DESIGN.md`](docs/DESIGN.md).*
 
 Bit layouts, the `tekin` formats' design rationale, the hot/cold conversion
 split, and the current-research context (MX / NVFP4 / posit / IEEE P3109) all
