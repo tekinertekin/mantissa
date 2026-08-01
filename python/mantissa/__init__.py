@@ -120,6 +120,7 @@ class Mantissa:
         self._lib.tk_dtype_name.restype = ctypes.c_char_p
         self._lib.tk_scalar_size.restype = ctypes.c_int
         self._lib.tk_block_size.restype = ctypes.c_int
+        self._lib.tk_elems_per_byte.restype = ctypes.c_int
 
         # narrow-storage primitives for the resident-weights inference path
         # (Prepared): quantize float32 into the storage dtype, and the narrow
@@ -995,9 +996,13 @@ class PreparedBlocked:
         self.block = lib.tk_block_size()
         self._nb = (in_dim + self.block - 1) // self.block
         self._u8 = ctypes.POINTER(ctypes.c_uint8)
+        # fp4 packs two elements per byte, so a row is not in_dim bytes wide and
+        # the row stride has to come from the library rather than be assumed.
+        epb = lib.tk_elems_per_byte()
+        self._rowb = ssz * ((in_dim + epb - 1) // epb)
 
         Wc, _ = _as_c_float(W, out_dim * in_dim, "W")
-        self._W = (ctypes.c_char * (ssz * out_dim * in_dim))()
+        self._W = (ctypes.c_char * (self._rowb * out_dim))()
         self._Ws = (ctypes.c_uint8 * (out_dim * self._nb))()
         # Row by row, because a block must not span two rows. _as_c_float hands
         # back a POINTER, so the row offset has to be real pointer arithmetic:
@@ -1006,14 +1011,14 @@ class PreparedBlocked:
         fsz = ctypes.sizeof(ctypes.c_float)
         for o in range(out_dim):
             row = ctypes.cast(base + o * in_dim * fsz, _f32p)
-            dst = ctypes.cast(ctypes.byref(self._W, o * in_dim * ssz), ctypes.c_void_p)
+            dst = ctypes.cast(ctypes.byref(self._W, o * self._rowb), ctypes.c_void_p)
             sc = ctypes.cast(ctypes.byref(self._Ws, o * self._nb), self._u8)
             lib.tk_quantize_blocked(row, dst, sc, in_dim)
 
         self._bias = None
         if bias is not None:
             self._bias, _ = _as_c_float(bias, out_dim, "bias")
-        self._xbuf = (ctypes.c_char * (ssz * in_dim))()
+        self._xbuf = (ctypes.c_char * self._rowb)()
         self._xs = (ctypes.c_uint8 * self._nb)()
 
     def forward(self, x, act: int, out=None):

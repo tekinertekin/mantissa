@@ -452,7 +452,7 @@ void tk_quantize_blocked(const float *restrict src, tk_scalar_t *restrict dst,
         float inv = 1.0f / tk_e8m0_to_float(sb);   /* exact: a power of two */
         scales[b0 / TK_BLOCK] = sb;
         for (int i = 0; i < len; i++)
-            dst[b0 + i] = TK_FROM_FLOAT(src[b0 + i] * inv);
+            tk_packed_set(dst, b0 + i, TK_FROM_FLOAT(src[b0 + i] * inv));
     }
 }
 
@@ -468,17 +468,20 @@ static inline void tk__dot4_blocked(const tk_scalar_t *restrict W, int in,
                                     const tk_scalar_t *restrict x,
                                     const uint8_t *restrict xs,
                                     float *restrict out) {
-    const tk_scalar_t *restrict w0 = W, *restrict w1 = W + in,
-                       *restrict w2 = W + 2 * in, *restrict w3 = W + 3 * in;
+    const size_t row = TK_PACKED_BYTES(in);
+    const tk_scalar_t *restrict w0 = W, *restrict w1 = W + row,
+                       *restrict w2 = W + 2 * row, *restrict w3 = W + 3 * row;
     float t0 = 0.0f, t1 = 0.0f, t2 = 0.0f, t3 = 0.0f;
-#if defined(TK__LD4)
+#if defined(TK__LD4) && TK_ELEMS_PER_BYTE == 1
     float32x4_t T0 = vdupq_n_f32(0), T1 = T0, T2 = T0, T3 = T0;
 #endif
     for (int b = 0, b0 = 0; b0 < in; b++, b0 += TK_BLOCK) {
         int len = (in - b0 < TK_BLOCK) ? in - b0 : TK_BLOCK;
         float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
         int i = 0;
-#if defined(TK__LD4)
+/* The vector loaders read one element per byte; packed storage puts two in a
+ * byte, so they cannot be used until there is a packed loader. */
+#if defined(TK__LD4) && TK_ELEMS_PER_BYTE == 1
         float32x4_t a0 = vdupq_n_f32(0), a1 = a0, a2 = a0, a3 = a0;
         float32x4_t c0 = a0, c1 = a0, c2 = a0, c3 = a0;
         for (; i + 8 <= len; i += 8) {
@@ -491,16 +494,18 @@ static inline void tk__dot4_blocked(const tk_scalar_t *restrict W, int in,
         }
 #endif
         for (; i < len; i++) {
-            float xi = TK_TO_FLOAT(x[b0 + i]);
-            s0 += TK_TO_FLOAT(w0[b0 + i]) * xi; s1 += TK_TO_FLOAT(w1[b0 + i]) * xi;
-            s2 += TK_TO_FLOAT(w2[b0 + i]) * xi; s3 += TK_TO_FLOAT(w3[b0 + i]) * xi;
+            float xi = TK_TO_FLOAT(tk_packed_get(x, b0 + i));
+            s0 += TK_TO_FLOAT(tk_packed_get(w0, b0 + i)) * xi;
+            s1 += TK_TO_FLOAT(tk_packed_get(w1, b0 + i)) * xi;
+            s2 += TK_TO_FLOAT(tk_packed_get(w2, b0 + i)) * xi;
+            s3 += TK_TO_FLOAT(tk_packed_get(w3, b0 + i)) * xi;
         }
         const float sx = tk_e8m0_to_float(xs[b]);
         const float g0 = tk_e8m0_to_float(ws[b]) * sx;
         const float g1 = tk_e8m0_to_float(ws[nb + b]) * sx;
         const float g2 = tk_e8m0_to_float(ws[2 * nb + b]) * sx;
         const float g3 = tk_e8m0_to_float(ws[3 * nb + b]) * sx;
-#if defined(TK__LD4)
+#if defined(TK__LD4) && TK_ELEMS_PER_BYTE == 1
         /* Scale the block's vector accumulator and keep accumulating in vector
          * form. Reducing per block instead would put a horizontal add in the
          * inner loop -- 64 of them per row at in=2048, against one for the flat
@@ -512,7 +517,7 @@ static inline void tk__dot4_blocked(const tk_scalar_t *restrict W, int in,
 #endif
         t0 += s0 * g0; t1 += s1 * g1; t2 += s2 * g2; t3 += s3 * g3;
     }
-#if defined(TK__LD4)
+#if defined(TK__LD4) && TK_ELEMS_PER_BYTE == 1
     t0 += vaddvq_f32(T0); t1 += vaddvq_f32(T1);
     t2 += vaddvq_f32(T2); t3 += vaddvq_f32(T3);
 #endif
@@ -528,13 +533,14 @@ static float tk__dot_blocked(const tk_scalar_t *restrict w, const uint8_t *restr
         float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
         int i = 0;
         for (; i + 4 <= len; i += 4) {
-            s0 += TK_TO_FLOAT(w[b0+i+0]) * TK_TO_FLOAT(x[b0+i+0]);
-            s1 += TK_TO_FLOAT(w[b0+i+1]) * TK_TO_FLOAT(x[b0+i+1]);
-            s2 += TK_TO_FLOAT(w[b0+i+2]) * TK_TO_FLOAT(x[b0+i+2]);
-            s3 += TK_TO_FLOAT(w[b0+i+3]) * TK_TO_FLOAT(x[b0+i+3]);
+            s0 += TK_TO_FLOAT(tk_packed_get(w, b0+i+0)) * TK_TO_FLOAT(tk_packed_get(x, b0+i+0));
+            s1 += TK_TO_FLOAT(tk_packed_get(w, b0+i+1)) * TK_TO_FLOAT(tk_packed_get(x, b0+i+1));
+            s2 += TK_TO_FLOAT(tk_packed_get(w, b0+i+2)) * TK_TO_FLOAT(tk_packed_get(x, b0+i+2));
+            s3 += TK_TO_FLOAT(tk_packed_get(w, b0+i+3)) * TK_TO_FLOAT(tk_packed_get(x, b0+i+3));
         }
         float s = (s0 + s1) + (s2 + s3);
-        for (; i < len; i++) s += TK_TO_FLOAT(w[b0+i]) * TK_TO_FLOAT(x[b0+i]);
+        for (; i < len; i++)
+            s += TK_TO_FLOAT(tk_packed_get(w, b0+i)) * TK_TO_FLOAT(tk_packed_get(x, b0+i));
         total += s * tk_e8m0_to_float(ws[b0 / TK_BLOCK]) * tk_e8m0_to_float(xs[b0 / TK_BLOCK]);
     }
     return total;
@@ -549,10 +555,11 @@ void tk_linear_forward_blocked(const tk_scalar_t *restrict W,
                                int out_dim, int in_dim,
                                tk_activation_t act) {
     int nb = (in_dim + TK_BLOCK - 1) / TK_BLOCK;
+    const size_t row = TK_PACKED_BYTES(in_dim);   /* a row never starts mid-byte */
     int o = 0;
     for (; o + 4 <= out_dim; o += 4) {
         float s[4];
-        tk__dot4_blocked(W + (size_t)o * in_dim, in_dim, W_scales + (size_t)o * nb, nb,
+        tk__dot4_blocked(W + (size_t)o * row, in_dim, W_scales + (size_t)o * nb, nb,
                          x, x_scales, s);
         for (int k = 0; k < 4; k++) {
             float z = s[k] + (bias ? bias[o + k] : 0.0f);
@@ -560,7 +567,7 @@ void tk_linear_forward_blocked(const tk_scalar_t *restrict W,
         }
     }
     for (; o < out_dim; o++) {
-        float z = tk__dot_blocked(W + (size_t)o * in_dim, W_scales + (size_t)o * nb,
+        float z = tk__dot_blocked(W + (size_t)o * row, W_scales + (size_t)o * nb,
                                   x, x_scales, in_dim);
         if (bias) z += bias[o];
         y[o] = tk_act_scalar(z, act);

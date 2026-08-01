@@ -298,6 +298,33 @@ TK_API tk_fp4_t  tk_float_to_fp4(float f);
  * The scale is a pure power of two, so applying it is exact. */
 #define TK_BLOCK 32
 
+/* fp4 is the only format narrow enough to pack: two E2M1 values fit one byte,
+ * low nibble first. Everything else stores one element per byte or wider. This
+ * applies to the block-scaled path only -- TK_BLOCK is even, so every block is
+ * a whole number of bytes and blocks stay byte-aligned. */
+#if TK_DTYPE == TK_DTYPE_FP4_E2M1
+  #define TK_ELEMS_PER_BYTE 2
+#else
+  #define TK_ELEMS_PER_BYTE 1
+#endif
+
+/* Bytes needed to store n elements, rounded up so a row never starts mid-byte. */
+#define TK_PACKED_BYTES(n) (((size_t)(n) + TK_ELEMS_PER_BYTE - 1) / TK_ELEMS_PER_BYTE)
+
+#if TK_ELEMS_PER_BYTE == 2
+static inline tk_scalar_t tk_packed_get(const tk_scalar_t *p, int i) {
+    return (tk_scalar_t)((p[i >> 1] >> ((i & 1) << 2)) & 0x0Fu);
+}
+static inline void tk_packed_set(tk_scalar_t *p, int i, tk_scalar_t v) {
+    const int sh = (i & 1) << 2;
+    p[i >> 1] = (tk_scalar_t)((p[i >> 1] & (0xF0u >> sh)) | ((v & 0x0Fu) << sh));
+}
+#else
+static inline tk_scalar_t tk_packed_get(const tk_scalar_t *p, int i) { return p[i]; }
+static inline void tk_packed_set(tk_scalar_t *p, int i, tk_scalar_t v) { p[i] = v; }
+#endif
+
+
 /* Byte b is the float32 exponent field, so the value is 2^(b-127) for
  * b in [1,254]. Byte 0 would be the subnormal encoding and 255 the inf/nan one,
  * which is why tk_e8m0_from_amax never produces them. */
@@ -337,5 +364,6 @@ static inline uint8_t tk_e8m0_from_amax(float amax) {
 TK_API const char *tk_dtype_name(void);   /* active storage type name */
 TK_API int         tk_scalar_size(void);  /* sizeof(tk_scalar_t), for the binding */
 TK_API int         tk_block_size(void);   /* TK_BLOCK, for the binding */
+TK_API int         tk_elems_per_byte(void); /* TK_ELEMS_PER_BYTE, for the binding */
 
 #endif /* MANTISSA_DTYPES_H */
